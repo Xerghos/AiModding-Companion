@@ -1,0 +1,10 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"gitHistory.alwaysPromptRepositoryPicker": true
+	}
+}

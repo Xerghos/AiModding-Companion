@@ -1,0 +1,88 @@
+# --- SÉCURITÉ CRITIQUE (NE JAMAIS MODIFIER) ---
+# Clés API et Paramètres Sensibles
+app_settings.json
+credentials.json
+gdrive_token.json
+kb_drive_file_id.json
+context_links.json
+.env
+.envrc
+
+# Custom - CORRIGÉ avec wildcards
+secrets.enc
+db_key_states.json.md
+src/
+temp/
+logs/
+ia_history/
+backups/
+*.txt
+!Suggestions à ajouter à la roadmap.txt
+*.json
+Gemini_synthesis.json
+# (!nomdefichier.json si besoin d'une exception)
+# Exception: on veut quand même ignorer prompt_history.json (déjà couvert par *.json)
+
+# Bases de Données et Connaissances (RAG)
+# On ignore tout le dossier db/ et les extensions de fichiers DB
+db/
+*.sqlite
+*.db
+*.faiss
+*.pkl
+knowledge_base_chroma/
+knowledge_base_qdrant/
+knowledge_base_lancedb/
+*.zip  # Archives de backup DB
+
+# Logs et Debug
+app_debug.log
+action_log.json
+*.log
+pip-log.txt
+
+# Cache Audio et Temporaires
+audio_cache/
+*.wav
+temp_audio.wav
+
+# --- Standard Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Environnements Virtuels ---
+venv/
+env/
+ENV/
+.venv/
+
+# --- IDEs et Outils ---
+.cursor/
+.idea/
+.vs/
+.vscode/
+.mypy_cache/
+.pytest_cache/
+*.swp
+*.swo
+*~
