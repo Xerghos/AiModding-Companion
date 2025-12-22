@@ -40,7 +40,21 @@ def to_generate_content_request(
     if user_prompt_id is None:
         user_prompt_id = str(uuid.uuid4())
     
-    # Convertir les messages au format CodeAssist
+    # Extraire les instructions système des messages
+    system_parts = []
+    
+    # 1. Ajouter l'instruction système explicite si présente
+    if system_instruction:
+        system_parts.append(system_instruction)
+    
+    # 2. Extraire les messages avec role='system' de la liste des messages
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            if content:
+                system_parts.append(str(content))
+    
+    # Convertir les messages au format CodeAssist (en excluant les system qui sont gérés ci-dessus)
     contents = _to_contents(messages)
     
     # Construire la requête Vertex (format interne CodeAssist)
@@ -48,11 +62,12 @@ def to_generate_content_request(
         "contents": contents,
     }
     
-    # Ajouter l'instruction système si présente
-    if system_instruction:
+    # Ajouter l'instruction système si présente (concaténée)
+    if system_parts:
+        full_system_instruction = "\n\n".join(system_parts)
         vertex_request["systemInstruction"] = {
             "role": "system",
-            "parts": [{"text": system_instruction}]
+            "parts": [{"text": full_system_instruction}]
         }
     
     # Ajouter les outils si présents

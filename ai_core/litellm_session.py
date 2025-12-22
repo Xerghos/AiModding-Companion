@@ -85,10 +85,13 @@ class LiteLLMSession(BaseSession):
             {"agent": agent_name, "mode": "LiteLLM"}
         )
     
-    def _create_msg(self, role: str, text: str) -> Dict[str, str]:
-        """Crée un message au format standard."""
-        return {"role": role, "content": text}
-    
+    def _truncate(self, text: str, max_chars: int) -> str:
+        """Tronque le texte s'il dépasse la limite."""
+        if not text: return ""
+        text_str = str(text)
+        if len(text_str) <= max_chars: return text_str
+        return text_str[:max_chars] + f"\n... [TRONQUÉ ({len(text_str)-max_chars} chars)] ..."
+
     def _build_payload_messages(self, rag_context: Optional[Dict] = None) -> List[Dict[str, str]]:
         """
         Construction Atomique du Payload (identique à DeepSeekSession).
@@ -118,12 +121,19 @@ class LiteLLMSession(BaseSession):
         try:
             comps = GlobalCacheManager.get_components() if GlobalCacheManager else {}
             
+            # Limites de taille (inspirées de prompt_builders.py)
+            LIMIT_ARCH = 10000
+            LIMIT_TREE = 10000
+            LIMIT_LTM = 6000
+            
             if is_writer_session:
                 # SESSION WRITER : Payload minimal (seulement architecture map)
                 if comps.get('arch'):
                     arch_content = str(comps['arch']).strip()
                     if arch_content.startswith("--- CARTOGRAPHIE TECHNIQUE ---"):
                         arch_content = arch_content.replace("--- CARTOGRAPHIE TECHNIQUE ---", "", 1).strip()
+                    
+                    arch_content = self._truncate(arch_content, LIMIT_ARCH)
                     messages.append({
                         "role": "system",
                         "content": f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_content}"
@@ -133,12 +143,15 @@ class LiteLLMSession(BaseSession):
                 # BLOC 2 : REPO MAP (remplace CARTOGRAPHIE TECHNIQUE)
                 if comps.get('repo_map'):
                     repo_map_content = str(comps['repo_map']).strip()
+                    repo_map_content = self._truncate(repo_map_content, LIMIT_ARCH)
                     messages.append({"role": "system", "content": repo_map_content})
                 elif comps.get('arch'):
                     # Fallback sur l'ancienne cartographie technique
                     arch_content = str(comps['arch']).strip()
                     if arch_content.startswith("--- CARTOGRAPHIE TECHNIQUE ---"):
                         arch_content = arch_content.replace("--- CARTOGRAPHIE TECHNIQUE ---", "", 1).strip()
+                    
+                    arch_content = self._truncate(arch_content, LIMIT_ARCH)
                     messages.append({
                         "role": "system",
                         "content": f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_content}"
@@ -146,11 +159,15 @@ class LiteLLMSession(BaseSession):
                 
                 # BLOC 3 : ARBORESCENCE PROJET
                 if comps.get('tree'):
-                    messages.append({"role": "system", "content": comps['tree']})
+                    tree_content = str(comps['tree']).strip()
+                    tree_content = self._truncate(tree_content, LIMIT_TREE)
+                    messages.append({"role": "system", "content": tree_content})
                 
                 # (Optionnel) LTM dans le système
                 if comps.get('ltm'):
-                    messages.append({"role": "system", "content": comps['ltm']})
+                    ltm_content = str(comps['ltm']).strip()
+                    ltm_content = self._truncate(ltm_content, LIMIT_LTM)
+                    messages.append({"role": "system", "content": ltm_content})
         
         except Exception as e:
             UnifiedLogger.write("AI_CORE", "WARNING", f"Echec assemblage composants CacheManager: {e}")
