@@ -207,14 +207,6 @@ def build_cli_prompt(
     tree = comps.get("tree") or ""
     ltm = comps.get("ltm") or ""
 
-    # Sécurisation si rag_context est un dict (bug fix sequence item 5)
-    rag_safe = rag_context
-    if isinstance(rag_safe, dict):
-        if rag_safe.get("docs"):
-            rag_safe = str(rag_safe["docs"]).strip()
-        else:
-            rag_safe = str(rag_safe)
-
     # Troncatures par bloc (avec repo_map si disponible)
     if repo_map:
         repo_map_t, repo_map_tr = _truncate(repo_map, arch_max)
@@ -224,7 +216,7 @@ def build_cli_prompt(
         arch_t, arch_tr = _truncate(arch, arch_max)
     tree_t, tree_tr = _truncate(tree, tree_max)
     ltm_t, ltm_tr = _truncate(ltm, ltm_max)
-    rag_t, rag_tr = _truncate(rag_safe or "", rag_max)
+    rag_t, rag_tr = _truncate(rag_context or "", rag_max)
     hist_raw = _format_history(history, max_turns=max_history_turns)
     hist_t, hist_tr = _truncate(hist_raw, history_max)
     if defer_message:

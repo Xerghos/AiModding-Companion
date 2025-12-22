@@ -33,6 +33,7 @@ except ImportError:
 
 from features.UnifiedLogger import UnifiedLogger
 from features.Decorators import trace_action
+from config.settings import APP_SETTINGS
 
 log = logging.getLogger("ai_core.litellm_proxy")
 
@@ -253,8 +254,20 @@ class LiteLLMProxy:
         # Gestion de l'authentification : OAuth (Login with Google) pour Gemini si disponible, sinon API key
         use_oauth = False
         if provider == ModelProvider.GEMINI:
-            # Essayer d'utiliser l'auth Google OAuth (Login with Google) pour profiter des tokens gratuits
-            use_oauth = self._try_google_oauth_auth()
+            # CAS 3 (Strict) : Si Bridge activé ET Modèle dans la liste -> OAuth/CodeAssist
+            # On vérifie les paramètres CLI Bridge
+            cli_cfg = APP_SETTINGS.get("cli_bridge", {})
+            cli_enabled = cli_cfg.get("enabled", False)
+            cli_models = [m.lower().strip() for m in cli_cfg.get("models", [])]
+            
+            # Modèle est-il dans la liste ?
+            is_bridged = cli_enabled and (model.lower().strip() in cli_models or normalized_model.lower().strip() in cli_models)
+            
+            if is_bridged:
+                # Essayer d'utiliser l'auth Google OAuth (Login with Google)
+                if self._try_google_oauth_auth():
+                    use_oauth = True
+                    UnifiedLogger.write("AI_CORE", "CLI_BRIDGE", f"🌉 CAS 3: CodeAssist activé pour {normalized_model}")
             
             if use_oauth:
                 # IMPORTANT: Utiliser le custom provider LiteLLM pour CodeAssist

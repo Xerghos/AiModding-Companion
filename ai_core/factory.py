@@ -159,12 +159,19 @@ class SmartSessionFactory:
         Crée une session configurée avec le gestionnaire de clés central.
         Phase 1.4 : Support LiteLLM avec fallback legacy.
         """
+        # Résolution du modèle (nécessaire pour vérifier le bridge)
+        profile_alias, real_model = self._resolve_real_model(model_type)
+        if not real_model or " " in real_model: 
+            real_model = "gemini-2.5-flash"
+
         # Phase 1.4 : Vérifier flag USE_LITELLM
         use_litellm = self.settings.get("migration_flags", {}).get("use_litellm", False)
         
+        # CAS 2 & 3 : LiteLLM activé
         if use_litellm and LITELLM_AVAILABLE:
             try:
                 # Tentative création LiteLLMSession
+                # LiteLLMSession + Proxy gérera le CAS 3 (CodeAssist) via le provider custom
                 return self.create_litellm_session(
                     model_type=model_type,
                     enable_tools=enable_tools,
@@ -180,11 +187,7 @@ class SmartSessionFactory:
                 )
                 # Continue avec code legacy
         
-        # Code legacy (inchangé)
-        profile_alias, real_model = self._resolve_real_model(model_type)
-        
-        if not real_model or " " in real_model: 
-            real_model = "gemini-2.5-flash"
+        # Code legacy (Fallback ou LiteLLM désactivé)
 
         # --- Détection Provider ---
         provider = "google_gemini"
@@ -245,11 +248,24 @@ class SmartSessionFactory:
             return UniversalResponseWrapper("OpenAI non implémenté.")
         else:
             # Gemini
-            # Phase 1.4 : Le routage CLI est maintenant géré par LiteLLMSession
-            # Si LiteLLM est activé, LiteLLMSession détectera automatiquement le CLI
-            # Sinon, on utilise GeminiSession standard
             
-            # Instanciation standard via API
+            # CAS 1 : LiteLLM désactivé, mais Bridge CLI activé pour ce modèle
+            # On vérifie si le modèle est éligible au pont CLI
+            cli_cfg = self.settings.get("cli_bridge", {})
+            cli_enabled = cli_cfg.get("enabled", False)
+            cli_models = [m.lower().strip() for m in cli_cfg.get("models", [])]
+            is_bridged = cli_enabled and (real_model.lower().strip() in cli_models)
+
+            if is_bridged:
+                UnifiedLogger.write("FACTORY", "CLI", f"🌉 CAS 1: Activation GeminiCliSession pour {real_model}")
+                return GeminiCliSession(
+                    self.key_manager,
+                    model_name=real_model,
+                    system_instruction=system_instruction,
+                    agent_name=agent_identity
+                )
+
+            # Instanciation standard via API (Fallback Chain)
             available = list(self.registry.values())
             fallback_chain = self._generate_model_cascade(real_model, available)
 

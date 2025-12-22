@@ -69,45 +69,6 @@ class LiteLLMSession(BaseSession):
         self._cli_session = None  # Toujours initialiser à None en premier
         self.proxy = None  # Initialiser à None (sera créé si nécessaire)
         
-        # Phase 1.3 : Détection Gemini-CLI et délégation (logique centralisée dans LiteLLM)
-        # Si CLI est activé pour les modèles Gemini, on délègue COMPLÈTEMENT à GeminiCliSession
-        # Cela évite que LiteLLM essaie d'utiliser Vertex AI qui nécessite des credentials Google Cloud
-        if self._should_use_cli():
-            # Délégation complète à GeminiCliSession
-            # Toutes les opérations (send_message, history, etc.) passeront par GeminiCliSession
-            try:
-                self._cli_session = GeminiCliSession(
-                    key_manager=key_manager,
-                    model_name=model_name,
-                    system_instruction=system_instruction,
-                    agent_name=agent_name
-                )
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "CLI_BRIDGE",
-                    f"🌉 LiteLLMSession délègue COMPLÈTEMENT à GeminiCliSession pour {model_name} (CLI Bridge activé)\n"
-                    f"   → Toutes les opérations passeront par le CLI Gemini (auth native, tokens gratuits)\n"
-                    f"   → LiteLLM/Vertex AI ne sera PAS utilisé pour ce modèle"
-                )
-                # Initialisation terminée, on utilise CLI (pas besoin de proxy LiteLLM)
-                # Toutes les méthodes (send_message, chat, history) délègueront à _cli_session
-                return
-            except FatalKeyError as e:
-                # CLI non installé ou non authentifié - erreur fatale
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "ERROR",
-                    f"CLI requis mais indisponible: {e}. Vérifiez l'installation: npm install -g @google/gemini-cli && gemini auth login"
-                )
-                raise e
-            except Exception as e:
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "WARNING",
-                    f"Echec création GeminiCliSession, fallback LiteLLM: {e}"
-                )
-                # Continue avec LiteLLM normal (fallback gracieux)
-        
         # Instance proxy LiteLLM (si pas CLI ou si CLI a échoué)
         try:
             self.proxy = get_litellm_proxy()
@@ -123,51 +84,6 @@ class LiteLLMSession(BaseSession):
             f"LiteLLMSession créée ({model_name})",
             {"agent": agent_name, "mode": "LiteLLM"}
         )
-    
-    def _should_use_cli(self) -> bool:
-        """
-        Détermine si on doit utiliser Gemini-CLI pour ce modèle.
-        
-        Logique centralisée dans LiteLLMSession :
-        - Vérifie le flag CLI Bridge (enabled)
-        - Vérifie si le modèle est dans la liste dynamique cli_bridge.models
-        - Vérifie si le modèle contient "cli" dans le nom (détection automatique)
-        
-        Returns:
-            True si CLI doit être utilisé, False sinon
-        """
-        # Vérifier flag CLI Bridge
-        cli_bridge = APP_SETTINGS.get("cli_bridge", {}) if isinstance(APP_SETTINGS, dict) else {}
-        cli_enabled = cli_bridge.get("enabled", False)
-        
-        if not cli_enabled:
-            return False
-        
-        # Normalisation pour comparaison (insensible à la casse)
-        target_model = str(self.model_name).strip().lower()
-        
-        # Vérifier si le modèle est dans la liste CLI configurée (liste dynamique depuis settings)
-        cli_models = cli_bridge.get("models", [])
-        cli_models_norm = [str(m).strip().lower() for m in cli_models]
-        
-        if target_model in cli_models_norm:
-            UnifiedLogger.write(
-                "AI_CORE",
-                "DEBUG",
-                f"Modèle {self.model_name} détecté dans liste CLI: {cli_models}"
-            )
-            return True
-        
-        # Vérifier aussi si le modèle contient "cli" dans le nom (détection automatique)
-        if "cli" in target_model:
-            UnifiedLogger.write(
-                "AI_CORE",
-                "DEBUG",
-                f"Modèle {self.model_name} contient 'cli' dans le nom (détection automatique)"
-            )
-            return True
-        
-        return False
     
     def _create_msg(self, role: str, text: str) -> Dict[str, str]:
         """Crée un message au format standard."""
@@ -313,17 +229,6 @@ class LiteLLMSession(BaseSession):
         Returns:
             UniversalResponseWrapper ou générateur (stream)
         """
-        # Phase 1.3 : Délégation Gemini-CLI si activé
-        if hasattr(self, '_cli_session') and self._cli_session:
-            # Délégation complète à GeminiCliSession
-            # Préservation isolation, limites, subprocess
-            return self._cli_session.send_message(
-                message=message,
-                stream=stream,
-                tool_config=tool_config,
-                rag_context=rag_context
-            )
-        
         # Pour Gemini, essayer d'abord l'auth OAuth (Login with Google), sinon API key
         # Cela permet de profiter des tokens gratuits Google AI Pro
         self.current_key = None
@@ -567,25 +472,17 @@ class LiteLLMSession(BaseSession):
     
     @property
     def history(self):
-        """Historique de la session (délégation à CLI si activé)."""
-        if hasattr(self, '_cli_session') and self._cli_session:
-            return self._cli_session.history
+        """Historique de la session."""
         return self._history
     
     @history.setter
     def history(self, val):
-        """Setter pour l'historique (délégation à CLI si activé)."""
-        if hasattr(self, '_cli_session') and self._cli_session:
-            self._cli_session.history = val
-        else:
-            self._history = val
+        """Setter pour l'historique."""
+        self._history = val
     
     @property
     def chat(self):
         """Interface de compatibilité pour l'historique."""
-        # Délégation à CLI session si elle existe
-        if hasattr(self, '_cli_session') and self._cli_session:
-            return self._cli_session.chat
         
         class ChatInterface:
             def __init__(self, session):
