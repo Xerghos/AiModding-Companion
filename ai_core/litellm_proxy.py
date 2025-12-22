@@ -300,7 +300,7 @@ class LiteLLMProxy:
                         max_tokens=max_tokens,
                         tools=tools,
                         project_id=None,  # None = utilise quota personnel Google AI Pro
-                        session_id=None,  # Peut être géré dans LiteLLMSession si nécessaire
+                        session_id=kwargs.get("session_id"),
                         **kwargs
                     )
                     

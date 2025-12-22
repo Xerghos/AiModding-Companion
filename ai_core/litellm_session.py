@@ -69,6 +69,10 @@ class LiteLLMSession(BaseSession):
         self._cli_session = None  # Toujours initialiser à None en premier
         self.proxy = None  # Initialiser à None (sera créé si nécessaire)
         
+        # ID de session persistant pour CodeAssist (évite erreur 500)
+        import uuid
+        self.session_id = str(uuid.uuid4())
+        
         # Instance proxy LiteLLM (si pas CLI ou si CLI a échoué)
         try:
             self.proxy = get_litellm_proxy()
@@ -296,9 +300,16 @@ class LiteLLMSession(BaseSession):
         # Outils Natifs
         native_tools = None
         try:
-            native_tools = _convert_schema_to_openai(TOOLS_SCHEMA)
+            if self._use_oauth:
+                # CAS 3: CodeAssist (OAuth) -> On passe le schéma Gemini NATIF (pas de conversion OpenAI)
+                # Cela évite la perte d'informations (types, descriptions) due à la double conversion
+                native_tools = TOOLS_SCHEMA
+                UnifiedLogger.write("AI_CORE", "DEBUG", "Passage TOOLS_SCHEMA natif pour CodeAssist")
+            else:
+                # CAS 2: LiteLLM Standard -> Conversion OpenAI requise
+                native_tools = _convert_schema_to_openai(TOOLS_SCHEMA)
         except Exception as e:
-            UnifiedLogger.write("AI_CORE", "WARNING", f"Echec conversion outils: {e}")
+            UnifiedLogger.write("AI_CORE", "WARNING", f"Echec préparation outils: {e}")
         
         # Construction du Payload Structuré (SANS RAG Docs dans messages système)
         final_messages = self._build_payload_messages(rag_context=None)
@@ -319,7 +330,8 @@ class LiteLLMSession(BaseSession):
             "stream": stream,
             "tools": native_tools if native_tools else None,
             "use_oauth": self._use_oauth,
-            "provider": provider
+            "provider": provider,
+            "session_id": self.session_id
         }
         
         # Sauvegarder le payload log (format spécifique LiteLLM)
@@ -342,7 +354,8 @@ class LiteLLMSession(BaseSession):
                 stream=stream,
                 temperature=temperature,
                 max_tokens=8000,
-                tools=native_tools if native_tools else None
+                tools=native_tools if native_tools else None,
+                session_id=self.session_id # Transmission ID persistant
             )
             
             self.key_mgr.mark_success(self.current_key, self.model_name)
