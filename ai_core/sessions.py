@@ -1596,9 +1596,17 @@ class GeminiCliSession(BaseSession):
         msg_str = message if isinstance(message, str) else str(message)
         msg_arg, msg_tr = _truncate(msg_str, int(cfg["prompt_limits"].get("message", 6000)))
 
+        # Extraction du texte du contexte RAG si c'est un dictionnaire
+        rag_context_str = rag_context
+        if isinstance(rag_context, dict):
+            if rag_context.get("docs"):
+                rag_context_str = str(rag_context["docs"]).strip()
+            else:
+                rag_context_str = str(rag_context)
+
         stdin_prompt, stdin_meta = build_cli_prompt(
             message="",  # message via --prompt
-            rag_context=rag_context,
+            rag_context=rag_context_str,
             history=self.history,
             cache_components=comps,
             max_history_turns=cfg["max_history_turns"],
