@@ -85,6 +85,10 @@ class LiteLLMSession(BaseSession):
             {"agent": agent_name, "mode": "LiteLLM"}
         )
     
+    def _create_msg(self, role: str, text: str) -> Dict[str, str]:
+        """Crée un message au format standard."""
+        return {"role": role, "content": text}
+
     def _truncate(self, text: str, max_chars: int) -> str:
         """Tronque le texte s'il dépasse la limite."""
         if not text: return ""
