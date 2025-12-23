@@ -290,6 +290,10 @@ class LiteLLMProxy:
                 start_t = time.time()
                 
                 try:
+                    # Extraire session_id de kwargs pour éviter le conflit "multiple values for keyword argument"
+                    # lors du déballage de **kwargs
+                    assist_session_id = kwargs.pop("session_id", None)
+                    
                     # Appeler codeassist_completion avec les paramètres LiteLLM
                     # project_id=None pour utiliser le quota personnel
                     response = codeassist_completion(
@@ -300,7 +304,7 @@ class LiteLLMProxy:
                         max_tokens=max_tokens,
                         tools=tools,
                         project_id=None,  # None = utilise quota personnel Google AI Pro
-                        session_id=kwargs.get("session_id"),
+                        session_id=assist_session_id,
                         **kwargs
                     )
                     
