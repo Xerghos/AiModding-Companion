@@ -8,13 +8,14 @@ import requests
 import re
 from enum import Enum
 import datetime
-from threading import Lock
+from threading import Lock, Thread
 import subprocess
 import shutil
 import os
 import sys
 import tempfile
 import atexit
+from typing import Dict, Any, List, Optional
 
 from config.settings import APP_SETTINGS
 from config.logs import get_logger
@@ -1476,6 +1477,11 @@ class GeminiCliSession(BaseSession):
         self._cli_workdir = None
         self._cli_env = None
         self._init_cli_isolation()
+        
+        # Buffer statique pour optimisation de l'écriture stdin
+        # Contient la partie statique du prompt (Repo Map/Arch, Tree, LTM) qui ne change que quand le cache change
+        self._static_prompt_buffer = None
+        self._static_buffer_cache_hash = None  # Hash pour détecter les changements du cache
 
         UnifiedLogger.write(
             "AI_CORE",
@@ -1640,6 +1646,88 @@ class GeminiCliSession(BaseSession):
     def _create_msg(self, role, text):
         """Crée un message au format standard."""
         return {"role": role, "content": text}
+    
+    def _get_cache_hash(self, cache_components: Dict[str, Any]) -> str:
+        """
+        Calcule un hash simple des composants du cache pour détecter les changements.
+        
+        Args:
+            cache_components: Dictionnaire des composants du cache (repo_map, arch, tree, ltm)
+            
+        Returns:
+            Hash string représentant l'état actuel du cache
+        """
+        import hashlib
+        # Créer une représentation simple des composants statiques
+        static_keys = ["repo_map", "arch", "tree", "ltm"]
+        static_data = {k: str(cache_components.get(k, "")) for k in static_keys}
+        # Sérialiser et hasher
+        data_str = json.dumps(static_data, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(data_str.encode('utf-8')).hexdigest()
+    
+    def _update_static_buffer(self, cache_components: Dict[str, Any], limits: Dict[str, int], max_history_turns: int):
+        """
+        Met à jour le buffer statique avec la partie statique du prompt.
+        Appelée quand le cache change ou si le buffer n'existe pas encore.
+        
+        Args:
+            cache_components: Composants du cache (repo_map, arch, tree, ltm)
+            limits: Limites de troncature pour chaque section
+            max_history_turns: Nombre de tours d'historique (non utilisé pour la partie statique)
+        """
+        from ai_core.prompt_builders import build_cli_prompt_split
+        
+        # Construire uniquement la partie statique (sans RAG, history, message)
+        static_part, _, meta = build_cli_prompt_split(
+            message="",  # Pas de message pour la partie statique
+            rag_context=None,  # Pas de RAG pour la partie statique
+            history=[],  # Pas d'historique pour la partie statique
+            cache_components=cache_components,
+            max_history_turns=max_history_turns,
+            limits=limits,
+            defer_message=True,
+        )
+        
+        self._static_prompt_buffer = static_part
+        self._static_buffer_cache_hash = self._get_cache_hash(cache_components)
+        
+        UnifiedLogger.write(
+            "AI_CORE",
+            "DEBUG",
+            f"CLI Buffer statique mis à jour: {len(static_part)} chars (hash: {self._static_buffer_cache_hash[:8]}...)"
+        )
+    
+    def _get_dynamic_prompt(self, message: str, rag_context: Optional[str], history: List[Dict[str, Any]], 
+                           cache_components: Dict[str, Any], limits: Dict[str, int], max_history_turns: int) -> str:
+        """
+        Construit uniquement la partie dynamique du prompt (RAG Context, History, Message).
+        
+        Args:
+            message: Message utilisateur
+            rag_context: Contexte RAG
+            history: Historique de conversation
+            cache_components: Composants du cache (requis pour build_cli_prompt_split, mais seule la partie dynamique est utilisée)
+            limits: Limites de troncature
+            max_history_turns: Nombre de tours d'historique
+            
+        Returns:
+            Partie dynamique du prompt (string)
+        """
+        from ai_core.prompt_builders import build_cli_prompt_split
+        
+        # Construire les deux parties, mais on n'utilisera que la partie dynamique
+        # La partie statique sera ignorée car on utilisera le buffer
+        _, dynamic_part, _ = build_cli_prompt_split(
+            message=message,
+            rag_context=rag_context,
+            history=history,
+            cache_components=cache_components,  # Requis pour la fonction, mais seule dynamic_part est utilisée
+            max_history_turns=max_history_turns,
+            limits=limits,
+            defer_message=False,
+        )
+        
+        return dynamic_part
 
     def _build_full_prompt(self, message, rag_context=None):
         """
@@ -1686,18 +1774,71 @@ class GeminiCliSession(BaseSession):
             UnifiedLogger.write("AI_CORE", "WARNING", f"CLI Bridge: échec get_components: {e}")
             comps = {}
 
-        from ai_core.prompt_builders import _truncate  # usage interne pour sécuriser l’arg --prompt
+        from ai_core.prompt_builders import _truncate  # usage interne pour sécuriser l'arg --prompt
         msg_str = message if isinstance(message, str) else str(message)
         msg_arg, msg_tr = _truncate(msg_str, int(cfg["prompt_limits"].get("message", 6000)))
 
-        stdin_prompt, stdin_meta = build_cli_prompt(
+        # OPTIMISATION: Utiliser le buffer statique + concaténation rapide
+        # 1. Vérifier si le buffer statique est à jour
+        current_cache_hash = self._get_cache_hash(comps)
+        buffer_needs_update = (
+            self._static_prompt_buffer is None or 
+            self._static_buffer_cache_hash != current_cache_hash
+        )
+        
+        if buffer_needs_update:
+            concat_start = time.time()
+            self._update_static_buffer(comps, cfg["prompt_limits"], cfg["max_history_turns"])
+            concat_time = (time.time() - concat_start) * 1000
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"CLI Buffer statique mis à jour en {concat_time:.2f}ms"
+            )
+        else:
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"CLI Buffer statique réutilisé (hash: {current_cache_hash[:8]}...)"
+            )
+        
+        # 2. Construire uniquement la partie dynamique
+        dynamic_start = time.time()
+        dynamic_part = self._get_dynamic_prompt(
             message="",  # message via --prompt
             rag_context=rag_context,
             history=self.history,
             cache_components=comps,
-            max_history_turns=cfg["max_history_turns"],
             limits=cfg["prompt_limits"],
-            defer_message=True,
+            max_history_turns=cfg["max_history_turns"],
+        )
+        dynamic_time = (time.time() - dynamic_start) * 1000
+        
+        # 3. Concaténer rapidement statique + dynamique
+        concat_start = time.time()
+        if self._static_prompt_buffer and dynamic_part:
+            stdin_prompt = f"{self._static_prompt_buffer}\n\n{dynamic_part}"
+        elif self._static_prompt_buffer:
+            stdin_prompt = self._static_prompt_buffer
+        elif dynamic_part:
+            stdin_prompt = dynamic_part
+        else:
+            stdin_prompt = ""
+        concat_time = (time.time() - concat_start) * 1000
+        
+        UnifiedLogger.write(
+            "AI_CORE",
+            "DEBUG",
+            f"CLI Prompt construit: dynamique en {dynamic_time:.2f}ms, concaténation en {concat_time:.2f}ms, total: {len(stdin_prompt)} chars"
+        )
+        
+        # Créer une meta simplifiée pour compatibilité (on n'a pas la meta complète car on a construit séparément)
+        # On va recalculer les tailles pour la meta
+        from ai_core.prompt_builders import PromptBuildMeta
+        stdin_meta = PromptBuildMeta(
+            total_chars=len(stdin_prompt),
+            truncated={},  # On ne track pas la troncature dans ce mode optimisé
+            sizes={}  # On ne track pas les tailles individuelles dans ce mode optimisé
         )
 
         # Attache meta pour logs
@@ -2021,6 +2162,8 @@ class GeminiCliSession(BaseSession):
                 # Mode streaming : on lit stdout ligne par ligne
                 def cli_generator():
                     try:
+                        # Mesure du temps de démarrage du processus
+                        process_start = time.time()
                         process = subprocess.Popen(
                             cmd,
                             stdout=subprocess.PIPE,
@@ -2032,26 +2175,107 @@ class GeminiCliSession(BaseSession):
                             cwd=self._cli_workdir or os.getcwd(),
                             env=self._cli_env
                         )
+                        process_created = time.time()
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "DEBUG",
+                            f"CLI Process créé en {(process_created - process_start)*1000:.0f}ms"
+                        )
 
-                        # Envoyer le contexte sur stdin, puis fermer pour déclencher l’exécution non-interactive
-                        try:
-                            process.stdin.write(stdin_prompt)
-                            if not stdin_prompt.endswith("\n"):
-                                process.stdin.write("\n")
-                        finally:
-                            try:
-                                process.stdin.close()
-                            except Exception:
-                                pass
+                        # OPTIMISATION: Écriture stdin asynchrone dans un thread séparé
+                        # Cela évite le blocage pendant que le processus démarre et découvre les outils MCP
+                        stdin_start = time.time()
+                        stdin_write_error = [None]  # Liste pour capturer l'erreur depuis le thread
+                        stdin_write_complete = [False]  # Flag pour indiquer la fin de l'écriture
                         
+                        def write_stdin_async(process, full_prompt):
+                            """Écrit stdin dans un thread séparé pour éviter le blocage."""
+                            try:
+                                process.stdin.write(full_prompt)
+                                if not full_prompt.endswith("\n"):
+                                    process.stdin.write("\n")
+                                process.stdin.close()
+                                stdin_write_complete[0] = True
+                            except Exception as e:
+                                stdin_write_error[0] = e
+                                try:
+                                    process.stdin.close()
+                                except Exception:
+                                    pass
+                        
+                        # Lancer le thread d'écriture stdin immédiatement
+                        stdin_thread = Thread(target=write_stdin_async, args=(process, stdin_prompt), daemon=True)
+                        stdin_thread.start()
+                        
+                        # On continue immédiatement à lire stdout pendant que stdin s'écrit en arrière-plan
+                        # Le thread se terminera automatiquement quand stdin sera fermé
+                        stdin_sent = time.time()
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "DEBUG",
+                            f"CLI stdin écriture asynchrone lancée ({len(stdin_prompt)} chars) en {(stdin_sent - stdin_start)*1000:.2f}ms"
+                        )
+                        
+                        # Mesure du temps avant la première ligne de sortie
+                        first_line_received = False
+                        first_line_time = None
                         full_response = ""
                         for line in process.stdout:
+                            if not first_line_received:
+                                first_line_time = time.time()
+                                first_line_delay = (first_line_time - stdin_sent) * 1000
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "DEBUG",
+                                    f"CLI Première ligne reçue après {first_line_delay:.0f}ms (découverte MCP + construction payload + latence réseau)"
+                                )
+                                first_line_received = True
+                            
                             if line.strip():
                                 full_response += line
                                 yield line
                         
                         # Attente de la fin du processus
                         process.wait()
+                        process_end = time.time()
+                        
+                        # Vérifier si l'écriture stdin a terminé et s'il y a eu une erreur
+                        if stdin_write_error[0]:
+                            raise Exception(f"Erreur écriture stdin: {stdin_write_error[0]}")
+                        
+                        # Attendre que le thread stdin se termine (devrait déjà être terminé)
+                        stdin_thread.join(timeout=1.0)  # Timeout de 1s pour éviter de bloquer indéfiniment
+                        if stdin_thread.is_alive():
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "WARNING",
+                                "CLI Thread stdin n'a pas terminé dans les temps (timeout 1s)"
+                            )
+                        
+                        # Calculer le temps réel d'écriture stdin (approximatif, car asynchrone)
+                        # On utilise le temps jusqu'à la première ligne comme proxy
+                        stdin_write_complete_time = first_line_time if first_line_received else stdin_sent
+                        stdin_duration_ms = (stdin_write_complete_time - stdin_start) * 1000
+                        
+                        # Logs détaillés des timings
+                        total_duration = (process_end - process_start) * 1000
+                        process_creation_ms = (process_created - process_start) * 1000
+                        first_line_delay_ms = (first_line_time - stdin_sent) * 1000 if first_line_received else 0
+                        streaming_duration_ms = (process_end - first_line_time) * 1000 if first_line_received else 0
+                        
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "DEBUG",
+                            "CLI Timing Breakdown",
+                            {
+                                "process_creation_ms": process_creation_ms,
+                                "stdin_write_ms": stdin_duration_ms,
+                                "first_line_delay_ms": first_line_delay_ms,
+                                "streaming_duration_ms": streaming_duration_ms,
+                                "total_ms": total_duration,
+                                "response_length": len(full_response)
+                            }
+                        )
                         
                         if process.returncode != 0:
                             error_output = process.stderr.read()

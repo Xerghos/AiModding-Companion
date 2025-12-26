@@ -11,11 +11,53 @@ LOG_DIR = "logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
-# [MODIF] Horodatage de démarrage de l'application (fixe pour toute la session)
-# Le timestamp est généré une seule fois au chargement du module et reste constant
+# [MODIF] Horodatage de démarrage de l'application (lazy initialization)
+# Le timestamp est généré lors de la première écriture et reste constant pour toute la session
+# Si un fichier de log récent existe (créé dans les 5 dernières minutes), il est réutilisé
 # Format : Jour-Mois_Heure-Minute-Seconde pour identifier la session
-_app_start_ts = datetime.datetime.now().strftime("%d-%b_%Hh%M_%S")
-LOG_FILE = os.path.join(LOG_DIR, f"global_debug_{_app_start_ts}.log")
+_app_start_ts = None
+LOG_FILE = None
+
+def _get_or_create_log_file():
+    """
+    Récupère le fichier de log existant (s'il est récent) ou en crée un nouveau.
+    Le timestamp est généré lors de la première écriture et reste constant.
+    """
+    global _app_start_ts, LOG_FILE
+    
+    if LOG_FILE is not None and os.path.exists(LOG_FILE):
+        # Le fichier existe déjà, le réutiliser
+        return LOG_FILE
+    
+    # Chercher un fichier de log récent (créé dans les 5 dernières minutes)
+    log_pattern = os.path.join(LOG_DIR, "global_debug_*.log")
+    existing_files = glob.glob(log_pattern)
+    
+    if existing_files:
+        # Trier par date de modification (plus récent en premier)
+        existing_files.sort(key=os.path.getmtime, reverse=True)
+        
+        # Vérifier si le fichier le plus récent a été créé dans les 5 dernières minutes
+        most_recent = existing_files[0]
+        file_mtime = os.path.getmtime(most_recent)
+        time_diff = datetime.datetime.now().timestamp() - file_mtime
+        
+        if time_diff < 300:  # 5 minutes = 300 secondes
+            # Réutiliser le fichier existant
+            LOG_FILE = most_recent
+            # Extraire le timestamp du nom de fichier
+            filename = os.path.basename(most_recent)
+            # Format: global_debug_26-Dec_23h11_39.log
+            if "_" in filename:
+                parts = filename.replace("global_debug_", "").replace(".log", "").split("_")
+                if len(parts) >= 3:
+                    _app_start_ts = "_".join(parts[:3])  # 26-Dec_23h11_39
+            return LOG_FILE
+    
+    # Créer un nouveau fichier avec un nouveau timestamp
+    _app_start_ts = datetime.datetime.now().strftime("%d-%b_%Hh%M_%S")
+    LOG_FILE = os.path.join(LOG_DIR, f"global_debug_{_app_start_ts}.log")
+    return LOG_FILE
 
 LOCK = threading.Lock()
 
@@ -112,7 +154,8 @@ class UnifiedLogger:
 
         with LOCK:
             try:
-                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                log_file_path = _get_or_create_log_file()
+                with open(log_file_path, "a", encoding="utf-8") as f:
                     f.write(log_entry)
             except: pass
 

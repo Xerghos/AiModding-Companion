@@ -142,7 +142,7 @@ def _detect_query_type(query: str) -> str:
         return "code"
 
 
-def build_cli_prompt(
+def build_cli_prompt_split(
     *,
     message: str,
     rag_context: Optional[str],
@@ -151,10 +151,15 @@ def build_cli_prompt(
     max_history_turns: int = 3,
     limits: Optional[Dict[str, int]] = None,
     defer_message: bool = False,
-) -> Tuple[str, PromptBuildMeta]:
+) -> Tuple[str, str, PromptBuildMeta]:
     """
-    Builder stateless (texte) pour `gemini prompt`.
-    Produit un prompt structuré façon DeepSeek: instructions + arch/tree + RAG + historique + message.
+    Version optimisée de build_cli_prompt qui sépare les parties statique et dynamique.
+    
+    Returns:
+        Tuple[static_part, dynamic_part, meta]
+        - static_part: Repo Map/Arch, Tree, LTM (mis en cache, ~15-18 KB)
+        - dynamic_part: RAG Context, History, Message (change à chaque requête, ~3-4 KB)
+        - meta: Métadonnées de construction
     """
     # Détecter le type de requête pour allocation adaptative
     query_type = _detect_query_type(message if isinstance(message, str) else str(message))
@@ -170,37 +175,31 @@ def build_cli_prompt(
     message_max = int(limits.get("message", 6000))
     
     # Allocation adaptative selon le type de requête
-    # Ajuster les limites pour prioriser les sections pertinentes
     if query_type == "code":
-        # Plus de Repo Map/Arch, moins de LTM
         arch_max = int(base_arch_max * 1.2)
         tree_max = int(base_tree_max * 1.1)
         ltm_max = int(base_ltm_max * 0.7)
         rag_max = base_rag_max
         history_max = base_history_max
     elif query_type == "concept":
-        # Plus de LTM, moins de Tree
         arch_max = base_arch_max
         tree_max = int(base_tree_max * 0.7)
         ltm_max = int(base_ltm_max * 1.3)
         rag_max = base_rag_max
         history_max = int(base_history_max * 1.1)
     elif query_type == "debug":
-        # Plus de RAG Docs, moins d'Arch
         arch_max = int(base_arch_max * 0.8)
         tree_max = base_tree_max
         ltm_max = base_ltm_max
         rag_max = int(base_rag_max * 1.3)
         history_max = base_history_max
     elif query_type == "refactor":
-        # Plus de Repo Map et RAG, moins de LTM
         arch_max = int(base_arch_max * 1.1)
         tree_max = base_tree_max
         ltm_max = int(base_ltm_max * 0.8)
         rag_max = int(base_rag_max * 1.1)
         history_max = base_history_max
     else:  # general
-        # Allocation équilibrée
         arch_max = base_arch_max
         tree_max = base_tree_max
         ltm_max = base_ltm_max
@@ -209,7 +208,6 @@ def build_cli_prompt(
 
     comps = cache_components or {}
     # Utiliser repo_map si disponible, sinon arch
-    # CORRECTION: S'assurer que les valeurs sont des strings (peuvent être des dicts)
     repo_map_raw = comps.get("repo_map")
     repo_map = str(repo_map_raw) if repo_map_raw else ""
     
@@ -222,7 +220,7 @@ def build_cli_prompt(
     ltm_raw = comps.get("ltm")
     ltm = str(ltm_raw) if ltm_raw else ""
 
-    # Troncatures par bloc (avec repo_map si disponible)
+    # Troncatures par bloc (avec repo_map si disponible) - PARTIE STATIQUE
     if repo_map:
         repo_map_t, repo_map_tr = _truncate(repo_map, arch_max)
         arch_t, arch_tr = "", False
@@ -232,11 +230,24 @@ def build_cli_prompt(
     tree_t, tree_tr = _truncate(tree, tree_max)
     ltm_t, ltm_tr = _truncate(ltm, ltm_max)
     
-    # CORRECTION: S'assurer que rag_context est une string
+    # Construire la partie STATIQUE (Repo Map/Arch, Tree, LTM)
+    static_parts: List[str] = []
+    static_parts.append("=== CONTEXTE PROJET (AUTOMATIQUE) ===")
+    if repo_map_t:
+        static_parts.append(repo_map_t)
+    elif arch_t:
+        static_parts.append(arch_t)
+    if tree_t:
+        static_parts.append(tree_t)
+    if ltm_t:
+        static_parts.append(ltm_t)
+    
+    static_part = "\n\n".join([str(p) for p in static_parts if p]).strip()
+    
+    # PARTIE DYNAMIQUE (RAG Context, History, Message)
     rag_context_str = ""
     if rag_context:
         if isinstance(rag_context, dict):
-            # Si c'est un dict, extraire la partie "docs" ou convertir en string
             if "docs" in rag_context:
                 rag_context_str = str(rag_context["docs"])
             else:
@@ -248,47 +259,32 @@ def build_cli_prompt(
     hist_raw = _format_history(history, max_turns=max_history_turns)
     hist_t, hist_tr = _truncate(hist_raw, history_max)
     
-    # Log pour diagnostic
-    import logging
-    log = logging.getLogger("Features.prompt_builders")
-    log.debug(
-        f"📝 Historique dans stdin_prompt: {len(hist_raw)} chars avant troncature, "
-        f"{len(hist_t)} chars après troncature (limite: {history_max}), "
-        f"tronqué: {hist_tr}"
-    )
     if defer_message:
         msg_t, msg_tr = "", False
     else:
         msg_t, msg_tr = _truncate(message if isinstance(message, str) else str(message), message_max)
 
-    parts: List[str] = []
-
-    # Note: le system prompt principal est fourni via GEMINI_SYSTEM_MD, ici on met juste la structure
-    parts.append("=== CONTEXTE PROJET (AUTOMATIQUE) ===")
-    if repo_map_t:
-        parts.append(repo_map_t)
-    elif arch_t:
-        parts.append(arch_t)
-    if tree_t:
-        parts.append(tree_t)
-    if ltm_t:
-        parts.append(ltm_t)
-
+    dynamic_parts: List[str] = []
     if rag_t:
-        parts.append("=== 📂 RAG CONTEXT (DOCS) ===")
-        parts.append(rag_t)
-
+        dynamic_parts.append("=== 📂 RAG CONTEXT (DOCS) ===")
+        dynamic_parts.append(rag_t)
     if hist_t:
-        parts.append("=== HISTORIQUE RÉCENT ===")
-        parts.append(hist_t)
-
-    parts.append("=== MESSAGE ACTUEL ===")
+        dynamic_parts.append("=== HISTORIQUE RÉCENT ===")
+        dynamic_parts.append(hist_t)
+    dynamic_parts.append("=== MESSAGE ACTUEL ===")
     if not defer_message:
-        parts.append(msg_t)
-
-    # CORRECTION: Filtrer et convertir tous les éléments en strings pour éviter l'erreur "expected str instance, dict found"
-    prompt = "\n\n".join([str(p) for p in parts if p]).strip()
-
+        dynamic_parts.append(msg_t)
+    
+    dynamic_part = "\n\n".join([str(p) for p in dynamic_parts if p]).strip()
+    
+    # Concaténer pour le prompt complet (pour compatibilité avec build_cli_prompt)
+    full_prompt = static_part
+    if dynamic_part:
+        if full_prompt:
+            full_prompt = f"{full_prompt}\n\n{dynamic_part}"
+        else:
+            full_prompt = dynamic_part
+    
     # Contrôle total (si on dépasse, on coupe depuis les sections les moins critiques)
     truncated: Dict[str, bool] = {
         "repo_map": repo_map_tr,
@@ -301,9 +297,15 @@ def build_cli_prompt(
         "total": False,
     }
 
-    if len(prompt) > total_max:
-        prompt, total_tr = _truncate(prompt, total_max)
+    if len(full_prompt) > total_max:
+        full_prompt, total_tr = _truncate(full_prompt, total_max)
         truncated["total"] = total_tr
+        # Si tronqué au total, on doit aussi tronquer les parties
+        if len(static_part) + len(dynamic_part) > total_max:
+            # Prioriser la partie statique, tronquer la dynamique si nécessaire
+            available_for_dynamic = max(0, total_max - len(static_part))
+            if len(dynamic_part) > available_for_dynamic:
+                dynamic_part, _ = _truncate(dynamic_part, available_for_dynamic)
 
     sizes: Dict[str, int] = {
         "repo_map": len(repo_map_t),
@@ -316,11 +318,50 @@ def build_cli_prompt(
     }
 
     meta = PromptBuildMeta(
-        total_chars=len(prompt),
+        total_chars=len(full_prompt),
         truncated=truncated,
         sizes=sizes,
     )
 
-    return prompt, meta
+    return static_part, dynamic_part, meta
+
+
+def build_cli_prompt(
+    *,
+    message: str,
+    rag_context: Optional[str],
+    history: List[Dict[str, Any]],
+    cache_components: Optional[Dict[str, str]] = None,
+    max_history_turns: int = 3,
+    limits: Optional[Dict[str, int]] = None,
+    defer_message: bool = False,
+) -> Tuple[str, PromptBuildMeta]:
+    """
+    Builder stateless (texte) pour `gemini prompt`.
+    Produit un prompt structuré façon DeepSeek: instructions + arch/tree + RAG + historique + message.
+    
+    Note: Utilise build_cli_prompt_split() en interne pour la rétrocompatibilité.
+    """
+    static_part, dynamic_part, meta = build_cli_prompt_split(
+        message=message,
+        rag_context=rag_context,
+        history=history,
+        cache_components=cache_components,
+        max_history_turns=max_history_turns,
+        limits=limits,
+        defer_message=defer_message,
+    )
+    
+    # Concaténer les parties pour retourner le prompt complet
+    if static_part and dynamic_part:
+        prompt = f"{static_part}\n\n{dynamic_part}"
+    elif static_part:
+        prompt = static_part
+    elif dynamic_part:
+        prompt = dynamic_part
+    else:
+        prompt = ""
+    
+    return prompt.strip(), meta
 
 
