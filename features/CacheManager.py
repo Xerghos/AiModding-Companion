@@ -41,6 +41,7 @@ class MultiModelCacheManager:
                 'logs', 'backups', 'audio_cache'
             })
             self.components['tree'] = f"--- ARBORESCENCE PROJET ---\n{tree}"
+            log.info(f"✅ Arborescence générée: {len(tree)} caractères")
         except Exception as e: 
             log.warning(f"Erreur Tree: {e}")
             self.components['tree'] = ""
@@ -56,8 +57,10 @@ class MultiModelCacheManager:
                     # Minification + Tri pour stabilité binaire parfaite
                     arch_str = json.dumps(condensed_arch, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
                     self.components['arch'] = f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_str}"
+                    log.info(f"✅ Architecture Map chargée: {len(arch_str)} caractères")
             else:
                 self.components['arch'] = ""
+                log.info("ℹ️ Architecture Map non trouvée (config/architecture_map.json)")
         except Exception as e:
             log.warning(f"Erreur Architecture: {e}")
             self.components['arch'] = ""
@@ -76,11 +79,23 @@ class MultiModelCacheManager:
             repo_map = repo_map_gen.get_repo_map()  # Sans limite pour le cache
             if repo_map:
                 self.components['repo_map'] = f"--- 🗺️ REPO MAP (Structure du Projet) ---\n{repo_map}"
+                log.info(f"✅ Repo Map générée: {len(repo_map)} caractères")
             else:
                 self.components['repo_map'] = ""
+                log.info("ℹ️ Repo Map vide")
         except Exception as e:
             log.warning(f"Erreur Repo Map: {e}")
             self.components['repo_map'] = ""
+        
+        # Log de comparaison repo_map vs arch
+        repo_map_size = len(self.components.get('repo_map', ''))
+        arch_size = len(self.components.get('arch', ''))
+        if repo_map_size > 0:
+            log.info(f"📊 Utilisation Repo Map ({repo_map_size} chars) au lieu de Architecture Map ({arch_size} chars)")
+        elif arch_size > 0:
+            log.info(f"📊 Utilisation Architecture Map ({arch_size} chars) - Repo Map non disponible")
+        else:
+            log.info("⚠️ Ni Repo Map ni Architecture Map disponibles")
 
         # 4. HISTORIQUE LTM (Variable)
         try:
@@ -88,8 +103,10 @@ class MultiModelCacheManager:
             if GlobalMemoryManager:
                 # On récupère le bloc compressé (si dispo)
                 self.components['ltm'] = GlobalMemoryManager.get_compressed_history_block()
+                log.info(f"✅ LTM chargé: {len(self.components['ltm'])} caractères")
             else:
                 self.components['ltm'] = ""
+                log.info("ℹ️ LTM non disponible (GlobalMemoryManager non initialisé)")
         except Exception as e:
             log.warning(f"Erreur LTM: {e}")
             self.components['ltm'] = ""
@@ -145,10 +162,24 @@ class MultiModelCacheManager:
         Affiche tous les fichiers et dossiers pertinents, sans limite de profondeur.
         Utilise .gitignore pour filtrer les fichiers et dossiers ignorés.
         """
-        from features.gitignore_parser import load_gitignore_patterns, should_ignore_path
+        from features.gitignore_parser import load_gitignore_patterns, should_ignore_path, PATHSPEC_AVAILABLE
         
         root_path_str = str(root_path)
-        gitignore_spec = load_gitignore_patterns(root_path_str)
+        
+        # Vérifier si pathspec est disponible
+        if not PATHSPEC_AVAILABLE:
+            log.warning(f"⚠️ Package 'pathspec' non installé. Installez-le avec: pip install pathspec>=0.11.0")
+            gitignore_spec = None
+        else:
+            gitignore_spec = load_gitignore_patterns(root_path_str)
+        
+        if gitignore_spec:
+            log.info(f"✅ .gitignore chargé pour l'arborescence (root: {root_path_str})")
+        else:
+            if PATHSPEC_AVAILABLE:
+                log.info(f"⚠️ .gitignore non disponible, utilisation du fallback (root: {root_path_str})")
+            else:
+                log.warning(f"⚠️ .gitignore non disponible (pathspec non installé), utilisation du fallback (root: {root_path_str})")
         
         # Fallback : liste basique si .gitignore non disponible
         if ignore_dirs is None: 
@@ -165,11 +196,22 @@ class MultiModelCacheManager:
             '.sqlite', '.sqlite3', '.db', '.index', '.pkl'
         }
         
+        # Compteurs pour le logging
+        dirs_ignored_gitignore = 0
+        dirs_ignored_fallback = 0
+        files_ignored_gitignore = 0
+        files_ignored_extensions = 0
+        total_dirs_scanned = 0
+        total_files_scanned = 0
+        
         for root, dirs, files in os.walk(root_path):
+            total_dirs_scanned += 1
+            total_files_scanned += len(files)
             # Vérifier si le dossier actuel est ignoré selon .gitignore
             if gitignore_spec and should_ignore_path(str(root), root_path_str, gitignore_spec):
                 # Ne pas afficher ce dossier ni ses enfants
                 dirs[:] = []  # Empêcher de descendre
+                dirs_ignored_gitignore += 1
                 continue
             
             # Vérifier aussi la liste hardcodée (fallback)
@@ -177,6 +219,7 @@ class MultiModelCacheManager:
             if folder_name in ignore_dirs:
                 # Ne pas afficher ce dossier ni ses enfants
                 dirs[:] = []  # Empêcher de descendre
+                dirs_ignored_fallback += 1
                 continue
             
             # Calcul de la profondeur relative pour l'indentation
@@ -188,12 +231,16 @@ class MultiModelCacheManager:
             
             # Filtrage in-place des dossiers ignorés selon .gitignore
             if gitignore_spec:
+                original_dirs_count = len(dirs)
                 dirs[:] = [d for d in dirs if not should_ignore_path(
                     os.path.join(str(root), d), root_path_str, gitignore_spec
                 )]
+                dirs_ignored_gitignore += (original_dirs_count - len(dirs))
             else:
                 # Fallback : utiliser la liste hardcodée
+                original_dirs_count = len(dirs)
                 dirs[:] = [d for d in dirs if d not in ignore_dirs]
+                dirs_ignored_fallback += (original_dirs_count - len(dirs))
             
             # Trier pour cohérence
             dirs.sort()
@@ -210,13 +257,25 @@ class MultiModelCacheManager:
                 
                 # Ignorer selon .gitignore
                 if gitignore_spec and should_ignore_path(file_path, root_path_str, gitignore_spec):
+                    files_ignored_gitignore += 1
                     continue
                 
                 # Ignorer seulement les fichiers vraiment inutiles (extensions)
                 if any(f.endswith(ext) for ext in ignored_file_extensions):
+                    files_ignored_extensions += 1
                     continue
                     
                 lines.append(f"{subindent}{f}")
+        
+        # Log des statistiques de filtrage
+        log.info(
+            f"📊 Arborescence générée: {len(lines)} lignes, "
+            f"{total_dirs_scanned} dossiers scannés, {total_files_scanned} fichiers scannés. "
+            f"Ignorés: {dirs_ignored_gitignore + dirs_ignored_fallback} dossiers "
+            f"({dirs_ignored_gitignore} via .gitignore, {dirs_ignored_fallback} via fallback), "
+            f"{files_ignored_gitignore + files_ignored_extensions} fichiers "
+            f"({files_ignored_gitignore} via .gitignore, {files_ignored_extensions} via extensions)"
+        )
                     
         return "\n".join(lines)
 

@@ -76,7 +76,7 @@ def build_cli_system_md(system_instruction: Optional[str], *, language: str = "f
 def _format_history(history: List[Dict[str, Any]], max_turns: int) -> str:
     if not history:
         return ""
-    # max_turns = nombre d’échanges (user+assistant) => 2*max_turns messages
+    # max_turns = nombre d'échanges (user+assistant) => 2*max_turns messages
     tail = history[-(max_turns * 2):]
     lines: List[str] = []
     for msg in tail:
@@ -88,7 +88,14 @@ def _format_history(history: List[Dict[str, Any]], max_turns: int) -> str:
             lines.append(f"Assistant: {content}")
         else:
             lines.append(f"User: {content}")
-    return "\n".join(lines).strip()
+    formatted = "\n".join(lines).strip()
+    
+    # Log pour diagnostic
+    import logging
+    log = logging.getLogger("Features.prompt_builders")
+    log.debug(f"📝 Historique formaté: {len(history)} messages totaux, {len(tail)} messages sélectionnés (max_turns={max_turns}), {len(formatted)} caractères")
+    
+    return formatted
 
 
 def _detect_query_type(query: str) -> str:
@@ -240,6 +247,15 @@ def build_cli_prompt(
     rag_t, rag_tr = _truncate(rag_context_str, rag_max)
     hist_raw = _format_history(history, max_turns=max_history_turns)
     hist_t, hist_tr = _truncate(hist_raw, history_max)
+    
+    # Log pour diagnostic
+    import logging
+    log = logging.getLogger("Features.prompt_builders")
+    log.debug(
+        f"📝 Historique dans stdin_prompt: {len(hist_raw)} chars avant troncature, "
+        f"{len(hist_t)} chars après troncature (limite: {history_max}), "
+        f"tronqué: {hist_tr}"
+    )
     if defer_message:
         msg_t, msg_tr = "", False
     else:

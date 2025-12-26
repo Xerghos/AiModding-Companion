@@ -1654,8 +1654,52 @@ class GeminiCliSession(BaseSession):
         
         # 3. HISTORIQUE CONVERSATIONNEL - Version nettoyée et tronquée
         # IMPORTANT: Nettoyer l'historique pour enlever le RAG dupliqué ET la mémoire consolidée
+        history_size_before = len(self.history)
+        UnifiedLogger.write(
+            "AI_CORE",
+            "DEBUG",
+            f"CLI Bridge: Traitement historique - {history_size_before} messages dans self.history"
+        )
+        
         skip_next_ack = False  # Flag pour ignorer le message "Bien reçu" qui suit la mémoire consolidée
+        history_messages_added = 0
+        history_messages_skipped = 0
+        
+        # Normaliser l'historique pour gérer les deux formats possibles :
+        # Format 1: {"role": "...", "content": "..."} (format standard)
+        # Format 2: {"role": "...", "parts": [{"text": "..."}]} (format Gemini CLI)
+        normalized_history = []
         for msg in self.history:
+            if isinstance(msg, dict):
+                role = msg.get('role', 'user')
+                # Normaliser "model" -> "assistant" pour compatibilité
+                if role == "model":
+                    role = "assistant"
+                
+                # Extraire le contenu selon le format
+                content = msg.get('content', '')
+                if not content and 'parts' in msg:
+                    # Format Gemini CLI: extraire depuis parts
+                    parts = msg.get('parts', [])
+                    if parts and isinstance(parts[0], dict):
+                        content = parts[0].get('text', '')
+                
+                normalized_history.append({"role": role, "content": str(content) if content else ""})
+            else:
+                # Format inconnu, essayer d'extraire role et content
+                role = getattr(msg, 'role', 'user')
+                if role == "model":
+                    role = "assistant"
+                content = getattr(msg, 'content', '') or (getattr(msg, 'parts', [{}])[0].get('text', '') if hasattr(msg, 'parts') else '')
+                normalized_history.append({"role": role, "content": str(content) if content else ""})
+        
+        UnifiedLogger.write(
+            "AI_CORE",
+            "DEBUG",
+            f"CLI Bridge: Historique normalisé - {len(normalized_history)} messages (format original: {len(self.history)})"
+        )
+        
+        for msg in normalized_history:
             role = msg.get('role', 'user')
             content = msg.get('content', '')
             
@@ -1665,6 +1709,7 @@ class GeminiCliSession(BaseSession):
                 # Ignorer les messages qui contiennent la mémoire consolidée (déjà dans stdin_prompt)
                 if "--- 📜 MÉMOIRE DU PROJET (RÉSUMÉ CONSOLIDÉ) ---" in content_str:
                     skip_next_ack = True  # Le prochain message assistant sera l'ack "Bien reçu"
+                    history_messages_skipped += 1
                     continue  # Skip ce message, il est déjà dans stdin_prompt
                 
                 # Pattern: "--- RAG CONTEXT ---\n...\n\n--- MESSAGE ---\n<message réel>"
@@ -1707,6 +1752,7 @@ class GeminiCliSession(BaseSession):
                         content = "\n".join(cleaned_lines).strip()
                         # Si le contenu nettoyé est vide ou ne contient que des patterns RAG, on skip
                         if not content or content.startswith("--- 📂") or "(Dist:" in content[:50]:
+                            history_messages_skipped += 1
                             continue
                 else:
                     content = content_str
@@ -1714,14 +1760,39 @@ class GeminiCliSession(BaseSession):
             # Ignorer le message assistant "Bien reçu" qui suit la mémoire consolidée
             if skip_next_ack and role == "assistant" and "Bien reçu. Mémoire mise à jour" in str(content):
                 skip_next_ack = False
+                history_messages_skipped += 1
                 continue
             
-            if content:
-                # Tronquer chaque message historique à 2000 chars max pour le log
-                content_str = str(content)
-                if len(content_str) > 2000:
-                    content_str = content_str[:2000] + "... [tronqué]"
-                messages_log.append({"role": role, "content": content_str})
+            # Vérifier si le contenu est vide après nettoyage
+            if not content or not str(content).strip():
+                # Contenu vide après nettoyage, on skip
+                history_messages_skipped += 1
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "DEBUG",
+                    f"CLI Bridge: Message {role} ignoré (contenu vide après nettoyage)"
+                )
+                continue
+            
+            # Tronquer chaque message historique à 2000 chars max pour le log
+            content_str = str(content)
+            if len(content_str) > 2000:
+                content_str = content_str[:2000] + "... [tronqué]"
+            messages_log.append({"role": role, "content": content_str})
+            history_messages_added += 1
+        
+        # Log du résultat du traitement de l'historique
+        UnifiedLogger.write(
+            "AI_CORE",
+            "DEBUG",
+            f"CLI Bridge: Historique traité - {history_messages_added} messages ajoutés, {history_messages_skipped} messages ignorés/filtrés"
+        )
+        if history_size_before > 0 and history_messages_added == 0:
+            UnifiedLogger.write(
+                "AI_CORE",
+                "WARNING",
+                f"CLI Bridge: Tous les messages de l'historique ({history_size_before}) ont été filtrés ou ignorés"
+            )
         
         # 4. INSTRUCTION FOCUS (System) - juste avant le dernier message user
         messages_log.append({
@@ -1775,6 +1846,9 @@ class GeminiCliSession(BaseSession):
                         "sizes": meta.sizes,
                         "truncated": meta.truncated,
                         "prompt_arg_truncated": bool(msg_tr),
+                        "history_size": history_size_before,
+                        "messages_log_count": len(messages_log),
+                        "history_in_messages_log": history_messages_added,
                     },
                 )
         except Exception:

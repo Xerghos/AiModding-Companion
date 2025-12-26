@@ -40,8 +40,11 @@ def load_gitignore_patterns(root_path: str) -> Optional[PathSpec]:
             return None
         
         return PathSpec.from_lines('gitwildmatch', patterns)
-    except Exception:
+    except Exception as e:
         # En cas d'erreur de lecture, retourner None
+        import logging
+        log = logging.getLogger("Features.gitignore_parser")
+        log.debug(f"Erreur chargement .gitignore: {e}")
         return None
 
 
