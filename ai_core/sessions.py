@@ -1908,6 +1908,12 @@ class GeminiCliSession(BaseSession):
                         self.history.append(self._create_msg("user", message))
                         self.history.append(self._create_msg("assistant", full_response))
                         
+                        # Calculer le texte d'entrée total
+                        input_text_total = (stdin_prompt or "") + "\n" + (msg_arg or "")
+                        
+                        # Logger les métriques
+                        self._log_metrics(start_t, input_text_total, full_response)
+                        
                         duration = time.time() - start_t
                         UnifiedLogger.write("AI_CORE", "SUCCESS", f"Gemini CLI Stream terminé ({duration:.2f}s)")
                         
@@ -1949,6 +1955,12 @@ class GeminiCliSession(BaseSession):
                 self.history.append(self._create_msg("user", message))
                 self.history.append(self._create_msg("assistant", content))
                 
+                # Calculer le texte d'entrée total
+                input_text_total = (stdin_prompt or "") + "\n" + (msg_arg or "")
+                
+                # Logger les métriques
+                self._log_metrics(start_t, input_text_total, content)
+                
                 duration = time.time() - start_t
                 UnifiedLogger.write("AI_CORE", "SUCCESS", f"Gemini CLI terminé ({duration:.2f}s)")
                 
@@ -1962,6 +1974,49 @@ class GeminiCliSession(BaseSession):
         except Exception as e:
             UnifiedLogger.write("AI_CORE", "ERROR", f"Gemini CLI Exception: {e}")
             raise e
+
+    def _log_metrics(self, start_time, input_text, output_text):
+        """
+        Logge les métriques d'usage pour GeminiCliSession.
+        Estime les tokens à partir de la taille du texte (approximation: 1 token ≈ 4 caractères).
+        
+        Args:
+            start_time: Temps de début (time.time())
+            input_text: Texte d'entrée complet (stdin_prompt + msg_arg)
+            output_text: Texte de sortie (réponse complète)
+        """
+        duration = time.time() - start_time
+        
+        try:
+            from features.TokenManager import TokenManager
+        except ImportError:
+            TokenManager = None
+        
+        # Estimation des tokens (approximation standard: 1 token ≈ 4 caractères)
+        # Pour Gemini, cette approximation est raisonnable pour le français et l'anglais
+        in_tok = len(input_text) // 4 if input_text else 0
+        out_tok = len(output_text) // 4 if output_text else 0
+        
+        # Enregistrer dans TokenManager si disponible
+        if TokenManager:
+            # Pour CLI, on n'a pas de clé API, donc on passe None
+            # TokenManager gérera le cas où current_key est None
+            try:
+                TokenManager.add_usage(self.model_name, None, in_tok, out_tok)
+            except Exception:
+                pass  # Ne pas bloquer si TokenManager échoue
+        
+        # Construire les métriques au même format que GeminiSession
+        metrics_data = {
+            "model": self.model_name,
+            "agent": self.agent_name or "Fast",  # Fallback sur "Fast" si None
+            "in": in_tok,
+            "out": out_tok,
+            "time": f"{duration:.2f}s",
+            "provider": "Gemini CLI"  # Distinguer du provider "Gemini" standard
+        }
+        
+        UnifiedLogger.write("AI_CORE", "METRICS", "Usage", metrics_data)
 
     @property
     def chat(self):
