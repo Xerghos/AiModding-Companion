@@ -11,10 +11,11 @@ LOG_DIR = "logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
-# [MODIF] Horodatage précis (Jour-Mois_Heure-Minute) pour éviter l'empilement
-# Note : On utilise 'h' au lieu de ':' car les deux-points sont interdits dans les noms de fichiers Windows
-current_ts = datetime.datetime.now().strftime("%d-%b_%Hh%M")
-LOG_FILE = os.path.join(LOG_DIR, f"global_debug_{current_ts}.log")
+# [MODIF] Horodatage de démarrage de l'application (fixe pour toute la session)
+# Le timestamp est généré une seule fois au chargement du module et reste constant
+# Format : Jour-Mois_Heure-Minute-Seconde pour identifier la session
+_app_start_ts = datetime.datetime.now().strftime("%d-%b_%Hh%M_%S")
+LOG_FILE = os.path.join(LOG_DIR, f"global_debug_{_app_start_ts}.log")
 
 LOCK = threading.Lock()
 

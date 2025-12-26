@@ -138,6 +138,79 @@ def _save_payload_log(session_type: str, model_name: str, payload_data: dict, ex
         UnifiedLogger.write("AI_CORE", "WARN", f"Echec sauvegarde payload: {e}")
 
 
+def _save_response_log(session_type: str, model_name: str, response_data: dict, extra_meta: dict = None):
+    """
+    Sauvegarde une réponse complète dans logs/ avec timestamp.
+    Args:
+        session_type: "gemini_cli"
+        model_name: nom du modèle utilisé
+        response_data: la réponse complète (texte, métriques, etc.)
+        extra_meta: métadonnées additionnelles
+    """
+    try:
+        logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%d-%b_%Hh%M_%S")
+        safe_model = model_name.replace("/", "_").replace(":", "_")
+        filename = f"response_{session_type}_{safe_model}_{timestamp}.json"
+        filepath = os.path.join(logs_dir, filename)
+        
+        log_content = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "session_type": session_type,
+            "model": model_name,
+            "response": response_data
+        }
+        if extra_meta:
+            log_content["meta"] = extra_meta
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(log_content, f, indent=2, ensure_ascii=False)
+        
+        UnifiedLogger.write("AI_CORE", "RESPONSE_LOG", f"📄 Réponse sauvegardée: {filename}")
+        
+    except Exception as e:
+        UnifiedLogger.write("AI_CORE", "WARN", f"Echec sauvegarde réponse: {e}")
+
+
+def _save_codeassist_payload_log(model_name: str, payload_data: dict, extra_meta: dict = None):
+    """
+    Sauvegarde le payload FINAL CodeAssist dans logs/ avec timestamp.
+    Ce payload représente exactement ce que gemini-cli envoie à CodeAssist.
+    
+    Args:
+        model_name: nom du modèle utilisé
+        payload_data: le payload CodeAssist complet (CAGenerateContentRequest)
+        extra_meta: métadonnées additionnelles
+    """
+    try:
+        logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%d-%b_%Hh%M_%S")
+        safe_model = model_name.replace("/", "_").replace(":", "_")
+        filename = f"codeassist_final_{safe_model}_{timestamp}.json"
+        filepath = os.path.join(logs_dir, filename)
+        
+        log_content = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "session_type": "codeassist_final",
+            "model": model_name,
+            "payload": payload_data
+        }
+        if extra_meta:
+            log_content["meta"] = extra_meta
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(log_content, f, indent=2, ensure_ascii=False)
+        
+        UnifiedLogger.write("AI_CORE", "CODEASSIST_PAYLOAD_LOG", f"📤 Payload CodeAssist final sauvegardé: {filename}")
+        
+    except Exception as e:
+        UnifiedLogger.write("AI_CORE", "WARN", f"Echec sauvegarde payload CodeAssist: {e}")
+
+
 # --- HELPER DE CONVERSION D'OUTILS ---
 # --- HELPER DE CONVERSION D'OUTILS ---
 def _convert_schema_to_openai(gemini_tools):
@@ -1819,7 +1892,87 @@ class GeminiCliSession(BaseSession):
                 }
             }
         }
-        _save_payload_log("gemini_cli", self.model_name, cli_payload)
+        # NOTE: On ne sauvegarde PAS le payload CLI intermédiaire pour GeminiCliSession
+        # On garde uniquement le payload CodeAssist final (codeassist_final_*.json)
+        # _save_payload_log("gemini_cli", self.model_name, cli_payload)  # Désactivé
+
+        # Reconstruire et logger le payload FINAL CodeAssist
+        try:
+            final_ca_payload = self._build_codeassist_final_payload(
+                stdin_prompt=stdin_prompt,
+                msg_arg=msg_arg,
+                model_name=self.model_name
+            )
+            
+            # Accéder à la structure "request" qui contient les champs réels
+            request_payload = final_ca_payload.get("request", final_ca_payload)
+            
+            # Calculer les métriques complètes du payload final
+            system_instruction_text = ""
+            if "systemInstruction" in request_payload:
+                si = request_payload["systemInstruction"]
+                if isinstance(si, dict) and "parts" in si:
+                    system_instruction_text = " ".join(part.get("text", "") for part in si["parts"])
+                elif isinstance(si, str):
+                    system_instruction_text = si
+            
+            contents_text = ""
+            if "contents" in request_payload:
+                for content in request_payload["contents"]:
+                    if "parts" in content:
+                        contents_text += " ".join(part.get("text", "") for part in content["parts"] if "text" in part)
+            
+            # Calculer la taille des outils (sérialisé en JSON)
+            tools_json = ""
+            tools_count = 0
+            if "tools" in request_payload and request_payload["tools"]:
+                # Les outils sont dans une liste, chaque élément a "functionDeclarations"
+                for tool_group in request_payload["tools"]:
+                    if "functionDeclarations" in tool_group:
+                        tools_count += len(tool_group["functionDeclarations"])
+                # Sérialiser les outils pour calculer leur taille
+                try:
+                    tools_json = json.dumps(request_payload["tools"], indent=2, ensure_ascii=False)
+                except Exception:
+                    tools_json = str(request_payload["tools"])
+            
+            # Sérialiser le payload complet pour calculer la taille totale
+            payload_json = json.dumps(final_ca_payload, indent=2, ensure_ascii=False)
+            total_payload_size = len(payload_json.encode('utf-8'))  # Taille en bytes
+            total_payload_chars = len(payload_json)  # Nombre de caractères
+            
+            # Total input = systemInstruction + contents + tools (sérialisés)
+            total_input_chars = len(system_instruction_text) + len(contents_text) + len(tools_json)
+            
+            # Stocker les métriques du payload final pour les utiliser dans _log_metrics
+            self._last_payload_input_chars = total_input_chars
+            self._last_payload_estimated_tokens = int(total_input_chars / 3.5)
+            
+            _save_codeassist_payload_log(
+                self.model_name,
+                final_ca_payload,
+                {
+                    "system_instruction_length": len(system_instruction_text),
+                    "contents_length": len(contents_text),
+                    "tools_json_length": len(tools_json),
+                    "tools_count": tools_count,
+                    "total_input_chars": total_input_chars,
+                    "total_payload_chars": total_payload_chars,
+                    "total_payload_size_bytes": total_payload_size,
+                    "total_payload_size_kb": round(total_payload_size / 1024, 2),
+                    "estimated_tokens": int(total_input_chars / 3.5),
+                    "has_tool_config": "toolConfig" in request_payload,
+                    "payload_structure": {
+                        "has_contents": "contents" in request_payload,
+                        "has_system_instruction": "systemInstruction" in request_payload,
+                        "has_tools": "tools" in request_payload and bool(request_payload.get("tools")),
+                        "has_tool_config": "toolConfig" in request_payload,
+                        "has_generation_config": "generationConfig" in request_payload
+                    }
+                }
+            )
+        except Exception as e:
+            UnifiedLogger.write("AI_CORE", "WARN", f"Echec reconstruction payload CodeAssist: {e}")
 
         cmd = [
             self.cli_path,
@@ -1911,10 +2064,15 @@ class GeminiCliSession(BaseSession):
                         # Calculer le texte d'entrée total
                         input_text_total = (stdin_prompt or "") + "\n" + (msg_arg or "")
                         
+                        duration = time.time() - start_t
+                        
+                        # NOTE: On ne sauvegarde PAS la réponse pour GeminiCliSession
+                        # Le payload CodeAssist final contient déjà toutes les informations nécessaires
+                        # _save_response_log("gemini_cli", self.model_name, response_log_data, {...})  # Désactivé
+                        
                         # Logger les métriques
                         self._log_metrics(start_t, input_text_total, full_response)
                         
-                        duration = time.time() - start_t
                         UnifiedLogger.write("AI_CORE", "SUCCESS", f"Gemini CLI Stream terminé ({duration:.2f}s)")
                         
                     except FileNotFoundError:
@@ -1958,10 +2116,15 @@ class GeminiCliSession(BaseSession):
                 # Calculer le texte d'entrée total
                 input_text_total = (stdin_prompt or "") + "\n" + (msg_arg or "")
                 
+                duration = time.time() - start_t
+                
+                # NOTE: On ne sauvegarde PAS la réponse pour GeminiCliSession
+                # Le payload CodeAssist final contient déjà toutes les informations nécessaires
+                # _save_response_log("gemini_cli", self.model_name, response_log_data, {...})  # Désactivé
+                
                 # Logger les métriques
                 self._log_metrics(start_t, input_text_total, content)
                 
-                duration = time.time() - start_t
                 UnifiedLogger.write("AI_CORE", "SUCCESS", f"Gemini CLI terminé ({duration:.2f}s)")
                 
                 # Retour au format UniversalResponseWrapper pour compatibilité
@@ -1975,14 +2138,72 @@ class GeminiCliSession(BaseSession):
             UnifiedLogger.write("AI_CORE", "ERROR", f"Gemini CLI Exception: {e}")
             raise e
 
+    def _build_codeassist_final_payload(
+        self,
+        stdin_prompt: str,
+        msg_arg: str,
+        model_name: str
+    ) -> dict:
+        """
+        Reconstruit le payload FINAL que gemini-cli envoie à CodeAssist.
+        Inclut le contexte complet, le message, et tous les outils MCP.
+        
+        Args:
+            stdin_prompt: Le contexte complet (Arch, Tree, LTM, RAG)
+            msg_arg: Le message utilisateur
+            model_name: Nom du modèle
+            
+        Returns:
+            Payload CodeAssist complet au format CAGenerateContentRequest
+        """
+        from ai_core.code_assist_converter import to_generate_content_request
+        from config.tools_schema import TOOLS_SCHEMA
+        
+        # Construire les messages au format Gemini API
+        # Le stdin_prompt devient le systemInstruction
+        # Le msg_arg devient le contenu utilisateur
+        messages = [
+            {"role": "user", "content": msg_arg}
+        ]
+        
+        # Récupérer les outils MCP (via TOOLS_SCHEMA pour l'instant)
+        # Note: gemini-cli découvre les outils via le serveur MCP configuré dans .gemini/settings.json
+        # On utilise TOOLS_SCHEMA comme approximation des outils disponibles
+        tools = TOOLS_SCHEMA if TOOLS_SCHEMA else None
+        
+        # Construire le payload CodeAssist final
+        # IMPORTANT: stdin_prompt est inclus intégralement sans troncature
+        # IMPORTANT: tools contient TOUS les outils MCP avec leurs schémas complets
+        ca_payload = to_generate_content_request(
+            model=model_name,
+            messages=messages,
+            system_instruction=stdin_prompt,  # Le contexte complet devient systemInstruction (18-25kb)
+            tools=tools,  # Tous les outils MCP complets (20-30kb)
+            function_calling_mode="AUTO",  # Mode par défaut pour gemini-cli
+            temperature=0.7,
+            **{}
+        )
+        
+        # Vérification post-construction : s'assurer que le payload contient bien tout
+        request_payload = ca_payload.get("request", ca_payload)
+        if "systemInstruction" not in request_payload:
+            UnifiedLogger.write("AI_CORE", "WARNING", "Payload CodeAssist: systemInstruction manquant")
+        if "tools" not in request_payload or not request_payload.get("tools"):
+            UnifiedLogger.write("AI_CORE", "WARNING", "Payload CodeAssist: tools manquants ou vides")
+        if "toolConfig" not in request_payload:
+            UnifiedLogger.write("AI_CORE", "WARNING", "Payload CodeAssist: toolConfig manquant")
+        
+        return ca_payload
+
     def _log_metrics(self, start_time, input_text, output_text):
         """
         Logge les métriques d'usage pour GeminiCliSession.
-        Estime les tokens à partir de la taille du texte (approximation: 1 token ≈ 4 caractères).
+        Estime les tokens à partir de la taille du texte (approximation: 1 token ≈ 3.5 caractères).
+        Utilise les métriques du payload final CodeAssist si disponibles (inclut les outils).
         
         Args:
             start_time: Temps de début (time.time())
-            input_text: Texte d'entrée complet (stdin_prompt + msg_arg)
+            input_text: Texte d'entrée complet (stdin_prompt + msg_arg) - utilisé comme fallback
             output_text: Texte de sortie (réponse complète)
         """
         duration = time.time() - start_time
@@ -1992,10 +2213,16 @@ class GeminiCliSession(BaseSession):
         except ImportError:
             TokenManager = None
         
-        # Estimation des tokens (approximation standard: 1 token ≈ 4 caractères)
-        # Pour Gemini, cette approximation est raisonnable pour le français et l'anglais
-        in_tok = len(input_text) // 4 if input_text else 0
-        out_tok = len(output_text) // 4 if output_text else 0
+        # Utiliser les métriques du payload final CodeAssist si disponibles (inclut les outils)
+        # Sinon, utiliser l'estimation basée sur input_text (fallback)
+        if hasattr(self, '_last_payload_estimated_tokens') and self._last_payload_estimated_tokens:
+            in_tok = self._last_payload_estimated_tokens
+        else:
+            # Estimation des tokens (ratio plus précis pour contenu mixte: 1 token ≈ 3.5 caractères)
+            # Pour Gemini avec contenu mixte (code + texte + markdown), 3.5 est plus précis que 4
+            in_tok = int(len(input_text) / 3.5) if input_text else 0
+        
+        out_tok = int(len(output_text) / 3.5) if output_text else 0
         
         # Enregistrer dans TokenManager si disponible
         if TokenManager:
