@@ -120,19 +120,41 @@ class LiteLLMSession(BaseSession):
         
         # --- BLOC 1 : INSTRUCTIONS AGENTS (System) ---
         if self.system_instruction:
+            # Nettoyer le system_instruction pour retirer le manuel d'outils (si présent)
+            # Les outils sont maintenant disponibles via MCP, pas besoin du manuel
+            import re
+            clean_instruction = self.system_instruction
+            # Retirer le bloc "--- 🛠️ MANUEL DES OUTILS AUTORISÉS ---"
+            clean_instruction = re.sub(
+                r"\n---\s*🛠️\s*MANUEL[\s\S]*?(?=\n---|\Z)",
+                "\n",
+                clean_instruction,
+                flags=re.MULTILINE
+            )
+            # Retirer les lignes qui incitent à utiliser les outils (redondant avec MCP)
+            clean_instruction = re.sub(
+                r"^.*(!native_tool|native_tool|JSON natif|POUR UTILISER UN OUTIL).*?$",
+                "",
+                clean_instruction,
+                flags=re.MULTILINE | re.IGNORECASE
+            )
+            # Nettoyer les espaces multiples
+            clean_instruction = re.sub(r"\n{3,}", "\n\n", clean_instruction).strip()
+            
             messages.append({
                 "role": "system",
-                "content": f"=== INSTRUCTIONS AGENT ({self.model_name}) ===\n{self.system_instruction}"
+                "content": f"=== INSTRUCTIONS AGENT ({self.model_name}) ===\n{clean_instruction}\n\nNote: Les outils sont disponibles via MCP. Utilise-les directement quand nécessaire."
             })
         
         # --- BLOCS DYNAMIQUES (System) ---
         try:
             comps = GlobalCacheManager.get_components() if GlobalCacheManager else {}
             
-            # Limites de taille (inspirées de prompt_builders.py)
-            LIMIT_ARCH = 10000
-            LIMIT_TREE = 10000
-            LIMIT_LTM = 6000
+            # Limites de taille RÉDUITES pour éviter erreur 500 (CodeAssist a des limites strictes)
+            # Réduites de 50% pour laisser plus de marge
+            LIMIT_ARCH = 5000  # Réduit de 10000
+            LIMIT_TREE = 5000  # Réduit de 10000
+            LIMIT_LTM = 3000   # Réduit de 6000
             
             if is_writer_session:
                 # SESSION WRITER : Payload minimal (seulement architecture map)
@@ -297,19 +319,34 @@ class LiteLLMSession(BaseSession):
         # Ajout du message utilisateur à l'historique
         self._history.append(self._create_msg("user", user_message_content))
         
-        # Outils Natifs
+        # Outils via MCP (au lieu de les passer directement dans le payload)
+        # LiteLLM découvrira automatiquement les outils depuis le serveur MCP configuré
         native_tools = None
-        try:
-            if self._use_oauth:
-                # CAS 3: CodeAssist (OAuth) -> On passe le schéma Gemini NATIF (pas de conversion OpenAI)
-                # Cela évite la perte d'informations (types, descriptions) due à la double conversion
-                native_tools = TOOLS_SCHEMA
-                UnifiedLogger.write("AI_CORE", "DEBUG", "Passage TOOLS_SCHEMA natif pour CodeAssist")
-            else:
-                # CAS 2: LiteLLM Standard -> Conversion OpenAI requise
+        use_mcp = True  # Utiliser MCP par défaut pour CodeAssist
+        
+        if use_mcp and self._use_oauth:
+            # CAS 3: CodeAssist (OAuth) -> Utiliser MCP au lieu de passer les outils directement
+            # Cela réduit la taille du payload et évite les erreurs 500
+            native_tools = [{
+                "type": "mcp",
+                "server_url": "litellm_proxy/mcp/aimodding_tools_mcp",
+                "server_label": "aimodding",
+                "require_approval": "never"  # Auto-exécution des outils
+            }]
+            UnifiedLogger.write("AI_CORE", "MCP", "🔧 Utilisation des outils MCP pour CodeAssist (réduction payload)")
+        elif not self._use_oauth:
+            # CAS 2: LiteLLM Standard -> Conversion OpenAI requise (pas de MCP)
+            try:
                 native_tools = _convert_schema_to_openai(TOOLS_SCHEMA)
-        except Exception as e:
-            UnifiedLogger.write("AI_CORE", "WARNING", f"Echec préparation outils: {e}")
+            except Exception as e:
+                UnifiedLogger.write("AI_CORE", "WARNING", f"Echec préparation outils: {e}")
+        else:
+            # Fallback: passer les outils directement si MCP n'est pas disponible
+            try:
+                native_tools = TOOLS_SCHEMA
+                UnifiedLogger.write("AI_CORE", "DEBUG", "Fallback: Passage TOOLS_SCHEMA natif pour CodeAssist")
+            except Exception as e:
+                UnifiedLogger.write("AI_CORE", "WARNING", f"Echec préparation outils: {e}")
         
         # Construction du Payload Structuré (SANS RAG Docs dans messages système)
         final_messages = self._build_payload_messages(rag_context=None)

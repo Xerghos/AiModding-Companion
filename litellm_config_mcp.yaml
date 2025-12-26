@@ -1,0 +1,30 @@
+# Configuration LiteLLM avec support MCP pour AiModding-Companion
+# Ce fichier peut être utilisé pour configurer LiteLLM Proxy avec notre serveur MCP
+
+model_list:
+  - model_name: gemini-3-pro-preview
+    litellm_params:
+      model: codeassist/gemini-3-pro-preview
+      # OAuth sera géré automatiquement par CodeAssistClient
+  - model_name: gemini-3-flash-preview
+    litellm_params:
+      model: codeassist/gemini-3-flash-preview
+
+litellm_settings:
+  # Alias pour notre serveur MCP
+  mcp_aliases:
+    "aimodding": "aimodding_tools_mcp"
+
+mcp_servers:
+  # Notre serveur MCP stdio qui expose nos 41 outils
+  aimodding_tools_mcp:
+    transport: "stdio"
+    command: "python"
+    args: ["-m", "ai_core.mcp_server"]
+    description: "AiModding-Companion Tools - 41 outils natifs (FileSystem, Code Analysis, Web, etc.)"
+
+general_settings:
+  # Activer le stockage en base de données pour MCP (requis)
+  store_model_in_db: true
+  supported_db_objects: ["mcp"]  # Stocker seulement les serveurs MCP
+

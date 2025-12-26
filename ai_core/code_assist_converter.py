@@ -71,8 +71,18 @@ def to_generate_content_request(
         }
     
     # Ajouter les outils si présents
-    if tools:
+    if tools and len(tools) > 0:  # Vérifier que tools n'est pas vide
         vertex_request["tools"] = _convert_tools_to_gemini_format(tools)
+        # CRITIQUE: Ajouter toolConfig pour éviter erreur 500 (comme gemini-cli)
+        # Le toolConfig est requis quand des outils sont présents
+        if "toolConfig" not in vertex_request:
+            # Mode par défaut: AUTO (comme gemini-cli)
+            function_calling_mode = kwargs.get("function_calling_mode", "AUTO")
+            vertex_request["toolConfig"] = {
+                "functionCallingConfig": {
+                    "mode": function_calling_mode  # AUTO, ANY, ou NONE
+                }
+            }
     
     # Construire la configuration de génération
     generation_config: Dict[str, Any] = {
@@ -181,17 +191,35 @@ def _to_contents(messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         # Convertir le contenu en parts
         parts = []
         if isinstance(content, str):
-            parts.append({"text": content})
+            # Filtrer les contenus vides
+            if content.strip():  # Ne pas ajouter si vide ou seulement des espaces
+                parts.append({"text": content})
         elif isinstance(content, list):
-            # Contenu multimodal
-            parts = content
+            # Contenu multimodal - filtrer les parts vides
+            for part in content:
+                if isinstance(part, dict):
+                    # Vérifier si le part a un contenu non vide
+                    has_content = False
+                    if "text" in part and part["text"] and part["text"].strip():
+                        has_content = True
+                    elif any(key in part for key in ["functionCall", "functionResponse", "inlineData", "fileData"]):
+                        has_content = True
+                    
+                    if has_content:
+                        parts.append(part)
+                elif part:  # Si c'est une string non vide
+                    parts.append({"text": str(part)})
         else:
-            parts.append({"text": str(content)})
+            content_str = str(content)
+            if content_str.strip():  # Ne pas ajouter si vide
+                parts.append({"text": content_str})
         
-        contents.append({
-            "role": ca_role,
-            "parts": parts
-        })
+        # Ne pas ajouter de content si tous les parts sont vides
+        if parts:
+            contents.append({
+                "role": ca_role,
+                "parts": parts
+            })
     
     return contents
 

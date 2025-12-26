@@ -10,7 +10,8 @@ import re
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger("ArchMapGenerator")
 
-IGNORED_DIRS = {'.git', '__pycache__', 'venv', 'env', 'node_modules', 'dist', 'build', '.vs', '.ia_history', '_OLD', 'tests'}
+# IGNORED_DIRS conservé comme fallback si .gitignore non disponible
+IGNORED_DIRS = {'.git', '__pycache__', 'venv', 'env', 'node_modules', 'dist', 'build', '.vs', '.ia_history', '_OLD', 'tests', 'DOC_CLI_FRAMEWORKS_DEPENDANCES', 'Documentation'}
 IGNORED_FILES = {} # On inclut __init__.py cette fois pour la complétude
 
 def get_project_root():
@@ -180,15 +181,42 @@ def generate_ultimate_graph():
     root = get_project_root()
     log.info(f"🚀 Démarrage du Cartographe ULTIME sur : {root}")
     
+    # Charger .gitignore pour filtrer les fichiers
+    try:
+        from features.gitignore_parser import load_gitignore_patterns, should_ignore_path
+        gitignore_spec = load_gitignore_patterns(root)
+        if gitignore_spec:
+            log.info("✅ .gitignore chargé pour filtrage")
+        else:
+            log.info("⚠️ .gitignore non disponible, utilisation du fallback")
+    except ImportError:
+        log.warning("⚠️ Module gitignore_parser non disponible, utilisation du fallback")
+        gitignore_spec = None
+        should_ignore_path = None
+    
     # 1. Recensement
     all_files = []
     all_files_set = set() # Pour lookup rapide
     
     for r, d, f in os.walk(root):
-        d[:] = [x for x in d if x not in IGNORED_DIRS]
+        # Filtrer dossiers selon .gitignore ou fallback
+        if gitignore_spec and should_ignore_path:
+            d[:] = [x for x in d if not should_ignore_path(
+                os.path.join(r, x), root, gitignore_spec
+            )]
+        else:
+            # Fallback : utiliser IGNORED_DIRS
+            d[:] = [x for x in d if x not in IGNORED_DIRS]
+        
         for file in f:
             if file.endswith('.py') and file not in IGNORED_FILES:
                 full_path = os.path.join(r, file)
+                
+                # Filtrer selon .gitignore
+                if gitignore_spec and should_ignore_path:
+                    if should_ignore_path(full_path, root, gitignore_spec):
+                        continue
+                
                 rel_path = os.path.relpath(full_path, root).replace('\\', '/')
                 all_files.append(rel_path)
                 all_files_set.add(rel_path)

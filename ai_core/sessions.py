@@ -1487,18 +1487,39 @@ class GeminiCliSession(BaseSession):
             UnifiedLogger.write("AI_CORE", "WARNING", f"CLI Bridge: échec écriture system.md: {e}")
 
         # 2) Settings projet: désactiver la mémoire (GEMINI.md) en choisissant un filename inexistant
+        # + Configuration MCP pour notre serveur d'outils
         settings_path = os.path.join(gemini_dir, "settings.json")
+        
+        # Calculer le chemin du projet (racine du workspace)
+        from pathlib import Path
+        project_root = Path(__file__).parent.parent
+        
         settings = {
             "context": {
                 "fileName": cfg["isolation"]["context_file_name"],
                 "discoveryMaxDir": cfg["isolation"]["discovery_max_dir"],
                 "includeDirectories": [],
                 "loadMemoryFromIncludeDirectories": False
+            },
+            # Configuration MCP pour notre serveur d'outils AiModding-Companion
+            "mcpServers": {
+                "aimodding-tools": {
+                    "command": sys.executable,  # python (ou python.exe sur Windows)
+                    "args": ["-m", "ai_core.mcp_server"],
+                    "cwd": str(project_root.absolute()),  # Racine du projet (chemin absolu)
+                    "trust": True,  # Bypass confirmations (on fait confiance à nos propres outils)
+                    "timeout": 30000  # 30 secondes
+                }
             }
         }
         try:
             with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
+            UnifiedLogger.write(
+                "AI_CORE",
+                "CLI_BRIDGE",
+                f"✅ Configuration MCP ajoutée dans {settings_path} (serveur: aimodding-tools)"
+            )
         except Exception as e:
             UnifiedLogger.write("AI_CORE", "WARNING", f"CLI Bridge: échec écriture settings.json: {e}")
 
@@ -1609,95 +1630,29 @@ class GeminiCliSession(BaseSession):
         # Attache meta pour logs
         self._last_prompt_meta = stdin_meta
 
-        # Payload Log (logs/) - Structure alignée sur DeepSeek (complet et bien structuré)
+        # Payload Log (logs/) - Structure OPTIMISÉE (pas de duplication avec stdin_prompt)
+        # NOTE: Le vrai contexte (Arch, Tree, LTM, RAG) est dans stdin_prompt, pas ici
+        # messages_log est utilisé uniquement pour le logging, pas pour l'exécution
         messages_log = []
         
-        # 1. INSTRUCTIONS AGENT (System) - comme DeepSeek
+        # 1. INSTRUCTIONS AGENT (System) - Version courte pour le log
         if self.system_instruction:
             sys_content = str(self.system_instruction)
+            if len(sys_content) > 2000:
+                sys_content = sys_content[:2000] + "... [tronqué - voir stdin_prompt pour version complète]"
             messages_log.append({
                 "role": "system",
                 "content": f"=== INSTRUCTIONS AGENT ({self.model_name}) ===\n{sys_content}"
             })
         
-        # 2. COMPOSANTS DU CACHE (System) - Arch, Tree, LTM - comme DeepSeek
+        # 2. NOTE: Les composants (Arch, Tree, LTM, RAG) sont dans stdin_prompt, pas ici
+        # Pour le log, on ajoute juste une note référençant stdin_prompt
+        messages_log.append({
+            "role": "system",
+            "content": "NOTE: Contexte complet (Arch, Tree, LTM, RAG) disponible dans stdin_prompt (voir cli_specific.meta)"
+        })
         
-        # EXTRACTION DE LA MÉMOIRE CONSOLIDÉE depuis l'historique (si présente)
-        extracted_ltm = None
-        for msg in self.history:
-            if msg.get('role') == 'user':
-                content = msg.get('content', '')
-                if content and "--- 📜 MÉMOIRE DU PROJET (RÉSUMÉ CONSOLIDÉ) ---" in str(content):
-                    # Extraire le contenu (enlever le header dupliqué)
-                    ltm_content = str(content).replace("--- 📜 MÉMOIRE DU PROJET (RÉSUMÉ CONSOLIDÉ) ---", "", 1).strip()
-                    # Enlever aussi "(Fin du Résumé - Reprise de la session ci-dessous)" si présent
-                    ltm_content = ltm_content.replace("(Fin du Résumé - Reprise de la session ci-dessous)", "").strip()
-                    if ltm_content:
-                        extracted_ltm = ltm_content
-                    break
-        
-        if comps.get('arch'):
-            arch_content = str(comps['arch']).strip()
-            # Enlever le header dupliqué si présent
-            if arch_content.startswith("--- CARTOGRAPHIE TECHNIQUE ---"):
-                arch_content = arch_content.replace("--- CARTOGRAPHIE TECHNIQUE ---", "", 1).strip()
-            # Architecture map non tronquée
-            messages_log.append({
-                "role": "system",
-                "content": f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_content}"
-            })
-        if comps.get('tree'):
-            tree_content = str(comps['tree']).strip()
-            # Enlever le header dupliqué si présent
-            if tree_content.startswith("--- ARBORESCENCE PROJET ---"):
-                tree_content = tree_content.replace("--- ARBORESCENCE PROJET ---", "", 1).strip()
-            # Arborescence non tronquée
-            messages_log.append({
-                "role": "system",
-                "content": f"--- ARBORESCENCE PROJET ---\n{tree_content}"
-            })
-        
-        # MÉMOIRE LONG TERME : utiliser extracted_ltm si disponible, sinon comps.get('ltm')
-        ltm_to_use = extracted_ltm
-        if not ltm_to_use and comps.get('ltm'):
-            ltm_content = str(comps['ltm']).strip()
-            if ltm_content.startswith("--- MÉMOIRE LONG TERME ---"):
-                ltm_content = ltm_content.replace("--- MÉMOIRE LONG TERME ---", "", 1).strip()
-            ltm_to_use = ltm_content
-        if ltm_to_use:
-            # Nettoyer le header "--- 📜 MÉMOIRE DU PROJET (RÉSUMÉ CONSOLIDÉ) ---" s'il est présent
-            ltm_clean = str(ltm_to_use).strip()
-            if "--- 📜 MÉMOIRE DU PROJET (RÉSUMÉ CONSOLIDÉ) ---" in ltm_clean:
-                ltm_clean = ltm_clean.replace("--- 📜 MÉMOIRE DU PROJET (RÉSUMÉ CONSOLIDÉ) ---", "", 1).strip()
-            # Enlever aussi "(Fin du Résumé - Reprise de la session ci-dessous)" si présent
-            ltm_clean = ltm_clean.replace("(Fin du Résumé - Reprise de la session ci-dessous)", "").strip()
-            messages_log.append({
-                "role": "system",
-                "content": f"--- MÉMOIRE LONG TERME ---\n{ltm_clean}"
-            })
-        
-        # 3. RAG CONTEXT (System) - Docs Techniques uniquement
-        # Note: La Repo Map est maintenant injectée à la place de CARTOGRAPHIE TECHNIQUE (voir BLOC 2)
-        if rag_context:
-            # Gérer le nouveau format dict ou l'ancien format string (compatibilité)
-            if isinstance(rag_context, dict):
-                # Nouveau format : seulement Docs Techniques (Repo Map déjà injectée en BLOC 2)
-                if rag_context.get("docs"):
-                    docs_content = str(rag_context["docs"]).strip()
-                    messages_log.append({
-                        "role": "system",
-                        "content": f"--- 📂 DOCS TECHNIQUE (RAG Hybride) ---\n{docs_content}"
-                    })
-                
-                # Note: LTM est déjà géré dans extracted_ltm/comps.get('ltm') plus haut
-            else:
-                # Ancien format string (compatibilité)
-                messages_log.append({
-                    "role": "system",
-                    "content": f"--- RAG CONTEXT ---\n{str(rag_context)}"
-                })
-        
-        # 4. HISTORIQUE CONVERSATIONNEL (User/Assistant) - comme DeepSeek
+        # 3. HISTORIQUE CONVERSATIONNEL - Version nettoyée et tronquée
         # IMPORTANT: Nettoyer l'historique pour enlever le RAG dupliqué ET la mémoire consolidée
         skip_next_ack = False  # Flag pour ignorer le message "Bien reçu" qui suit la mémoire consolidée
         for msg in self.history:
@@ -1707,10 +1662,10 @@ class GeminiCliSession(BaseSession):
             # NETTOYAGE: Si c'est un message user qui contient du RAG mélangé ou la mémoire consolidée, on l'extrait
             if content and role == "user":
                 content_str = str(content)
-                # Ignorer les messages qui contiennent la mémoire consolidée (déjà extraite plus haut)
+                # Ignorer les messages qui contiennent la mémoire consolidée (déjà dans stdin_prompt)
                 if "--- 📜 MÉMOIRE DU PROJET (RÉSUMÉ CONSOLIDÉ) ---" in content_str:
                     skip_next_ack = True  # Le prochain message assistant sera l'ack "Bien reçu"
-                    continue  # Skip ce message, il est déjà dans le message system LTM
+                    continue  # Skip ce message, il est déjà dans stdin_prompt
                 
                 # Pattern: "--- RAG CONTEXT ---\n...\n\n--- MESSAGE ---\n<message réel>"
                 if "--- RAG CONTEXT ---" in content_str and "--- MESSAGE ---" in content_str:
@@ -1762,16 +1717,21 @@ class GeminiCliSession(BaseSession):
                 continue
             
             if content:
-                messages_log.append({"role": role, "content": str(content)[:3000]})
+                # Tronquer chaque message historique à 2000 chars max pour le log
+                content_str = str(content)
+                if len(content_str) > 2000:
+                    content_str = content_str[:2000] + "... [tronqué]"
+                messages_log.append({"role": role, "content": content_str})
         
-        # 5. INSTRUCTION FOCUS (System) - juste avant le dernier message user
+        # 4. INSTRUCTION FOCUS (System) - juste avant le dernier message user
         messages_log.append({
             "role": "system",
             "content": "⚠️ INSTRUCTION : Focus sur la demande ci-dessous."
         })
         
-        # 6. MESSAGE ACTUEL (User) - séparé, sans RAG mélangé
-        messages_log.append({"role": "user", "content": msg_str[:5000]})
+        # 5. MESSAGE ACTUEL (User) - séparé, sans RAG mélangé, tronqué à 2000 chars
+        msg_str_truncated = msg_str[:2000] + ("... [tronqué]" if len(msg_str) > 2000 else "")
+        messages_log.append({"role": "user", "content": msg_str_truncated})
         
         cli_payload = {
             "model": self.model_name,

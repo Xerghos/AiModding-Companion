@@ -141,12 +141,20 @@ class MultiModelCacheManager:
 
     def _get_complete_tree(self, root_path, ignore_dirs=None):
         """
-        Génère une arborescence COMPLÈTE du projet.
+        Génère une arborescence COMPLÈTE du projet en respectant .gitignore.
         Affiche tous les fichiers et dossiers pertinents, sans limite de profondeur.
-        Ignore seulement les dossiers vraiment inutiles (cache, dépendances, système).
+        Utilise .gitignore pour filtrer les fichiers et dossiers ignorés.
         """
+        from features.gitignore_parser import load_gitignore_patterns, should_ignore_path
+        
+        root_path_str = str(root_path)
+        gitignore_spec = load_gitignore_patterns(root_path_str)
+        
+        # Fallback : liste basique si .gitignore non disponible
         if ignore_dirs is None: 
-            ignore_dirs = set()
+            ignore_dirs = {'.git', '__pycache__', 'venv', 'env', 'node_modules', 
+                          '.vs', '.vscode', '.idea', '.cursor', 'logs', 'backups', 'audio_cache'}
+        
         lines = []
         root_path = Path(root_path)
         
@@ -158,7 +166,13 @@ class MultiModelCacheManager:
         }
         
         for root, dirs, files in os.walk(root_path):
-            # Vérifier si le dossier actuel est ignoré
+            # Vérifier si le dossier actuel est ignoré selon .gitignore
+            if gitignore_spec and should_ignore_path(str(root), root_path_str, gitignore_spec):
+                # Ne pas afficher ce dossier ni ses enfants
+                dirs[:] = []  # Empêcher de descendre
+                continue
+            
+            # Vérifier aussi la liste hardcodée (fallback)
             folder_name = os.path.basename(root) or "./"
             if folder_name in ignore_dirs:
                 # Ne pas afficher ce dossier ni ses enfants
@@ -172,8 +186,15 @@ class MultiModelCacheManager:
             except ValueError:
                 level = 0
             
-            # Filtrage in-place des dossiers ignorés (pour éviter de descendre)
-            dirs[:] = [d for d in dirs if d not in ignore_dirs]
+            # Filtrage in-place des dossiers ignorés selon .gitignore
+            if gitignore_spec:
+                dirs[:] = [d for d in dirs if not should_ignore_path(
+                    os.path.join(str(root), d), root_path_str, gitignore_spec
+                )]
+            else:
+                # Fallback : utiliser la liste hardcodée
+                dirs[:] = [d for d in dirs if d not in ignore_dirs]
+            
             # Trier pour cohérence
             dirs.sort()
             
@@ -185,9 +206,16 @@ class MultiModelCacheManager:
             # Afficher TOUS les fichiers (pas de limite)
             subindent = '  ' * (level + 1)
             for f in sorted(files):
-                # Ignorer seulement les fichiers vraiment inutiles
+                file_path = os.path.join(str(root), f)
+                
+                # Ignorer selon .gitignore
+                if gitignore_spec and should_ignore_path(file_path, root_path_str, gitignore_spec):
+                    continue
+                
+                # Ignorer seulement les fichiers vraiment inutiles (extensions)
                 if any(f.endswith(ext) for ext in ignored_file_extensions):
                     continue
+                    
                 lines.append(f"{subindent}{f}")
                     
         return "\n".join(lines)

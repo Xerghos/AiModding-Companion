@@ -41,6 +41,31 @@ def codeassist_completion(**kwargs) -> Any:
     max_tokens = kwargs.get("max_tokens")
     tools = kwargs.get("tools")
     system_instruction = kwargs.get("system_instruction")
+    
+    # MODIFICATION: Utiliser MCP si les outils ne sont pas fournis explicitement
+    # Si tools est None ou vide, on laisse LiteLLM découvrir les outils MCP automatiquement
+    # Si tools contient déjà des outils MCP (format {"type": "mcp", ...}), on les utilise
+    # Sinon, on utilise les outils fournis normalement
+    use_mcp_tools = False
+    if tools is None or (isinstance(tools, list) and len(tools) == 0):
+        # Aucun outil fourni, utiliser MCP si configuré
+        # LiteLLM découvrira automatiquement les outils MCP depuis la config
+        use_mcp_tools = True
+        UnifiedLogger.write(
+            "AI_CORE",
+            "MCP",
+            "🔧 Utilisation des outils MCP (découverte automatique)"
+        )
+    elif isinstance(tools, list) and len(tools) > 0:
+        # Vérifier si c'est déjà un outil MCP
+        first_tool = tools[0]
+        if isinstance(first_tool, dict) and first_tool.get("type") == "mcp":
+            use_mcp_tools = True
+            UnifiedLogger.write(
+                "AI_CORE",
+                "MCP",
+                f"🔧 Utilisation des outils MCP explicitement configurés ({len(tools)} serveurs)"
+            )
     # Ne pas récupérer project_id depuis l'environnement pour utiliser le quota personnel
     # Seulement utiliser si explicitement fourni (pour utilisation projet GCP)
     project_id = kwargs.get("project_id")  # None par défaut = quota personnel

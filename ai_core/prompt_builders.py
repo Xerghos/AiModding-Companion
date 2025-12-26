@@ -202,10 +202,18 @@ def build_cli_prompt(
 
     comps = cache_components or {}
     # Utiliser repo_map si disponible, sinon arch
-    repo_map = comps.get("repo_map") or ""
-    arch = comps.get("arch") or "" if not repo_map else ""
-    tree = comps.get("tree") or ""
-    ltm = comps.get("ltm") or ""
+    # CORRECTION: S'assurer que les valeurs sont des strings (peuvent être des dicts)
+    repo_map_raw = comps.get("repo_map")
+    repo_map = str(repo_map_raw) if repo_map_raw else ""
+    
+    arch_raw = comps.get("arch")
+    arch = str(arch_raw) if arch_raw and not repo_map else ""
+    
+    tree_raw = comps.get("tree")
+    tree = str(tree_raw) if tree_raw else ""
+    
+    ltm_raw = comps.get("ltm")
+    ltm = str(ltm_raw) if ltm_raw else ""
 
     # Troncatures par bloc (avec repo_map si disponible)
     if repo_map:
@@ -216,7 +224,20 @@ def build_cli_prompt(
         arch_t, arch_tr = _truncate(arch, arch_max)
     tree_t, tree_tr = _truncate(tree, tree_max)
     ltm_t, ltm_tr = _truncate(ltm, ltm_max)
-    rag_t, rag_tr = _truncate(rag_context or "", rag_max)
+    
+    # CORRECTION: S'assurer que rag_context est une string
+    rag_context_str = ""
+    if rag_context:
+        if isinstance(rag_context, dict):
+            # Si c'est un dict, extraire la partie "docs" ou convertir en string
+            if "docs" in rag_context:
+                rag_context_str = str(rag_context["docs"])
+            else:
+                rag_context_str = str(rag_context)
+        else:
+            rag_context_str = str(rag_context)
+    
+    rag_t, rag_tr = _truncate(rag_context_str, rag_max)
     hist_raw = _format_history(history, max_turns=max_history_turns)
     hist_t, hist_tr = _truncate(hist_raw, history_max)
     if defer_message:
@@ -249,7 +270,8 @@ def build_cli_prompt(
     if not defer_message:
         parts.append(msg_t)
 
-    prompt = "\n\n".join([p for p in parts if p]).strip()
+    # CORRECTION: Filtrer et convertir tous les éléments en strings pour éviter l'erreur "expected str instance, dict found"
+    prompt = "\n\n".join([str(p) for p in parts if p]).strip()
 
     # Contrôle total (si on dépasse, on coupe depuis les sections les moins critiques)
     truncated: Dict[str, bool] = {

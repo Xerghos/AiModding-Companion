@@ -140,6 +140,21 @@ class CodeAssistClient:
             f"CodeAssist API: {method} (OAuth)"
         )
         
+        # Log du payload complet pour diagnostic
+        try:
+            payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Payload CodeAssist ({method}):\n{payload_str}"
+            )
+        except Exception as e:
+            UnifiedLogger.write(
+                "AI_CORE",
+                "WARN",
+                f"Impossible de logger le payload: {e}"
+            )
+        
         try:
             response = requests.post(
                 url,
@@ -213,6 +228,21 @@ class CodeAssistClient:
             "START",
             f"CodeAssist API Streaming: {method} (OAuth)"
         )
+        
+        # Log du payload complet pour diagnostic
+        try:
+            payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Payload CodeAssist Streaming ({method}):\n{payload_str}"
+            )
+        except Exception as e:
+            UnifiedLogger.write(
+                "AI_CORE",
+                "WARN",
+                f"Impossible de logger le payload: {e}"
+            )
         
         try:
             response = requests.post(
@@ -310,6 +340,23 @@ class CodeAssistClient:
         import uuid
         user_prompt_id = str(uuid.uuid4())
         
+        # Log des outils si présents
+        if tools:
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Outils passés à CodeAssist: {len(tools)} outils"
+            )
+            try:
+                tools_str = json.dumps(tools, indent=2, ensure_ascii=False)
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "DEBUG",
+                    f"Détails outils:\n{tools_str[:1000]}"  # Limiter à 1000 chars
+                )
+            except:
+                pass
+        
         # Convertir au format CodeAssist
         ca_request = to_generate_content_request(
             model=model,
@@ -323,6 +370,29 @@ class CodeAssistClient:
             system_instruction=system_instruction,
             **kwargs
         )
+        
+        # Vérification post-conversion
+        request_data = ca_request.get("request", {})
+        if tools:
+            has_toolconfig = "toolConfig" in request_data
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Vérification post-conversion: toolConfig présent = {has_toolconfig}"
+            )
+            if has_toolconfig:
+                toolconfig_str = json.dumps(request_data.get("toolConfig"), indent=2, ensure_ascii=False)
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "DEBUG",
+                    f"toolConfig généré:\n{toolconfig_str}"
+                )
+            else:
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "ERROR",
+                    "[CRITICAL] toolConfig MANQUANT après conversion!"
+                )
         
         if stream:
             # Mode streaming
