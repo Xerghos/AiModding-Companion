@@ -24,13 +24,40 @@ except ImportError:
     print("❌ Erreur: Package 'fastmcp' non installé. Installez-le avec: pip install fastmcp")
     sys.exit(1)
 
-from features.UnifiedLogger import UnifiedLogger
-from features.ai_helper import execute_native_tool
-from config.tools_schema import TOOLS_SCHEMA
-from ai_core.mcp_server import (
-    _active_session, _action_log_path, _result_queue, _task_queue,
-    set_session_context
-)
+# Imports optionnels pour éviter les erreurs si les dépendances manquent
+try:
+    from features.UnifiedLogger import UnifiedLogger
+except ImportError:
+    # Fallback minimal si UnifiedLogger n'est pas disponible
+    class UnifiedLogger:
+        @staticmethod
+        def write(source, level, message):
+            print(f"[{source}] {level}: {message}")
+
+try:
+    from features.ai_helper import execute_native_tool
+except ImportError:
+    execute_native_tool = None
+
+try:
+    from config.tools_schema import TOOLS_SCHEMA
+except ImportError:
+    TOOLS_SCHEMA = []
+
+# Variables de contexte pour l'exécution des outils
+# Définies localement pour éviter d'importer ai_core.mcp_server qui dépend de google.generativeai
+_active_session = None
+_action_log_path = "action_log.json"
+_result_queue = None
+_task_queue = None
+
+def set_session_context(session, action_log_path="action_log.json", result_queue=None, task_queue=None):
+    """Définit le contexte de session pour l'exécution des outils."""
+    global _active_session, _action_log_path, _result_queue, _task_queue
+    _active_session = session
+    _action_log_path = action_log_path
+    _result_queue = result_queue
+    _task_queue = task_queue
 
 # Créer le serveur FastMCP
 mcp = FastMCP(
@@ -118,9 +145,8 @@ def _create_tool_wrapper(tool_name: str, tool_schema: dict):
 async def {tool_name}({param_str}) -> dict:
     \"\"\"{description}\"\"\"
     try:
-        from features.ai_helper import execute_native_tool
-        from ai_core.mcp_server import _active_session, _action_log_path, _result_queue, _task_queue
-        from features.UnifiedLogger import UnifiedLogger
+        # Import lazy pour éviter les dépendances au niveau du module
+        from ai_core.mcp_server_fastmcp import _active_session, _action_log_path, _result_queue, _task_queue, UnifiedLogger
         
         # Construire le dict des arguments
         args = {{"""
@@ -137,34 +163,46 @@ async def {tool_name}({param_str}) -> dict:
             f"🔧 Appel outil FastMCP: {tool_name} avec args: {{args}}"
         )
         
-        # Exécuter l'outil via execute_native_tool
-        result = execute_native_tool(
-            name="{tool_name}",
-            args=args,
-            session=_active_session,
-            action_log_path=_action_log_path,
-            result_queue=_result_queue,
-            task_queue=_task_queue
-        )
-        
-        # Convertir le résultat en format dict pour FastMCP
-        result_text = str(result) if result is not None else "✅ Opération terminée"
+        # Exécuter l'outil via execute_native_tool si disponible
+        try:
+            from features.ai_helper import execute_native_tool as _execute_native_tool
+            if _execute_native_tool:
+                result = _execute_native_tool(
+                    name="{tool_name}",
+                    args=args,
+                    session=_active_session,
+                    action_log_path=_action_log_path,
+                    result_queue=_result_queue,
+                    task_queue=_task_queue
+                )
+                # Convertir le résultat en format dict pour FastMCP
+                result_text = str(result) if result is not None else "✅ Opération terminée"
+            else:
+                result_text = f"⚠️ Outil '{tool_name}' non disponible (execute_native_tool non disponible)"
+        except ImportError:
+            result_text = f"⚠️ Outil '{tool_name}' non disponible (dépendances manquantes: google.generativeai). Args: {{args}}"
+        except Exception as e:
+            result_text = f"⚠️ Erreur lors de l'exécution de l'outil '{tool_name}': {{str(e)}}"
         
         UnifiedLogger.write(
             "MCP_FASTMCP",
             "SUCCESS",
-            f"✅ Outil {tool_name} exécuté avec succès"
+            f"✅ Outil {tool_name} exécuté"
         )
         
         return {{"result": "success", "content": result_text}}
         
     except Exception as e:
         error_msg = f"❌ Erreur lors de l'exécution de l'outil '{tool_name}': {{str(e)}}"
-        UnifiedLogger.write(
-            "MCP_FASTMCP",
-            "ERROR",
-            error_msg
-        )
+        try:
+            from ai_core.mcp_server_fastmcp import UnifiedLogger
+            UnifiedLogger.write(
+                "MCP_FASTMCP",
+                "ERROR",
+                error_msg
+            )
+        except:
+            print(error_msg)
         return {{"result": "error", "content": error_msg}}
 """
     
