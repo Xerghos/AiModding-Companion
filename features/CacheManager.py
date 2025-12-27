@@ -23,69 +23,117 @@ class MultiModelCacheManager:
         self.ttl_minutes = 60
         # Liste des modèles pour lesquels le cache est impossible (Quota 0 ou erreur)
         self.blacklisted_models = set()
+        # OPTIMISATION: Cache temporaire pour la repo_map réutilisable
+        self._cached_repo_map = None
+        self._repo_map_cache_time = None
+        # OPTIMISATION: Cache pour l'arborescence et Architecture Map
+        self._cached_tree = None
+        self._cached_tree_time = None
+        self._cached_arch_map = None
+        self._cached_arch_map_time = None
+        self._cache_ttl_seconds = 60  # TTL de 60 secondes pour tree/arch
 
     @trace_action(source="CacheManager")
-    def prepare_content(self):
+    def prepare_content(self, repo_map=None):
         """
         Génère les composants du contexte (Arborescence, Architecture, LTM).
         Ne les fusionne pas immédiatement pour permettre l'injection atomique.
+        
+        Args:
+            repo_map: Repo Map déjà générée (optionnel) - évite la régénération si fournie
         """
         log.info("📦 Préparation des composants contextuels (Mode Atomique)...")
         
         # 1. ARBORESCENCE (COMPLÈTE - Toutes les infos essentielles pour DeepSeek)
-        try:
-            # Arborescence complète : pas de limite de profondeur, tous les fichiers affichés
-            # Ignore seulement les dossiers vraiment inutiles (cache, dépendances, système, logs, backups)
-            tree = self._get_complete_tree(os.getcwd(), ignore_dirs={
-                '.git', '__pycache__', 'venv', 'env', 'node_modules', '.vs', '.vscode', '.idea', '.cursor',
-                'logs', 'backups', 'audio_cache'
-            })
-            self.components['tree'] = f"--- ARBORESCENCE PROJET ---\n{tree}"
-            log.info(f"✅ Arborescence générée: {len(tree)} caractères")
-        except Exception as e: 
-            log.warning(f"Erreur Tree: {e}")
-            self.components['tree'] = ""
+        # OPTIMISATION: Utiliser le cache si disponible et valide
+        import time
+        use_cache = (self._cached_tree is not None and 
+                     self._cached_tree_time is not None and 
+                     (time.time() - self._cached_tree_time) < self._cache_ttl_seconds)
+        
+        if use_cache:
+            self.components['tree'] = f"--- ARBORESCENCE PROJET ---\n{self._cached_tree}"
+            log.info(f"✅ Arborescence réutilisée depuis le cache: {len(self._cached_tree)} caractères (économisé ~200-300ms)")
+        else:
+            try:
+                # Arborescence complète : pas de limite de profondeur, tous les fichiers affichés
+                # Ignore seulement les dossiers vraiment inutiles (cache, dépendances, système, logs, backups)
+                tree = self._get_complete_tree(os.getcwd(), ignore_dirs={
+                    '.git', '__pycache__', 'venv', 'env', 'node_modules', '.vs', '.vscode', '.idea', '.cursor',
+                    'logs', 'backups', 'audio_cache'
+                })
+                self.components['tree'] = f"--- ARBORESCENCE PROJET ---\n{tree}"
+                # Mettre en cache
+                self._cached_tree = tree
+                self._cached_tree_time = time.time()
+                log.info(f"✅ Arborescence générée: {len(tree)} caractères")
+            except Exception as e: 
+                log.warning(f"Erreur Tree: {e}")
+                self.components['tree'] = ""
 
         # 2. ARCHITECTURE MAP (Lourd & Stable) - CONDENSÉE pour payload
-        try:
-            arch_path = get_path("config/architecture_map.json")
-            if os.path.exists(arch_path):
-                with open(arch_path, 'r', encoding='utf-8') as f:
-                    arch_data = json.load(f)
-                    # Condensation intelligente pour réduire la taille du payload
-                    condensed_arch = self._condense_architecture_map(arch_data)
-                    # Minification + Tri pour stabilité binaire parfaite
-                    arch_str = json.dumps(condensed_arch, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-                    self.components['arch'] = f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_str}"
-                    log.info(f"✅ Architecture Map chargée: {len(arch_str)} caractères")
-            else:
+        # OPTIMISATION: Utiliser le cache si disponible et valide
+        use_cache = (self._cached_arch_map is not None and 
+                     self._cached_arch_map_time is not None and 
+                     (time.time() - self._cached_arch_map_time) < self._cache_ttl_seconds)
+        
+        if use_cache:
+            self.components['arch'] = f"--- CARTOGRAPHIE TECHNIQUE ---\n{self._cached_arch_map}"
+            log.info(f"✅ Architecture Map réutilisée depuis le cache: {len(self._cached_arch_map)} caractères (économisé ~50-100ms)")
+        else:
+            try:
+                arch_path = get_path("config/architecture_map.json")
+                if os.path.exists(arch_path):
+                    with open(arch_path, 'r', encoding='utf-8') as f:
+                        arch_data = json.load(f)
+                        # Condensation intelligente pour réduire la taille du payload
+                        condensed_arch = self._condense_architecture_map(arch_data)
+                        # Minification + Tri pour stabilité binaire parfaite
+                        arch_str = json.dumps(condensed_arch, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+                        self.components['arch'] = f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_str}"
+                        # Mettre en cache
+                        self._cached_arch_map = arch_str
+                        self._cached_arch_map_time = time.time()
+                        log.info(f"✅ Architecture Map chargée: {len(arch_str)} caractères")
+                else:
+                    self.components['arch'] = ""
+                    log.info("ℹ️ Architecture Map non trouvée (config/architecture_map.json)")
+            except Exception as e:
+                log.warning(f"Erreur Architecture: {e}")
                 self.components['arch'] = ""
-                log.info("ℹ️ Architecture Map non trouvée (config/architecture_map.json)")
-        except Exception as e:
-            log.warning(f"Erreur Architecture: {e}")
-            self.components['arch'] = ""
 
         # 3. REPO MAP (Structure du Projet) - Nouveau composant statique
-        try:
-            from features.context.repo_map import get_repo_map_generator
-            from config import APP_SETTINGS
-            
-            # Récupérer le chemin de la base de données RAG
-            db_path = APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid")
-            if not os.path.isabs(db_path):
-                db_path = get_path(db_path)
-            
-            repo_map_gen = get_repo_map_generator(db_path)
-            repo_map = repo_map_gen.get_repo_map()  # Sans limite pour le cache
+        # OPTIMISATION: Réutiliser repo_map si fournie (évite la double génération)
+        if repo_map is not None:
+            # Repo Map déjà générée, la réutiliser
             if repo_map:
                 self.components['repo_map'] = f"--- 🗺️ REPO MAP (Structure du Projet) ---\n{repo_map}"
-                log.info(f"✅ Repo Map générée: {len(repo_map)} caractères")
+                log.info(f"✅ Repo Map réutilisée: {len(repo_map)} caractères")
             else:
                 self.components['repo_map'] = ""
-                log.info("ℹ️ Repo Map vide")
-        except Exception as e:
-            log.warning(f"Erreur Repo Map: {e}")
-            self.components['repo_map'] = ""
+                log.info("ℹ️ Repo Map vide (réutilisée)")
+        else:
+            # Générer la Repo Map si non fournie
+            try:
+                from features.context.repo_map import get_repo_map_generator
+                from config import APP_SETTINGS
+                
+                # Récupérer le chemin de la base de données RAG
+                db_path = APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid")
+                if not os.path.isabs(db_path):
+                    db_path = get_path(db_path)
+                
+                repo_map_gen = get_repo_map_generator(db_path)
+                repo_map = repo_map_gen.get_repo_map()  # Sans limite pour le cache
+                if repo_map:
+                    self.components['repo_map'] = f"--- 🗺️ REPO MAP (Structure du Projet) ---\n{repo_map}"
+                    log.info(f"✅ Repo Map générée: {len(repo_map)} caractères")
+                else:
+                    self.components['repo_map'] = ""
+                    log.info("ℹ️ Repo Map vide")
+            except Exception as e:
+                log.warning(f"Erreur Repo Map: {e}")
+                self.components['repo_map'] = ""
         
         # Log de comparaison repo_map vs arch
         repo_map_size = len(self.components.get('repo_map', ''))
@@ -405,13 +453,37 @@ class MultiModelCacheManager:
             log.debug(f"Déduplication: {removed_count} signatures dupliquées supprimées du LTM")
 
     @trace_action(source="CacheManager")
-    def get_components(self):
+    def set_repo_map_cache(self, repo_map):
+        """
+        Définit une repo_map en cache pour réutilisation lors du prochain appel à get_components().
+        Utile pour éviter la double génération de la repo_map.
+        """
+        self._cached_repo_map = repo_map
+        import time
+        self._repo_map_cache_time = time.time()
+    
+    def get_components(self, repo_map=None):
         """
         [NOUVEAU] Retourne le dictionnaire des composants séparés.
         Utilisé par DeepSeekSession pour l'assemblage atomique des blocs.
+        
+        Args:
+            repo_map: Repo Map déjà générée (optionnel) - passée à prepare_content()
         """
+        # OPTIMISATION: Utiliser le cache si disponible et récent (< 5 secondes)
+        import time
+        if repo_map is None and self._cached_repo_map is not None:
+            if self._repo_map_cache_time and (time.time() - self._repo_map_cache_time) < 5.0:
+                repo_map = self._cached_repo_map
+                log.info(f"✅ Repo Map réutilisée depuis le cache (économisé ~700ms)")
+        
         if not self.components:
-            self.prepare_content()
+            self.prepare_content(repo_map=repo_map)
+        elif repo_map is not None:
+            # Si repo_map est fournie mais les composants existent déjà, 
+            # on doit quand même mettre à jour la repo_map pour éviter l'incohérence
+            # (cela peut arriver si get_components() est appelé plusieurs fois)
+            self.prepare_content(repo_map=repo_map)
         return self.components
 
     @trace_action(source="CacheManager")

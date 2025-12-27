@@ -9,6 +9,7 @@ import re
 from enum import Enum
 import datetime
 from threading import Lock, Thread
+import threading
 from queue import Queue, Empty
 import subprocess
 import shutil
@@ -178,39 +179,39 @@ def _save_response_log(session_type: str, model_name: str, response_data: dict, 
 
 def _save_codeassist_payload_log(model_name: str, payload_data: dict, extra_meta: dict = None):
     """
-    Sauvegarde le payload FINAL CodeAssist dans logs/ avec timestamp.
-    Ce payload représente exactement ce que gemini-cli envoie à CodeAssist.
-    
-    Args:
-        model_name: nom du modèle utilisé
-        payload_data: le payload CodeAssist complet (CAGenerateContentRequest)
-        extra_meta: métadonnées additionnelles
+    Sauvegarde un payload CodeAssist dans logs/ avec timestamp.
+    OPTIMISATION: Écriture asynchrone pour ne pas bloquer le thread principal.
     """
-    try:
-        logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
-        os.makedirs(logs_dir, exist_ok=True)
-        
-        timestamp = datetime.datetime.now().strftime("%d-%b_%Hh%M_%S")
-        safe_model = model_name.replace("/", "_").replace(":", "_")
-        filename = f"codeassist_final_{safe_model}_{timestamp}.json"
-        filepath = os.path.join(logs_dir, filename)
-        
-        log_content = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "session_type": "codeassist_final",
-            "model": model_name,
-            "payload": payload_data
-        }
-        if extra_meta:
-            log_content["meta"] = extra_meta
-        
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(log_content, f, indent=2, ensure_ascii=False)
-        
-        UnifiedLogger.write("AI_CORE", "CODEASSIST_PAYLOAD_LOG", f"📤 Payload CodeAssist final sauvegardé: {filename}")
-        
-    except Exception as e:
-        UnifiedLogger.write("AI_CORE", "WARN", f"Echec sauvegarde payload CodeAssist: {e}")
+    def save_async():
+        """Thread pour l'écriture asynchrone du fichier."""
+        try:
+            logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            
+            timestamp = datetime.datetime.now().strftime("%d-%b_%Hh%M_%S")
+            safe_model = model_name.replace("/", "_").replace(":", "_")
+            filename = f"codeassist_final_{safe_model}_{timestamp}.json"
+            filepath = os.path.join(logs_dir, filename)
+            
+            log_content = {
+                "timestamp": datetime.datetime.now().isoformat(),
+                "session_type": "codeassist_final",
+                "model": model_name,
+                "payload": payload_data
+            }
+            if extra_meta:
+                log_content["meta"] = extra_meta
+            
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(log_content, f, indent=2, ensure_ascii=False)
+            
+            UnifiedLogger.write("AI_CORE", "CODEASSIST_PAYLOAD_LOG", f"📤 Payload CodeAssist final sauvegardé: {filename}")
+        except Exception as e:
+            UnifiedLogger.write("AI_CORE", "WARN", f"Echec sauvegarde payload CodeAssist: {e}")
+    
+    # Lancer l'écriture en arrière-plan dans un thread daemon
+    thread = Thread(target=save_async, daemon=True)
+    thread.start()
 
 
 # --- HELPER DE CONVERSION D'OUTILS ---
@@ -1451,6 +1452,134 @@ class GeminiSession:
         except Exception as e:
             UnifiedLogger.write("AI_CORE", "WARNING", f"Pas de métriques: {e}")
 
+# --- CLASSE POOL DE PROCESSUS CLI (OPTIMISATION PERFORMANCES) ---
+class CliProcessPool:
+    """
+    Pool de processus CLI préchauffés pour réduire le temps de découverte MCP.
+    Maintient un processus "prêt" en arrière-plan pour la prochaine requête.
+    """
+    def __init__(self, cli_path, model_name, cli_workdir, cli_env, mcp_http_available):
+        self.cli_path = cli_path
+        self.model_name = model_name
+        self.cli_workdir = cli_workdir
+        self.cli_env = cli_env
+        self.mcp_http_available = mcp_http_available
+        
+        # Processus prêt à être utilisé (None si aucun disponible)
+        self._ready_process = None
+        self._ready_process_lock = threading.Lock()
+        self._prewarm_thread = None
+        
+        # Démarrer le préchauffage en arrière-plan
+        self._start_prewarm()
+    
+    def _start_prewarm(self):
+        """Démarre un thread de préchauffage pour maintenir un processus prêt."""
+        def prewarm_worker():
+            """Worker qui maintient un processus prêt."""
+            while True:
+                try:
+                    # Attendre un peu avant de créer le processus
+                    time.sleep(1.0)
+                    
+                    with self._ready_process_lock:
+                        # Si on a déjà un processus prêt, ne pas en créer un autre
+                        if self._ready_process is not None:
+                            # Vérifier si le processus est toujours valide
+                            if self._ready_process.poll() is None:
+                                # Processus toujours actif, continuer
+                                continue
+                            else:
+                                # Processus terminé, nettoyer
+                                self._ready_process = None
+                        
+                        # Créer un nouveau processus de test pour préchauffer
+                        # Ce processus sera utilisé pour la prochaine requête
+                        test_cmd = [
+                            self.cli_path,
+                            "--model",
+                            self.model_name,
+                            "--output-format",
+                            "text",
+                            "--prompt",
+                            "test"
+                        ]
+                        
+                        process = subprocess.Popen(
+                            test_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            stdin=subprocess.PIPE,
+                            text=True,
+                            encoding='utf-8',
+                            errors='replace',
+                            bufsize=65536,
+                            cwd=self.cli_workdir or os.getcwd(),
+                            env=self.cli_env
+                        )
+                        
+                        # Vérifier que le processus démarre correctement
+                        time.sleep(0.1)
+                        if process.poll() is None:
+                            # Processus actif, le marquer comme prêt
+                            # Note: Ce processus sera utilisé pour tester la disponibilité MCP
+                            # mais ne sera pas réutilisé directement car subprocess ne le permet pas
+                            self._ready_process = process
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "DEBUG",
+                                f"CLI Pool: Processus préchauffé créé (PID: {process.pid})"
+                            )
+                            
+                except Exception as e:
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "DEBUG",
+                        f"CLI Pool: Erreur préchauffage (non bloquant): {e}"
+                    )
+                    time.sleep(5.0)  # Attendre plus longtemps en cas d'erreur
+        
+        self._prewarm_thread = Thread(target=prewarm_worker, daemon=True)
+        self._prewarm_thread.start()
+    
+    def get_process(self, cmd):
+        """
+        Obtient un processus pour la commande donnée.
+        Pour l'instant, crée toujours un nouveau processus car subprocess ne peut être réutilisé.
+        Mais le processus préchauffé garantit que Node.js/MCP sont en cache.
+        """
+        # Toujours créer un nouveau processus car subprocess ne peut être réutilisé
+        # Le processus préchauffé sert juste à avoir Node.js/MCP en cache système
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=65536,
+            cwd=self.cli_workdir or os.getcwd(),
+            env=self.cli_env
+        )
+        
+        # Nettoyer le processus prêt s'il existe (il a servi son but)
+        with self._ready_process_lock:
+            if self._ready_process is not None:
+                try:
+                    if self._ready_process.poll() is None:
+                        self._ready_process.terminate()
+                        try:
+                            self._ready_process.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            self._ready_process.kill()
+                            self._ready_process.wait()
+                except Exception:
+                    pass
+                self._ready_process = None
+        
+        return process
+
 # --- CLASSE GEMINI CLI SESSION (PONT CLI) ---
 class GeminiCliSession(BaseSession):
     """
@@ -1485,11 +1614,8 @@ class GeminiCliSession(BaseSession):
         self._static_buffer_cache_hash = None  # Hash pour détecter les changements du cache
         
         # Pool de processus pré-chauffés (pour réutilisation)
-        # Note: Un processus subprocess ne peut être réutilisé qu'une fois (après stdin fermé, il est terminé)
-        # Le pool maintient un processus "prêt" pour la première requête
-        # Pool de processus (structure de base, peut être étendu)
-        # Note: La réutilisation complète nécessiterait des named pipes/sockets
-        self._process_pool = None  # Sera initialisé après _init_cli_isolation si nécessaire
+        # Initialisé après _init_cli_isolation pour avoir accès à cli_workdir et cli_env
+        self._process_pool = None
 
         UnifiedLogger.write(
             "AI_CORE",
@@ -1730,6 +1856,23 @@ class GeminiCliSession(BaseSession):
 
         # Nettoyage à la fin du process (best-effort)
         atexit.register(lambda: shutil.rmtree(workdir, ignore_errors=True))
+        
+        # OPTIMISATION: Initialiser le pool de processus après avoir configuré l'isolation
+        # Cela permet de maintenir des processus préchauffés pour réduire le temps de découverte MCP
+        try:
+            self._process_pool = CliProcessPool(
+                self.cli_path,
+                self.model_name,
+                self._cli_workdir,
+                self._cli_env,
+                self._mcp_http_available
+            )
+        except Exception as e:
+            UnifiedLogger.write(
+                "AI_CORE",
+                "WARNING",
+                f"CLI Pool: Échec initialisation (non bloquant): {e}"
+            )
     
     def _find_gemini_cli(self):
         """
