@@ -710,6 +710,13 @@ class Worker(threading.Thread):
                 if msg_type not in ["ui_update", "get_queue_status"]:
                     UnifiedLogger.write("WORKER", "TASK_RECEIVED", f"Type: {msg_type}, Action: {action}")
 
+                # --- PRE-CHAUFFAGE CLI ---
+                if msg_type == 'prewarm_cli':
+                    UnifiedLogger.write("WORKER", "INIT", "🔥 Préchauffage CLI demandé...")
+                    self.get_main_session() # Initialise la session et déclenche le pre-warm via GeminiCliSession.__init__
+                    self.task_queue.task_done()
+                    continue
+
                 # --- SIGNAL D'ARRÊT ---
                 if msg_type == 'stop_generation':
                     self.abort_current_stream = True

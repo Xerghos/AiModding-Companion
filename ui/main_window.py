@@ -317,6 +317,8 @@ class GeminiApp:
         self.worker_thread = Worker(task_queue, result_queue, self.stop_event)
         self.worker_thread.start()
         self._load_prompt_history()
+        # [OPTIMISATION] Pré-chauffage immédiat du CLI pour éliminer le Cold Start
+        task_queue.put({'type': 'prewarm_cli'})
 
     @trace_action(source="main_window")
     def _setup_bindings(self):
