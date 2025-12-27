@@ -62,7 +62,15 @@ class HotGeminiProcess:
                 # On ajoute un séparateur si nécessaire, mais on ne ferme PAS stdin
                 if not self.static_prompt.endswith("\n"):
                     self.process.stdin.write("\n\n")
-                self.process.stdin.flush()
+                # FLUSH RETIRÉ : Le flush() bloque ~7.5s car Node.js ne lit pas encore les données
+                # Le flush automatique se fera lors de la fermeture stdin dans use()
+                # Cela élimine la latence excessive observée lors du pré-chauffage
+                # self.process.stdin.flush()  # ← RETIRÉ pour éviter blocage
+            
+            # Délai minimum pour laisser gemini-cli s'initialiser (détection readiness)
+            # Cela évite les erreurs "No input provided via stdin" en s'assurant que
+            # Node.js est prêt à lire stdin avant de marquer le processus comme ready
+            time.sleep(0.5)  # 500ms pour laisser le temps à gemini-cli de s'initialiser
             
             self.status = "ready"
             # UnifiedLogger.write("AI_CORE", "DEBUG", f"Pool: Process PID {self.process.pid} pré-chargé ({len(self.static_prompt)} chars)")
@@ -166,6 +174,15 @@ class GeminiCliProcessPool:
             # Cas idéal : Processus prêt et compatible
             if self._next_process and self._current_config == cfg_sig:
                 proc = self._next_process
+                
+                # Vérification TTL : processus ne doit pas être trop vieux (30s max)
+                age = time.time() - proc.creation_time
+                if age > 30.0:
+                    UnifiedLogger.write("AI_CORE", "DEBUG", f"Pool: Processus expiré (age={age:.1f}s), création sync...")
+                    proc.kill()
+                    self._next_process = None
+                    return HotGeminiProcess(cmd, cwd, env, static_prompt)
+                
                 self._next_process = None # On le consomme
                 
                 # Vérification santé
@@ -173,9 +190,9 @@ class GeminiCliProcessPool:
                     UnifiedLogger.write("AI_CORE", "WARNING", "Pool: Processus pré-chauffé mort, création sync...")
                     return HotGeminiProcess(cmd, cwd, env, static_prompt)
                 
-                UnifiedLogger.write("AI_CORE", "DEBUG", "Pool: Utilisation processus pré-chauffé 🔥")
+                UnifiedLogger.write("AI_CORE", "DEBUG", f"Pool: Utilisation processus pré-chauffé 🔥 (age={age:.1f}s)")
                 return proc
-
+            
             # Cas fallback : Pas de process prêt ou config différente
             UnifiedLogger.write("AI_CORE", "DEBUG", "Pool: Cold start (pas de process prêt/compatible) ❄️")
             return HotGeminiProcess(cmd, cwd, env, static_prompt)
