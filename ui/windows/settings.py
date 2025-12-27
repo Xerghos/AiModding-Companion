@@ -606,7 +606,36 @@ class SettingsWindow(BaseWindow):
                     ))
                     # Utiliser gcloud auth application-default login
                     import subprocess
-                    subprocess.run(["gcloud", "auth", "application-default", "login"], check=True)
+                    import shutil
+                    
+                    # Trouver gcloud dans le PATH ou chemins standards Windows
+                    gcloud_path = shutil.which("gcloud")
+                    if not gcloud_path:
+                        # Chemins standards Windows pour gcloud
+                        gcloud_candidates = [
+                            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Cloud SDK", "google-cloud-sdk", "bin", "gcloud.cmd"),
+                            os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Cloud SDK", "google-cloud-sdk", "bin", "gcloud.cmd"),
+                            os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Google", "Cloud SDK", "google-cloud-sdk", "bin", "gcloud.cmd"),
+                        ]
+                        for candidate in gcloud_candidates:
+                            if os.path.exists(candidate):
+                                gcloud_path = candidate
+                                break
+                    
+                    if not gcloud_path:
+                        self.after(0, lambda: messagebox.showerror(
+                            "gcloud non trouvé",
+                            "gcloud n'a pas été trouvé dans le PATH.\n\n"
+                            "Solutions:\n"
+                            "1. Installez Google Cloud SDK: https://cloud.google.com/sdk/docs/install\n"
+                            "2. Ajoutez gcloud au PATH système\n"
+                            "3. Ou définissez GOOGLE_OAUTH_CLIENT_ID et GOOGLE_OAUTH_CLIENT_SECRET"
+                        ))
+                        return
+                    
+                    # Lancer gcloud avec shell=True pour Windows
+                    subprocess.run([gcloud_path, "auth", "application-default", "login"], check=True, shell=True)
+                    self.after(0, lambda: self._check_adc_status())
                     return
                 
                 client_config = {

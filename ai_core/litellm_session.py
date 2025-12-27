@@ -279,18 +279,26 @@ class LiteLLMSession(BaseSession):
         Returns:
             UniversalResponseWrapper ou générateur (stream)
         """
-        # Pour Gemini, essayer d'abord l'auth OAuth (Login with Google), sinon API key
-        # Cela permet de profiter des tokens gratuits Google AI Pro
+        # Pour Gemini, essayer d'abord l'auth OAuth (Login with Google) si le modèle est bridged
+        # CORRECTION: OAuth n'est utilisé que pour les modèles dans cli_bridge.models
+        # Les autres modèles (comme compressor) utilisent les API keys normales
         self.current_key = None
         self._use_oauth = False
         
         if "gemini" in self.model_name.lower() or "google" in self.model_name.lower():
-            # Vérifier si OAuth est disponible AVANT de récupérer une API key
-            if self.proxy and hasattr(self.proxy, '_try_google_oauth_auth'):
-                self._use_oauth = self.proxy._try_google_oauth_auth()
+            # Vérifier si le modèle est dans la liste des modèles bridged (CLI/OAuth)
+            cli_cfg = APP_SETTINGS.get("cli_bridge", {})
+            cli_enabled = cli_cfg.get("enabled", False)
+            cli_models = [m.lower().strip() for m in cli_cfg.get("models", [])]
+            is_bridged = cli_enabled and (self.model_name.lower().strip() in cli_models)
+            
+            if is_bridged:
+                # Modèle bridged: essayer OAuth
+                if self.proxy and hasattr(self.proxy, '_try_google_oauth_auth'):
+                    self._use_oauth = self.proxy._try_google_oauth_auth()
             
             if not self._use_oauth:
-                # OAuth non disponible, utiliser API key
+                # Modèle non-bridged OU OAuth non disponible: utiliser API key
                 try:
                     self.current_key = self.key_mgr.get_key(self.model_name)
                 except Exception:
@@ -359,14 +367,16 @@ class LiteLLMSession(BaseSession):
         
         # Déterminer le provider utilisé
         provider = "codeassist" if self._use_oauth else "standard"
-        
+
+        # IMPORTANT: Ne pas forcer max_tokens pour CodeAssist (OAuth)
+        max_tokens = None if self._use_oauth else 8000        
         # Construction du payload complet pour logging
         litellm_payload = {
             "model": self.model_name,
             "agent": self.agent_name or "LiteLLM Agent",
             "messages": final_messages,
             "temperature": temperature,
-            "max_tokens": 8000,
+            "max_tokens": max_tokens,
             "stream": stream,
             "tools": native_tools if native_tools else None,
             "use_oauth": self._use_oauth,
@@ -393,7 +403,7 @@ class LiteLLMSession(BaseSession):
                 api_key=api_key_to_use,  # None si OAuth, sinon API key
                 stream=stream,
                 temperature=temperature,
-                max_tokens=8000,
+                max_tokens=max_tokens,  # None pour CodeAssist (OAuth), 8000 sinon
                 tools=native_tools if native_tools else None,
                 session_id=self.session_id # Transmission ID persistant
             )
