@@ -62,7 +62,10 @@ class HotGeminiProcess:
                 # On ajoute un séparateur si nécessaire, mais on ne ferme PAS stdin
                 if not self.static_prompt.endswith("\n"):
                     self.process.stdin.write("\n\n")
-                self.process.stdin.flush()
+                # FLUSH RETIRÉ : Le flush() bloque ~7.5s car Node.js ne lit pas encore les données
+                # du buffer système. Le flush automatique se fera lors de la fermeture stdin dans use(),
+                # ce qui élimine la latence pendant le pré-chauffage.
+                # self.process.stdin.flush()  # ← RETIRÉ pour performance
             
             self.status = "ready"
             # UnifiedLogger.write("AI_CORE", "DEBUG", f"Pool: Process PID {self.process.pid} pré-chargé ({len(self.static_prompt)} chars)")
