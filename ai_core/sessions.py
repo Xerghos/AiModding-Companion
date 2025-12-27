@@ -1586,29 +1586,51 @@ class GeminiCliSession(BaseSession):
         project_root = Path(__file__).parent.parent
         project_root_abs = str(project_root.absolute())  # Pré-calculer le chemin absolu
         
-        # Configuration MCP stdio (transport standard, compatible avec gemini-cli)
-        # NOTE: Le serveur MCP HTTP est utilisé pour CodeAssistClient, mais gemini-cli
-        # utilise stdio car il nécessite stdin pour le prompt. Le serveur MCP HTTP
-        # reste disponible pour CodeAssistClient et pour pré-découvrir les outils.
-        mcp_server_config = {
-            "command": sys.executable,
-            "args": ["-m", "ai_core.mcp_server"],
-            "cwd": project_root_abs,  # Chemin absolu pré-calculé
-            "trust": True,
-            "timeout": 30000
-        }
+        # Configuration MCP HTTP/SSE pour utiliser le serveur long-running déjà démarré
+        # Le serveur MCP HTTP est démarré au lancement de l'application (voir run.py)
+        # Cela évite de lancer un nouveau processus Python à chaque requête
+        mcp_http_port = int(os.environ.get("MCP_HTTP_PORT", "8765"))
+        mcp_http_host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
+        mcp_server_url = f"http://{mcp_http_host}:{mcp_http_port}/mcp/sse"
         
-        # Configuration alternative SSE (désactivée temporairement - problème de compatibilité)
-        # TODO: Réactiver SSE une fois que gemini-cli supporte correctement SSE avec stdin
-        # mcp_http_port = int(os.environ.get("MCP_HTTP_PORT", "8765"))
-        # mcp_http_host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
-        # mcp_server_url = f"http://{mcp_http_host}:{mcp_http_port}/mcp/sse"
-        # mcp_server_config = {
-        #     "url": mcp_server_url,
-        #     "transport": "sse",
-        #     "trust": True,
-        #     "timeout": 30000
-        # }
+        # Vérifier que le serveur MCP HTTP est disponible avant de l'utiliser
+        self._mcp_http_available = False
+        try:
+            import requests
+            health_url = f"http://{mcp_http_host}:{mcp_http_port}/health"
+            response = requests.get(health_url, timeout=2)
+            if response.status_code == 200:
+                self._mcp_http_available = True
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "DEBUG",
+                    f"✅ Serveur MCP HTTP disponible sur {health_url} ({response.json().get('tools_count', 0)} outils)"
+                )
+        except Exception as e:
+            UnifiedLogger.write(
+                "AI_CORE",
+                "WARNING",
+                f"⚠️ Serveur MCP HTTP non disponible ({health_url}): {e}. Utilisation de stdio en fallback."
+            )
+        
+        # Configuration SSE/HTTP si disponible, sinon fallback sur stdio
+        # NOTE: gemini-cli détecte automatiquement le transport SSE si on utilise "url"
+        # (pas besoin de la clé "transport" qui n'est pas reconnue)
+        if self._mcp_http_available:
+            mcp_server_config = {
+                "url": mcp_server_url,  # URL SSE - gemini-cli détecte automatiquement le transport
+                "trust": True,
+                "timeout": 30000
+            }
+        else:
+            # Fallback sur stdio si le serveur HTTP n'est pas disponible
+            mcp_server_config = {
+                "command": sys.executable,
+                "args": ["-m", "ai_core.mcp_server"],
+                "cwd": project_root_abs,  # Chemin absolu pré-calculé
+                "trust": True,
+                "timeout": 30000
+            }
         
         settings = {
             "context": {
@@ -1668,11 +1690,19 @@ class GeminiCliSession(BaseSession):
             # Minifier le JSON pour réduire la taille (pas d'indentation, séparateurs compacts)
             with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(settings, f, ensure_ascii=False, indent=None, separators=(',', ':'))
-            UnifiedLogger.write(
-                "AI_CORE",
-                "CLI_BRIDGE",
-                f"✅ Configuration MCP stdio ajoutée dans {settings_path} (serveur: aimodding-tools)"
-            )
+            # Message de log adapté selon le transport utilisé
+            if self._mcp_http_available:
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "CLI_BRIDGE",
+                    f"✅ Configuration MCP HTTP/SSE ajoutée dans {settings_path} (serveur: aimodding-tools, URL: {mcp_server_url})"
+                )
+            else:
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "CLI_BRIDGE",
+                    f"✅ Configuration MCP stdio ajoutée dans {settings_path} (serveur: aimodding-tools, fallback)"
+                )
         except Exception as e:
             UnifiedLogger.write("AI_CORE", "WARNING", f"CLI Bridge: échec écriture settings.json: {e}")
 
@@ -2280,6 +2310,23 @@ class GeminiCliSession(BaseSession):
             msg_arg,
         ]
         
+        # Logger la commande exécutée (sans le prompt complet pour éviter le spam)
+        UnifiedLogger.write(
+            "AI_CORE",
+            "DEBUG",
+            f"CLI Commande: {self.cli_path} --model {self.model_name} --output-format text --prompt [{(len(msg_arg))} chars]"
+        )
+        UnifiedLogger.write(
+            "AI_CORE",
+            "DEBUG",
+            f"CLI CWD: {self._cli_workdir or os.getcwd()}"
+        )
+        UnifiedLogger.write(
+            "AI_CORE",
+            "DEBUG",
+            f"CLI Transport MCP: {'HTTP/SSE' if self._mcp_http_available else 'stdio'}"
+        )
+        
         # Diagnostic léger : tailles/troncature (sans contenu sensible)
         try:
             meta = getattr(self, "_last_prompt_meta", None)
@@ -2370,8 +2417,10 @@ class GeminiCliSession(BaseSession):
                             """Écrit stdin dans un thread séparé pour éviter le blocage."""
                             try:
                                 # Attendre un peu pour que le processus soit prêt (évite les erreurs de timing)
+                                # Avec SSE, gemini-cli peut prendre un peu plus de temps pour initialiser la connexion MCP
                                 import time
-                                time.sleep(0.1)
+                                wait_time = 0.2 if self._mcp_http_available else 0.1  # Plus de temps si SSE
+                                time.sleep(wait_time)
                                 
                                 # Vérifier que le processus est toujours actif avant d'écrire
                                 if process.poll() is not None:
@@ -2381,21 +2430,46 @@ class GeminiCliSession(BaseSession):
                                     stderr_msg = ""
                                     try:
                                         if process.stderr:
-                                            stderr_msg = process.stderr.read()
+                                            # Essayer de lire stderr de manière non-bloquante
+                                            import select
+                                            import sys
+                                            if sys.platform != 'win32':
+                                                # Sur Unix, on peut utiliser select
+                                                if select.select([process.stderr], [], [], 0)[0]:
+                                                    stderr_msg = process.stderr.read()
+                                            else:
+                                                # Sur Windows, essayer de lire directement
+                                                try:
+                                                    stderr_msg = process.stderr.read(1000)
+                                                except Exception:
+                                                    pass
                                     except Exception:
                                         pass
+                                    
                                     error_msg = f"Processus terminé avant écriture stdin (code: {exit_code})"
                                     if stderr_msg:
                                         error_msg += f" - stderr: {stderr_msg[:500]}"
+                                    
+                                    UnifiedLogger.write(
+                                        "AI_CORE",
+                                        "ERROR",
+                                        f"CLI Erreur stdin: {error_msg}"
+                                    )
                                     raise Exception(error_msg)
                                 
                                 # Vérifier que stdin est toujours ouvert
                                 if process.stdin is None:
-                                    raise Exception("stdin est None")
+                                    raise Exception("stdin est None - le processus n'a pas de stdin")
                                 if process.stdin.closed:
-                                    raise Exception("stdin est déjà fermé")
+                                    raise Exception("stdin est déjà fermé - le processus a peut-être terminé")
                                 
                                 # Écrire le prompt
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "DEBUG",
+                                    f"CLI Écriture stdin: {len(full_prompt)} caractères (transport: {'SSE' if self._mcp_http_available else 'stdio'})"
+                                )
+                                
                                 process.stdin.write(full_prompt)
                                 if not full_prompt.endswith("\n"):
                                     process.stdin.write("\n")
@@ -2403,8 +2477,22 @@ class GeminiCliSession(BaseSession):
                                 process.stdin.close()
                                 stdin_write_complete[0] = True
                                 
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "DEBUG",
+                                    "CLI stdin écrit avec succès"
+                                )
+                                
                             except Exception as e:
                                 stdin_write_error[0] = e
+                                
+                                # Log détaillé de l'erreur
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "ERROR",
+                                    f"CLI Erreur écriture stdin: {str(e)} (transport: {'SSE' if self._mcp_http_available else 'stdio'})"
+                                )
+                                
                                 # Log l'erreur stderr si disponible pour diagnostic
                                 try:
                                     if process.stderr:
@@ -2421,20 +2509,20 @@ class GeminiCliSession(BaseSession):
                                                         "DEBUG",
                                                         f"CLI stderr (erreur stdin): {stderr_output[:500]}"
                                                     )
+                                        else:
+                                            # Sur Windows, essayer de lire directement
+                                            try:
+                                                stderr_output = process.stderr.read(1000)
+                                                if stderr_output:
+                                                    UnifiedLogger.write(
+                                                        "AI_CORE",
+                                                        "DEBUG",
+                                                        f"CLI stderr (erreur stdin): {stderr_output[:500]}"
+                                                    )
+                                            except Exception:
+                                                pass
                                 except Exception:
-                                    # Sur Windows, select n'est pas disponible, on essaie juste de lire
-                                    try:
-                                        if process.stderr:
-                                            # Lire de manière non-bloquante (peut échouer sur Windows)
-                                            stderr_output = process.stderr.read(500)
-                                            if stderr_output:
-                                                UnifiedLogger.write(
-                                                    "AI_CORE",
-                                                    "DEBUG",
-                                                    f"CLI stderr (erreur stdin): {stderr_output[:500]}"
-                                                )
-                                    except Exception:
-                                        pass
+                                    pass
                                 
                                 # Fermer stdin proprement
                                 try:
@@ -2462,6 +2550,11 @@ class GeminiCliSession(BaseSession):
                         stdout_finished = [False]  # Flag pour indiquer la fin de la lecture
                         stdout_error = [None]  # Capturer les erreurs depuis le thread
                         
+                        # OPTIMISATION: Lecture stderr non-bloquante pour diagnostiquer les erreurs
+                        stderr_queue = Queue()
+                        stderr_finished = [False]
+                        stderr_lines = []  # Capturer toutes les lignes stderr pour diagnostic
+                        
                         def read_stdout_thread(process, queue, finished_flag, error_flag):
                             """Thread qui lit stdout et met les lignes dans la queue."""
                             try:
@@ -2472,13 +2565,43 @@ class GeminiCliSession(BaseSession):
                                 error_flag[0] = e
                                 finished_flag[0] = True
                         
-                        # Lancer le thread de lecture stdout
+                        def read_stderr_thread(process, queue, finished_flag, lines_list):
+                            """Thread qui lit stderr et met les lignes dans la queue + liste."""
+                            try:
+                                for line in process.stderr:
+                                    line_text = line.strip()
+                                    if line_text:
+                                        lines_list.append(line_text)
+                                        queue.put(line_text)
+                                        # Logger immédiatement les erreurs stderr pour diagnostic
+                                        UnifiedLogger.write(
+                                            "AI_CORE",
+                                            "DEBUG",
+                                            f"CLI stderr: {line_text[:500]}"
+                                        )
+                                finished_flag[0] = True
+                            except Exception as e:
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "DEBUG",
+                                    f"CLI Erreur lecture stderr: {e}"
+                                )
+                                finished_flag[0] = True
+                        
+                        # Lancer les threads de lecture stdout et stderr
                         stdout_thread = Thread(
                             target=read_stdout_thread,
                             args=(process, stdout_queue, stdout_finished, stdout_error),
                             daemon=True
                         )
                         stdout_thread.start()
+                        
+                        stderr_thread = Thread(
+                            target=read_stderr_thread,
+                            args=(process, stderr_queue, stderr_finished, stderr_lines),
+                            daemon=True
+                        )
+                        stderr_thread.start()
                         
                         # Mesure du temps avant la première ligne de sortie
                         first_line_received = False
@@ -2513,8 +2636,17 @@ class GeminiCliSession(BaseSession):
                         if stdout_error[0]:
                             raise Exception(f"Erreur lecture stdout: {stdout_error[0]}")
                         
-                        # Attendre que le thread se termine
+                        # Attendre que les threads se terminent
                         stdout_thread.join(timeout=1.0)
+                        stderr_thread.join(timeout=1.0)
+                        
+                        # Logger toutes les erreurs stderr capturées si le processus s'est terminé sans sortie
+                        if not first_line_received and stderr_lines:
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "ERROR",
+                                f"CLI Aucune sortie stdout, mais {len(stderr_lines)} lignes stderr capturées: {stderr_lines[:10]}"
+                            )
                         
                         # Attente de la fin du processus
                         process.wait()

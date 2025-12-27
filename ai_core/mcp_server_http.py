@@ -11,6 +11,7 @@ import json
 import sys
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime
@@ -193,6 +194,12 @@ async def handle_sse(request: web.Request) -> Response:
     """
     Endpoint SSE pour le transport Server-Sent Events.
     Compatible avec gemini-cli SSE transport.
+    
+    Note: gemini-cli peut fermer la connexion après la découverte des outils,
+    donc on gère gracieusement la fermeture de connexion.
+    
+    IMPORTANT: Pour POST, gemini-cli peut envoyer des requêtes MCP dans le body.
+    Pour GET, c'est juste une connexion SSE pour recevoir des événements.
     """
     response = web.StreamResponse()
     response.headers['Content-Type'] = 'text/event-stream'
@@ -201,37 +208,169 @@ async def handle_sse(request: web.Request) -> Response:
     
     await response.prepare(request)
     
+    # Logger la méthode HTTP et les headers pour diagnostic
+    UnifiedLogger.write(
+        "MCP_HTTP",
+        "INFO",
+        f"🔗 Connexion SSE: {request.method} {request.path_qs} depuis {request.remote}"
+    )
+    UnifiedLogger.write(
+        "MCP_HTTP",
+        "DEBUG",
+        f"Headers SSE: {dict(request.headers)}"
+    )
+    
+    # Pour POST, lire le body si présent (gemini-cli peut envoyer des requêtes MCP)
+    request_body = None
+    if request.method == 'POST':
+        try:
+            request_body = await request.read()
+            if request_body:
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "INFO",
+                    f"📦 Body POST reçu ({len(request_body)} bytes): {request_body[:500].decode('utf-8', errors='replace')}"
+                )
+            else:
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "DEBUG",
+                    "Body POST vide"
+                )
+        except Exception as e:
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "ERROR",
+                f"❌ Erreur lecture body POST: {e}"
+            )
+    
     try:
-        # Envoyer un événement initial
+        # Envoyer un événement initial de connexion
+        UnifiedLogger.write(
+            "MCP_HTTP",
+            "INFO",
+            "✅ Envoi événement de connexion SSE"
+        )
         await response.write(b'data: {"type": "connection", "status": "connected"}\n\n')
         
-        # Maintenir la connexion ouverte
-        # (gemini-cli gère la découverte et les appels d'outils via d'autres endpoints)
+        # Maintenir la connexion ouverte avec des heartbeats
+        # gemini-cli peut fermer la connexion à tout moment, donc on gère les exceptions
+        heartbeat_count = 0
         while True:
             await asyncio.sleep(1)
-            # Envoyer un heartbeat périodique
-            await response.write(b'data: {"type": "heartbeat"}\n\n')
+            try:
+                # Vérifier si la connexion est toujours ouverte avant d'écrire
+                transport_closing = False
+                try:
+                    if hasattr(request, 'transport') and request.transport is not None:
+                        transport_closing = request.transport.is_closing()
+                except (AttributeError, RuntimeError, OSError):
+                    transport_closing = True
+                
+                if transport_closing:
+                    UnifiedLogger.write(
+                        "MCP_HTTP",
+                        "INFO",
+                        f"🔌 Connexion SSE fermée par le client (heartbeat #{heartbeat_count})"
+                    )
+                    break
+                # Envoyer un heartbeat périodique
+                heartbeat_count += 1
+                if heartbeat_count % 10 == 0:  # Logger tous les 10 heartbeats
+                    UnifiedLogger.write(
+                        "MCP_HTTP",
+                        "DEBUG",
+                        f"💓 Heartbeat SSE #{heartbeat_count}"
+                    )
+                await response.write(b'data: {"type": "heartbeat", "count": ' + str(heartbeat_count).encode() + b'}\n\n')
+            except (ConnectionResetError, OSError, asyncio.CancelledError) as e:
+                # Connexion fermée par le client - c'est normal
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "INFO",
+                    f"🔌 Connexion SSE fermée par le client (heartbeat #{heartbeat_count}): {type(e).__name__}"
+                )
+                break
             
+    except asyncio.CancelledError:
+        # Connexion annulée - c'est normal
+        UnifiedLogger.write(
+            "MCP_HTTP",
+            "DEBUG",
+            f"Connexion SSE annulée (heartbeat #{heartbeat_count})"
+        )
     except Exception as e:
         UnifiedLogger.write(
             "MCP_HTTP",
             "ERROR",
-            f"❌ Erreur SSE: {e}"
+            f"❌ Erreur SSE (heartbeat #{heartbeat_count}): {e}"
         )
     finally:
-        await response.write_eof()
+        # Fermer proprement la connexion si elle n'est pas déjà fermée
+        try:
+            # Vérifier si le transport existe et n'est pas fermé
+            transport_closing = False
+            try:
+                if hasattr(request, 'transport') and request.transport is not None:
+                    transport_closing = request.transport.is_closing()
+            except (AttributeError, RuntimeError, OSError):
+                # Transport déjà fermé ou invalide
+                transport_closing = True
+            
+            if not transport_closing:
+                await response.write_eof()
+        except (ConnectionResetError, OSError, RuntimeError, AttributeError) as e:
+            # Connexion déjà fermée - c'est normal, on ignore l'erreur
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "DEBUG",
+                f"Connexion SSE déjà fermée lors de write_eof: {type(e).__name__}"
+            )
     
     return response
 
 
+@web.middleware
+async def logging_middleware(request: web.Request, handler):
+    """Middleware pour logger toutes les requêtes HTTP entrantes."""
+    start_time = time.time()
+    
+    # Logger la requête entrante
+    UnifiedLogger.write(
+        "MCP_HTTP",
+        "DEBUG",
+        f"Requête HTTP: {request.method} {request.path_qs} depuis {request.remote} (headers: {dict(request.headers)})"
+    )
+    
+    try:
+        response = await handler(request)
+        duration = (time.time() - start_time) * 1000
+        UnifiedLogger.write(
+            "MCP_HTTP",
+            "DEBUG",
+            f"Réponse HTTP: {request.method} {request.path_qs} -> {response.status} ({duration:.0f}ms)"
+        )
+        return response
+    except Exception as e:
+        duration = (time.time() - start_time) * 1000
+        UnifiedLogger.write(
+            "MCP_HTTP",
+            "ERROR",
+            f"Erreur HTTP: {request.method} {request.path_qs} -> {type(e).__name__}: {e} ({duration:.0f}ms)"
+        )
+        raise
+
+
 def create_app() -> web.Application:
     """Crée l'application aiohttp avec les routes MCP."""
-    app = web.Application()
+    app = web.Application(middlewares=[logging_middleware])
     
     # Routes MCP
     app.router.add_get('/mcp/tools', handle_list_tools)
     app.router.add_post('/mcp/tools/call', handle_call_tool)
+    # SSE doit accepter GET et POST (gemini-cli utilise POST pour initialiser la connexion)
     app.router.add_get('/mcp/sse', handle_sse)
+    app.router.add_post('/mcp/sse', handle_sse)
     app.router.add_get('/health', handle_health)
     
     # Route racine pour compatibilité
@@ -245,6 +384,45 @@ async def start_server(host: str = MCP_HTTP_HOST, port: int = MCP_HTTP_PORT) -> 
     Démarre le serveur MCP HTTP en arrière-plan.
     """
     global _app, _runner, _site
+    
+    # Vérifier si le port est déjà utilisé (serveur précédent peut-être encore actif)
+    import socket
+    try:
+        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_socket.settimeout(1)
+        result = test_socket.connect_ex((host, port))
+        test_socket.close()
+        if result == 0:
+            # Le port est déjà utilisé - vérifier si c'est notre serveur
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "WARNING",
+                f"⚠️ Port {port} déjà utilisé. Vérification si le serveur MCP HTTP est déjà actif..."
+            )
+            try:
+                import requests
+                health_url = f"http://{host}:{port}/health"
+                response = requests.get(health_url, timeout=2)
+                if response.status_code == 200:
+                    UnifiedLogger.write(
+                        "MCP_HTTP",
+                        "INFO",
+                        f"✅ Serveur MCP HTTP déjà actif sur {health_url} ({response.json().get('tools_count', 0)} outils)"
+                    )
+                    return  # Le serveur est déjà actif, pas besoin d'en démarrer un nouveau
+            except Exception:
+                pass
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "WARNING",
+                f"⚠️ Port {port} utilisé par un autre processus. Tentative de démarrage quand même..."
+            )
+    except Exception as e:
+        UnifiedLogger.write(
+            "MCP_HTTP",
+            "DEBUG",
+            f"Vérification port échouée: {e}"
+        )
     
     try:
         _app = create_app()
@@ -265,6 +443,39 @@ async def start_server(host: str = MCP_HTTP_HOST, port: int = MCP_HTTP_PORT) -> 
             f"📋 Endpoints disponibles: /mcp/tools, /mcp/tools/call, /mcp/sse, /health"
         )
         
+    except OSError as e:
+        if "10048" in str(e) or "address already in use" in str(e).lower():
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "WARNING",
+                f"⚠️ Port {port} déjà utilisé. Le serveur MCP HTTP est peut-être déjà démarré. Vérification..."
+            )
+            # Vérifier si le serveur répond
+            try:
+                import requests
+                health_url = f"http://{host}:{port}/health"
+                response = requests.get(health_url, timeout=2)
+                if response.status_code == 200:
+                    UnifiedLogger.write(
+                        "MCP_HTTP",
+                        "INFO",
+                        f"✅ Serveur MCP HTTP déjà actif sur {health_url} ({response.json().get('tools_count', 0)} outils) - Réutilisation du serveur existant"
+                    )
+                    return  # Le serveur est déjà actif
+            except Exception:
+                pass
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "ERROR",
+                f"❌ Impossible de démarrer le serveur MCP HTTP: port {port} utilisé et serveur non accessible"
+            )
+        else:
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "ERROR",
+                f"❌ Erreur démarrage serveur MCP HTTP: {e}"
+            )
+        raise
     except Exception as e:
         UnifiedLogger.write(
             "MCP_HTTP",
