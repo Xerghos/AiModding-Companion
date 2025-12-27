@@ -1589,7 +1589,7 @@ class GeminiCliSession(BaseSession):
         # Configuration MCP HTTP/SSE pour utiliser le serveur long-running déjà démarré
         # Le serveur MCP HTTP est démarré au lancement de l'application (voir run.py)
         # Cela évite de lancer un nouveau processus Python à chaque requête
-        mcp_http_port = int(os.environ.get("MCP_HTTP_PORT", "8765"))
+        mcp_http_port = int(os.environ.get("MCP_HTTP_PORT", "8000"))
         mcp_http_host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
         # FastMCP expose l'endpoint SSE à /mcp (pas /mcp/sse)
         # gemini-cli détecte automatiquement le transport SSE depuis cette URL

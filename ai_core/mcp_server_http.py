@@ -6,7 +6,7 @@ UTILISE MAINTENANT FastMCP au lieu d'aiohttp.
 
 Usage:
     Le serveur démarre automatiquement au lancement de l'application via start_server_background().
-    Port par défaut: 8765 (configurable via MCP_HTTP_PORT)
+    Port par défaut: 8000 (configurable via MCP_HTTP_PORT)
 """
 import asyncio
 import json
@@ -44,7 +44,7 @@ from ai_core.mcp_server import (
 )
 
 # Configuration du serveur
-MCP_HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8765"))
+MCP_HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8000"))
 MCP_HTTP_HOST = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
 
 # Serveur HTTP global

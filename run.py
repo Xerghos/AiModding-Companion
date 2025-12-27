@@ -22,19 +22,25 @@ except ImportError:
     pass
 
 # 3.5. Démarrage du serveur MCP HTTP long-running
-try:
-    import time
-    from ai_core.mcp_server_http import start_server_background
-    mcp_server_thread = start_server_background()
-    # Laisser un peu de temps au serveur pour s'initialiser
-    time.sleep(0.5)
-    if 'UnifiedLogger' in locals():
-        UnifiedLogger.write("run", "INFO", "✅ Serveur MCP HTTP démarré en arrière-plan")
-except Exception as e:
-    if 'UnifiedLogger' in locals():
-        UnifiedLogger.write("run", "WARNING", f"⚠️ Impossible de démarrer le serveur MCP HTTP: {e}")
-    else:
-        print(f"⚠️ Serveur MCP HTTP non démarré: {e}")
+# DÉSACTIVÉ : Le serveur MCP doit être lancé dans un terminal séparé via start_mcp_server.py
+# Le serveur FastMCP peut fonctionner indépendamment sans besoin des queues/sessions de l'application.
+# Pour lancer le serveur MCP avec l'application, utilisez: start_with_mcp.bat
+# Pour lancer uniquement le serveur MCP: python start_mcp_server.py
+# Le serveur sera accessible à: http://localhost:8000/mcp
+#
+# Ancien code (désactivé):
+# try:
+#     import time
+#     from ai_core.mcp_server_http import start_server_background
+#     mcp_server_thread = start_server_background()
+#     time.sleep(0.5)
+#     if 'UnifiedLogger' in locals():
+#         UnifiedLogger.write("run", "INFO", "✅ Serveur MCP HTTP démarré en arrière-plan")
+# except Exception as e:
+#     if 'UnifiedLogger' in locals():
+#         UnifiedLogger.write("run", "WARNING", f"⚠️ Impossible de démarrer le serveur MCP HTTP: {e}")
+#     else:
+#         print(f"⚠️ Serveur MCP HTTP non démarré: {e}")
 
 # 4. Import UI
 try:

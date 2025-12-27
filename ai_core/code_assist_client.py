@@ -27,7 +27,7 @@ def get_tools_from_mcp_server() -> Optional[List[Dict[str, Any]]]:
         Liste des outils au format Gemini/OpenAI, ou None en cas d'erreur
     """
     try:
-        mcp_http_port = int(os.environ.get("MCP_HTTP_PORT", "8765"))
+        mcp_http_port = int(os.environ.get("MCP_HTTP_PORT", "8000"))
         mcp_http_host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
         mcp_url = f"http://{mcp_http_host}:{mcp_http_port}/mcp/tools"
         

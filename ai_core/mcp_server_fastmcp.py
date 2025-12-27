@@ -4,7 +4,7 @@ Utilise FastMCP pour simplifier l'implémentation et gérer automatiquement JSON
 
 Usage:
     Le serveur démarre automatiquement au lancement de l'application via mcp_server_http.py.
-    Port par défaut: 8765 (configurable via MCP_HTTP_PORT)
+    Port par défaut: 8000 (configurable via MCP_HTTP_PORT, compatible FastMCP 2.0)
 """
 import sys
 import os
@@ -281,8 +281,33 @@ async def health_check(request=None):
 
 if __name__ == "__main__":
     # Pour les tests directs du serveur FastMCP
-    UnifiedLogger.write("MCP_FASTMCP", "START", "Démarrage direct du serveur FastMCP HTTP...")
+    import os
     
-    # Démarrer le serveur FastMCP avec transport HTTP
-    mcp.run(transport="http", host="127.0.0.1", port=8765)
+    # Configuration selon la documentation FastMCP 2.0
+    # Port par défaut : 8000 (compatible avec FastMCP documentation)
+    # Le serveur sera accessible à http://localhost:8000/mcp
+    port = int(os.environ.get("MCP_HTTP_PORT", 8000))
+    host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
+    
+    UnifiedLogger.write("MCP_FASTMCP", "START", f"Démarrage du serveur FastMCP HTTP sur http://{host}:{port}/mcp")
+    
+    print("\n" + "="*60)
+    print("🚀 Serveur MCP FastMCP")
+    print("="*60)
+    print(f"✅ Serveur démarré sur http://{host}:{port}/mcp")
+    print(f"📋 {len(TOOLS_SCHEMA)} outils disponibles")
+    print("💡 Appuyez sur Ctrl+C pour arrêter le serveur")
+    print("="*60 + "\n")
+    
+    try:
+        # Démarrer le serveur FastMCP avec transport HTTP
+        mcp.run(transport="http", host=host, port=port)
+    except KeyboardInterrupt:
+        print("\n\n👋 Arrêt du serveur...")
+        UnifiedLogger.write("MCP_FASTMCP", "STOP", "Serveur arrêté par l'utilisateur")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Erreur lors du démarrage du serveur: {e}")
+        UnifiedLogger.write("MCP_FASTMCP", "ERROR", f"Erreur: {e}")
+        sys.exit(1)
 
