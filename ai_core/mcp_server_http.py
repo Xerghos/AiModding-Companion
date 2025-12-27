@@ -1,9 +1,11 @@
 """
 Serveur MCP HTTP long-running pour partager les outils entre gemini-cli et CodeAssistClient.
-Utilise aiohttp pour exposer les outils MCP via HTTP/SSE.
+UTILISE MAINTENANT FastMCP au lieu d'aiohttp.
+
+⚠️ IMPORTANT: L'ancien code aiohttp est désactivé. Seul FastMCP est utilisé via start_server_background().
 
 Usage:
-    Le serveur démarre automatiquement au lancement de l'application.
+    Le serveur démarre automatiquement au lancement de l'application via start_server_background().
     Port par défaut: 8765 (configurable via MCP_HTTP_PORT)
 """
 import asyncio
@@ -73,9 +75,15 @@ def get_tools_list() -> List[Dict[str, Any]]:
 
 async def handle_list_tools(request: web.Request) -> Response:
     """
-    Endpoint MCP: Liste tous les outils disponibles.
-    Compatible avec le protocole MCP.
+    [DÉSACTIVÉ] Endpoint MCP: Liste tous les outils disponibles.
+    Cette fonction n'est plus utilisée - FastMCP gère maintenant tout.
     """
+    UnifiedLogger.write(
+        "MCP_HTTP",
+        "ERROR",
+        "❌ handle_list_tools() appelée mais désactivée - FastMCP gère maintenant les outils"
+    )
+    raise RuntimeError("L'ancien serveur aiohttp est désactivé. FastMCP gère maintenant les outils.")
     try:
         tools = get_tools_list()
         
@@ -107,9 +115,15 @@ async def handle_list_tools(request: web.Request) -> Response:
 
 async def handle_call_tool(request: web.Request) -> Response:
     """
-    Endpoint MCP: Exécute un outil.
-    Compatible avec le protocole MCP.
+    [DÉSACTIVÉ] Endpoint MCP: Exécute un outil.
+    Cette fonction n'est plus utilisée - FastMCP gère maintenant tout.
     """
+    UnifiedLogger.write(
+        "MCP_HTTP",
+        "ERROR",
+        "❌ handle_call_tool() appelée mais désactivée - FastMCP gère maintenant les outils"
+    )
+    raise RuntimeError("L'ancien serveur aiohttp est désactivé. FastMCP gère maintenant les outils.")
     try:
         data = await request.json()
         tool_name = data.get("name")
@@ -192,15 +206,17 @@ async def handle_health(request: web.Request) -> Response:
 
 async def handle_sse(request: web.Request) -> Response:
     """
-    Endpoint SSE pour le transport Server-Sent Events.
-    Compatible avec gemini-cli SSE transport.
-    
-    Note: gemini-cli peut fermer la connexion après la découverte des outils,
-    donc on gère gracieusement la fermeture de connexion.
-    
-    IMPORTANT: Pour POST, gemini-cli peut envoyer des requêtes MCP dans le body.
-    Pour GET, c'est juste une connexion SSE pour recevoir des événements.
+    [DÉSACTIVÉ] Endpoint SSE pour le transport Server-Sent Events.
+    Cette fonction n'est plus utilisée - FastMCP gère maintenant tout.
     """
+    UnifiedLogger.write(
+        "MCP_HTTP",
+        "ERROR",
+        "❌ handle_sse() appelée mais désactivée - FastMCP gère maintenant le SSE"
+    )
+    raise RuntimeError("L'ancien serveur aiohttp est désactivé. FastMCP gère maintenant le SSE.")
+    
+    # Code désactivé ci-dessous (ne sera jamais exécuté)
     response = web.StreamResponse()
     response.headers['Content-Type'] = 'text/event-stream'
     response.headers['Cache-Control'] = 'no-cache'
@@ -361,28 +377,39 @@ async def logging_middleware(request: web.Request, handler):
         raise
 
 
+# ============================================================================
+# ANCIEN CODE AIOHTTP - DÉSACTIVÉ (remplacé par FastMCP)
+# ============================================================================
+# Les fonctions suivantes sont conservées pour référence mais ne sont plus utilisées.
+# FastMCP gère maintenant tout le serveur HTTP/SSE.
+
 def create_app() -> web.Application:
-    """Crée l'application aiohttp avec les routes MCP."""
-    app = web.Application(middlewares=[logging_middleware])
-    
-    # Routes MCP
-    app.router.add_get('/mcp/tools', handle_list_tools)
-    app.router.add_post('/mcp/tools/call', handle_call_tool)
-    # SSE doit accepter GET et POST (gemini-cli utilise POST pour initialiser la connexion)
-    app.router.add_get('/mcp/sse', handle_sse)
-    app.router.add_post('/mcp/sse', handle_sse)
-    app.router.add_get('/health', handle_health)
-    
-    # Route racine pour compatibilité
-    app.router.add_get('/', handle_health)
-    
-    return app
+    """
+    [DÉSACTIVÉ] Crée l'application aiohttp avec les routes MCP.
+    Cette fonction n'est plus utilisée - FastMCP gère maintenant tout.
+    """
+    # Ne plus créer l'application aiohttp - FastMCP gère tout
+    UnifiedLogger.write(
+        "MCP_HTTP",
+        "WARNING",
+        "⚠️ create_app() appelée mais désactivée - FastMCP est utilisé maintenant"
+    )
+    raise RuntimeError("L'ancien serveur aiohttp est désactivé. Utilisez FastMCP via start_server_background().")
 
 
 async def start_server(host: str = MCP_HTTP_HOST, port: int = MCP_HTTP_PORT) -> None:
     """
-    Démarre le serveur MCP HTTP en arrière-plan.
+    [DÉSACTIVÉ] Démarre le serveur MCP HTTP en arrière-plan.
+    Cette fonction n'est plus utilisée - FastMCP gère maintenant tout via start_server_background().
     """
+    UnifiedLogger.write(
+        "MCP_HTTP",
+        "WARNING",
+        "⚠️ start_server() appelée mais désactivée - Utilisez start_server_background() pour FastMCP"
+    )
+    raise RuntimeError("L'ancien serveur aiohttp est désactivé. Utilisez start_server_background() pour FastMCP.")
+    
+    # Code désactivé ci-dessous (ne sera jamais exécuté)
     global _app, _runner, _site
     
     # Vérifier si le port est déjà utilisé (serveur précédent peut-être encore actif)
@@ -510,69 +537,184 @@ async def stop_server() -> None:
 
 def start_server_background(host: str = MCP_HTTP_HOST, port: int = MCP_HTTP_PORT) -> threading.Thread:
     """
-    Démarre le serveur MCP HTTP dans un thread séparé avec une event loop dédiée.
+    Démarre le serveur MCP HTTP/SSE avec FastMCP dans un thread séparé.
     Retourne le thread pour pouvoir l'arrêter plus tard.
     """
-    def run_server():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    def run_fastmcp_server():
         try:
-            # Démarrer le serveur
-            loop.run_until_complete(start_server(host, port))
+            # Vérifier si le port est déjà utilisé
+            import socket
+            test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_socket.settimeout(1)
+            result = test_socket.connect_ex((host, port))
+            test_socket.close()
+            if result == 0:
+                # Le port est déjà utilisé - vérifier si c'est notre serveur FastMCP
+                try:
+                    import requests
+                    health_url = f"http://{host}:{port}/health"
+                    response = requests.get(health_url, timeout=2)
+                    if response.status_code == 200:
+                        UnifiedLogger.write(
+                            "MCP_HTTP",
+                            "INFO",
+                            f"✅ Serveur FastMCP déjà actif sur {health_url} - Réutilisation"
+                        )
+                        return  # Le serveur est déjà actif
+                except Exception:
+                    pass
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "WARNING",
+                    f"⚠️ Port {port} déjà utilisé. Tentative de démarrage FastMCP quand même..."
+                )
             
-            # Maintenir la boucle en vie avec une tâche qui ne se termine jamais
-            async def keep_alive():
-                while True:
-                    await asyncio.sleep(1)
+            # Désactiver le banner FastMCP AVANT d'importer FastMCP
+            # On doit faire le monkey-patch avant l'import pour qu'il soit effectif
+            try:
+                import fastmcp.utilities.cli
+                # Désactiver complètement la fonction log_server_banner
+                def noop_log_banner(*args, **kwargs):
+                    pass
+                fastmcp.utilities.cli.log_server_banner = noop_log_banner
+            except Exception:
+                pass
             
-            loop.create_task(keep_alive())
-            # Maintenir la boucle en vie
-            loop.run_forever()
+            # Configurer l'encodage UTF-8 AVANT d'importer FastMCP
+            import os
+            os.environ['PYTHONIOENCODING'] = 'utf-8'
+            
+            # Maintenant on peut importer FastMCP en toute sécurité
+            # Le monkey-patch du banner FastMCP devrait suffire pour éviter l'affichage
+            from ai_core.mcp_server_fastmcp import mcp
+            import logging
+            
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "START",
+                f"🚀 Démarrage serveur FastMCP HTTP/SSE sur http://{host}:{port}"
+            )
+            
+            # Configurer le logging pour uvicorn (silencieux)
+            # On configure les loggers AVANT de démarrer le serveur
+            logging.getLogger("uvicorn").setLevel(logging.ERROR)
+            logging.getLogger("uvicorn.access").setLevel(logging.ERROR)
+            
+            # Désactiver aussi les logs de FastMCP si possible
+            try:
+                logging.getLogger("fastmcp").setLevel(logging.ERROR)
+                logging.getLogger("mcp").setLevel(logging.ERROR)
+            except Exception:
+                pass
+            
+            try:
+                # Utiliser directement mcp.run() - méthode recommandée par FastMCP
+                # Cette méthode gère automatiquement :
+                # - Le démarrage du serveur HTTP/SSE
+                # - La gestion de la boucle d'événements asyncio
+                # - La configuration uvicorn en interne
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "INFO",
+                    f"📡 Démarrage serveur FastMCP avec mcp.run() sur {host}:{port}"
+                )
+                
+                # Démarrer le serveur (bloquant mais normal pour un serveur)
+                # C'est un thread daemon, donc il ne bloquera pas l'arrêt de l'application
+                mcp.run(transport="http", host=host, port=port)
+            except KeyboardInterrupt:
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "INFO",
+                    "🛑 Serveur FastMCP arrêté (KeyboardInterrupt)"
+                )
+            except Exception as e:
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "ERROR",
+                    f"❌ Erreur dans mcp.run(): {e}"
+                )
+                import traceback
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "ERROR",
+                    f"Traceback: {traceback.format_exc()}"
+                )
+                raise
+            
+        except OSError as e:
+            if "10048" in str(e) or "address already in use" in str(e).lower():
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "WARNING",
+                    f"⚠️ Port {port} déjà utilisé. Un serveur MCP est probablement déjà actif."
+                )
+            else:
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "ERROR",
+                    f"❌ Erreur OSError dans le serveur FastMCP: {e}"
+                )
         except Exception as e:
             UnifiedLogger.write(
                 "MCP_HTTP",
                 "ERROR",
-                f"Erreur dans la boucle serveur: {e}"
+                f"❌ Erreur dans le serveur FastMCP: {e}"
             )
             import traceback
-            traceback.print_exc()
-        finally:
-            try:
-                # Arrêter proprement le serveur
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            except Exception:
-                pass
-            finally:
-                loop.close()
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "ERROR",
+                f"Traceback: {traceback.format_exc()}"
+            )
     
-    server_thread = threading.Thread(target=run_server, daemon=True, name="MCP-HTTP-Server")
+    server_thread = threading.Thread(target=run_fastmcp_server, daemon=True, name="MCP-FastMCP-Server")
     server_thread.start()
-    
-    # Attendre un peu pour vérifier que le serveur démarre correctement
-    import time
-    time.sleep(0.5)
     
     UnifiedLogger.write(
         "MCP_HTTP",
         "INFO",
-        f"Thread serveur MCP HTTP demarre (daemon)"
+        f"Thread serveur FastMCP HTTP démarré (daemon)"
     )
+    
+    # Vérifier que le serveur démarre correctement (non-bloquant)
+    def check_server_startup():
+        """Vérifie que le serveur démarre correctement après un court délai"""
+        import time
+        time.sleep(1)  # Attendre que le serveur démarre
+        try:
+            import requests
+            health_url = f"http://{MCP_HTTP_HOST}:{MCP_HTTP_PORT}/health"
+            response = requests.get(health_url, timeout=2)
+            if response.status_code == 200:
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "INFO",
+                    f"✅ Serveur FastMCP démarré et accessible sur {health_url}"
+                )
+            else:
+                UnifiedLogger.write(
+                    "MCP_HTTP",
+                    "WARNING",
+                    f"⚠️ Serveur FastMCP démarré mais /health retourne {response.status_code}"
+                )
+        except Exception as e:
+            UnifiedLogger.write(
+                "MCP_HTTP",
+                "WARNING",
+                f"⚠️ Impossible de vérifier le démarrage du serveur: {e}"
+            )
+    
+    # Lancer la vérification dans un thread séparé pour ne pas bloquer
+    check_thread = threading.Thread(target=check_server_startup, daemon=True)
+    check_thread.start()
     
     return server_thread
 
 
 if __name__ == "__main__":
-    # Mode standalone pour tests
-    async def main():
-        await start_server()
-        try:
-            # Maintenir le serveur en vie
-            await asyncio.Event().wait()
-        except KeyboardInterrupt:
-            await stop_server()
-    
-    asyncio.run(main())
+    # Mode standalone pour tests - Utilise FastMCP maintenant
+    from ai_core.mcp_server_fastmcp import mcp
+    UnifiedLogger.write("MCP_HTTP", "START", "Démarrage serveur FastMCP HTTP en mode standalone...")
+    mcp.run(transport="http", host=MCP_HTTP_HOST, port=MCP_HTTP_PORT)
 

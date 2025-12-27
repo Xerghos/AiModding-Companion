@@ -1591,27 +1591,42 @@ class GeminiCliSession(BaseSession):
         # Cela évite de lancer un nouveau processus Python à chaque requête
         mcp_http_port = int(os.environ.get("MCP_HTTP_PORT", "8765"))
         mcp_http_host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
-        mcp_server_url = f"http://{mcp_http_host}:{mcp_http_port}/mcp/sse"
+        # FastMCP expose l'endpoint SSE à /mcp (pas /mcp/sse)
+        # gemini-cli détecte automatiquement le transport SSE depuis cette URL
+        mcp_server_url = f"http://{mcp_http_host}:{mcp_http_port}/mcp"
         
         # Vérifier que le serveur MCP HTTP est disponible avant de l'utiliser
+        # On fait plusieurs tentatives car le serveur peut être en cours de démarrage
         self._mcp_http_available = False
-        try:
-            import requests
-            health_url = f"http://{mcp_http_host}:{mcp_http_port}/health"
-            response = requests.get(health_url, timeout=2)
-            if response.status_code == 200:
-                self._mcp_http_available = True
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "DEBUG",
-                    f"✅ Serveur MCP HTTP disponible sur {health_url} ({response.json().get('tools_count', 0)} outils)"
-                )
-        except Exception as e:
-            UnifiedLogger.write(
-                "AI_CORE",
-                "WARNING",
-                f"⚠️ Serveur MCP HTTP non disponible ({health_url}): {e}. Utilisation de stdio en fallback."
-            )
+        health_url = f"http://{mcp_http_host}:{mcp_http_port}/health"
+        
+        import time
+        max_retries = 3
+        retry_delay = 0.5
+        
+        for attempt in range(max_retries):
+            try:
+                import requests
+                response = requests.get(health_url, timeout=2)
+                if response.status_code == 200:
+                    self._mcp_http_available = True
+                    tools_count = response.json().get('tools_count', 0)
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "DEBUG",
+                        f"✅ Serveur MCP HTTP disponible sur {health_url} ({tools_count} outils, tentative {attempt + 1}/{max_retries})"
+                    )
+                    break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "WARNING",
+                        f"⚠️ Serveur MCP HTTP non disponible ({health_url}) après {max_retries} tentatives: {e}. Utilisation de stdio en fallback."
+                    )
         
         # Configuration SSE/HTTP si disponible, sinon fallback sur stdio
         # NOTE: gemini-cli détecte automatiquement le transport SSE si on utilise "url"

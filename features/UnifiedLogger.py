@@ -290,15 +290,31 @@ class UnifiedLogger:
                 
                 if parts:
                     metrics_line = " | ".join(parts)
-                    print(f"                 │ {Colors.DIM}└──{Colors.RESET} {metrics_line}")
+                    try:
+                        print(f"                 │ {Colors.DIM}└──{Colors.RESET} {metrics_line}")
+                    except UnicodeEncodeError:
+                        # Remplacer les caractères Unicode par des équivalents ASCII
+                        safe_line = metrics_line.replace("📥", "[IN]").replace("📤", "[OUT]").replace("⏱️", "[TIME]")
+                        safe_line = safe_line.replace("│", "|").replace("└──", "+--")
+                        print(f"                 | {Colors.DIM}+--{Colors.RESET} {safe_line}")
 
             # 2. ERREUR : Texte Rouge
             elif msg_type in ["ERROR", "WARNING", "CRITICAL"]:
                 err = str(data.get('error', data))
-                print(f"                 │ {Colors.RED}└── 💥 {err[:200]}...{Colors.RESET}")
+                try:
+                    print(f"                 │ {Colors.RED}└── 💥 {err[:200]}...{Colors.RESET}")
+                except UnicodeEncodeError:
+                    # Remplacer les caractères Unicode par des équivalents ASCII
+                    safe_err = err[:200].encode('ascii', 'ignore').decode('ascii')
+                    print(f"                 | {Colors.RED}+-- [!] {safe_err}...{Colors.RESET}")
 
             # 3. RESULTAT : Résumé
             elif "result_summary" in data and str(data["result_summary"]) != "None":
                 smry = str(data["result_summary"])
                 if len(smry) > 5:
-                    print(f"                 │ {Colors.GREEN}└── 📄 {smry[:100]}...{Colors.RESET}")
+                    try:
+                        print(f"                 │ {Colors.GREEN}└── 📄 {smry[:100]}...{Colors.RESET}")
+                    except UnicodeEncodeError:
+                        # Remplacer les caractères Unicode par des équivalents ASCII
+                        safe_smry = smry[:100].encode('ascii', 'ignore').decode('ascii')
+                        print(f"                 | {Colors.GREEN}+-- [FILE] {safe_smry}...{Colors.RESET}")

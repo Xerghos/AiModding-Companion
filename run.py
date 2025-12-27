@@ -23,8 +23,11 @@ except ImportError:
 
 # 3.5. Démarrage du serveur MCP HTTP long-running
 try:
+    import time
     from ai_core.mcp_server_http import start_server_background
     mcp_server_thread = start_server_background()
+    # Laisser un peu de temps au serveur pour s'initialiser
+    time.sleep(0.5)
     if 'UnifiedLogger' in locals():
         UnifiedLogger.write("run", "INFO", "✅ Serveur MCP HTTP démarré en arrière-plan")
 except Exception as e:
