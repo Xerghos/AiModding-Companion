@@ -6,6 +6,7 @@ et compatible avec gemini-cli.
 
 import os
 import json
+import time
 from typing import Dict, Any, Optional, Tuple
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -39,6 +40,63 @@ EXPECTED_FORMAT = {
     "token": (str, type(None)),  # Access token (peut être None si expiré)
     "scopes": list,  # Liste des scopes autorisés
 }
+
+_last_refresh_time: Optional[float] = None
+TOKEN_REFRESH_THRESHOLD_SECONDS = 30 * 60  # 30 minutes
+
+
+def _timestamp_path_for_token(token_path: str) -> str:
+    return token_path + ".timestamp"
+
+
+def _load_last_refresh_time(token_path: str) -> float:
+    """
+    Charge l'horodatage du dernier refresh.
+    Fallback: mtime du token JSON (utile si gemini-cli a refresh sans ecrire .timestamp).
+    """
+    ts_path = _timestamp_path_for_token(token_path)
+
+    # Priorite au fichier timestamp
+    if os.path.exists(ts_path):
+        try:
+            with open(ts_path, "r") as f:
+                return float((f.read() or "").strip() or "0")
+        except Exception:
+            return 0.0
+
+    # Fallback: mtime du token json
+    if os.path.exists(token_path):
+        try:
+            return float(os.path.getmtime(token_path))
+        except Exception:
+            return 0.0
+
+    return 0.0
+
+
+def _save_last_refresh_time(token_path: str, refresh_time: Optional[float] = None) -> None:
+    """Sauvegarde l'horodatage du dernier refresh dans token_path + '.timestamp'."""
+    ts_path = _timestamp_path_for_token(token_path)
+    t = time.time() if refresh_time is None else float(refresh_time)
+    os.makedirs(os.path.dirname(token_path), exist_ok=True)
+    with open(ts_path, "w") as f:
+        f.write(str(t))
+
+
+def should_refresh_token(
+    token_path: str,
+    threshold_seconds: int = TOKEN_REFRESH_THRESHOLD_SECONDS
+) -> bool:
+    """
+    Indique si on doit forcer un refresh proactif du token OAuth.
+    Regle: si aucun refresh depuis threshold_seconds.
+    """
+    global _last_refresh_time
+    if _last_refresh_time is None:
+        _last_refresh_time = _load_last_refresh_time(token_path)
+
+    age = time.time() - float(_last_refresh_time or 0.0)
+    return age > float(threshold_seconds)
 
 
 def validate_oauth_credentials(token_data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
@@ -165,6 +223,15 @@ def save_oauth_credentials(credentials: Credentials, token_path: str) -> bool:
         # Sauvegarder avec indentation pour lisibilité
         with open(token_path, 'w') as f:
             json.dump(token_data, f, indent=2)
+
+        # Mettre a jour le timestamp de refresh (utilise par le refresh proactif 30min)
+        try:
+            global _last_refresh_time
+            _last_refresh_time = time.time()
+            _save_last_refresh_time(token_path, _last_refresh_time)
+        except Exception:
+            # Ne pas bloquer si le timestamp ne peut pas etre ecrit
+            pass
         
         # Vérifier que le fichier peut être rechargé
         try:

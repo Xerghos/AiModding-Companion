@@ -70,8 +70,11 @@ class LiteLLMSession(BaseSession):
         self.proxy = None  # Initialiser à None (sera créé si nécessaire)
         
         # ID de session persistant pour CodeAssist (évite erreur 500)
-        import uuid
-        self.session_id = str(uuid.uuid4())
+        import hashlib
+        import os
+        project_path = os.path.abspath(os.getcwd())
+        session_hash = hashlib.md5(project_path.encode()).hexdigest()[:16]
+        self.session_id = f"aimodding_{session_hash}"
         
         # Instance proxy LiteLLM (si pas CLI ou si CLI a échoué)
         try:

@@ -17,6 +17,9 @@ def to_generate_content_request(
     max_tokens: Optional[int] = None,
     tools: Optional[List[Dict]] = None,
     system_instruction: Optional[str] = None,
+    safety_settings: Optional[List[Dict]] = None,
+    labels: Optional[Dict[str, str]] = None,
+    cached_content: Optional[Dict] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """
@@ -57,7 +60,7 @@ def to_generate_content_request(
     # Convertir les messages au format CodeAssist (en excluant les system qui sont gérés ci-dessus)
     contents = _to_contents(messages)
     
-    # Construire la requête Vertex (format interne CodeAssist)
+    # Construire la requête Vertex (format interne CodeAssist - aligné sur gemini-cli)
     vertex_request: Dict[str, Any] = {
         "contents": contents,
     }
@@ -69,9 +72,72 @@ def to_generate_content_request(
             "role": "system",
             "parts": [{"text": full_system_instruction}]
         }
+
+    # Construire la configuration de génération (alignée sur gemini-cli converter.js)
+    generation_config: Dict[str, Any] = {
+        "temperature": temperature,
+    }
+
+    if max_tokens:
+        generation_config["maxOutputTokens"] = max_tokens
+
+    # Ajouter tous les paramètres de génération depuis kwargs (aligné sur Vertex AI)
+    # Paramètres de base
+    if "top_p" in kwargs and kwargs["top_p"] is not None:
+        generation_config["topP"] = kwargs["top_p"]
+    if "top_k" in kwargs and kwargs["top_k"] is not None:
+        generation_config["topK"] = kwargs["top_k"]
+    if "stop_sequences" in kwargs and kwargs["stop_sequences"] is not None:
+        generation_config["stopSequences"] = kwargs["stop_sequences"]
+
+    # Paramètres avancés (alignés sur gemini-cli)
+    if "candidate_count" in kwargs and kwargs["candidate_count"] is not None:
+        generation_config["candidateCount"] = kwargs["candidate_count"]
+    if "response_logprobs" in kwargs and kwargs["response_logprobs"] is not None:
+        generation_config["responseLogprobs"] = kwargs["response_logprobs"]
+    if "logprobs" in kwargs and kwargs["logprobs"] is not None:
+        generation_config["logprobs"] = kwargs["logprobs"]
+    if "presence_penalty" in kwargs and kwargs["presence_penalty"] is not None:
+        generation_config["presencePenalty"] = kwargs["presence_penalty"]
+    if "frequency_penalty" in kwargs and kwargs["frequency_penalty"] is not None:
+        generation_config["frequencyPenalty"] = kwargs["frequency_penalty"]
+    if "seed" in kwargs and kwargs["seed"] is not None:
+        generation_config["seed"] = kwargs["seed"]
+
+    # Paramètres de réponse structurée
+    if "response_mime_type" in kwargs and kwargs["response_mime_type"] is not None:
+        generation_config["responseMimeType"] = kwargs["response_mime_type"]
+    if "response_schema" in kwargs and kwargs["response_schema"] is not None:
+        generation_config["responseSchema"] = kwargs["response_schema"]
+    if "response_json_schema" in kwargs and kwargs["response_json_schema"] is not None:
+        generation_config["responseJsonSchema"] = kwargs["response_json_schema"]
+
+    # Paramètres avancés de modèle
+    if "thinking_config" in kwargs and kwargs["thinking_config"] is not None:
+        generation_config["thinkingConfig"] = kwargs["thinking_config"]
+    if "routing_config" in kwargs and kwargs["routing_config"] is not None:
+        generation_config["routingConfig"] = kwargs["routing_config"]
+    if "model_selection_config" in kwargs and kwargs["model_selection_config"] is not None:
+        generation_config["modelSelectionConfig"] = kwargs["model_selection_config"]
+
+    # Paramètres multimédias et audio
+    if "response_modalities" in kwargs and kwargs["response_modalities"] is not None:
+        generation_config["responseModalities"] = kwargs["response_modalities"]
+    if "media_resolution" in kwargs and kwargs["media_resolution"] is not None:
+        generation_config["mediaResolution"] = kwargs["media_resolution"]
+    if "speech_config" in kwargs and kwargs["speech_config"] is not None:
+        generation_config["speechConfig"] = kwargs["speech_config"]
+    if "audio_timestamp" in kwargs and kwargs["audio_timestamp"] is not None:
+        generation_config["audioTimestamp"] = kwargs["audio_timestamp"]
     
-    # Ajouter les outils si présents
-    if tools and len(tools) > 0:  # Vérifier que tools n'est pas vide
+    if generation_config:
+        vertex_request["generationConfig"] = generation_config
+
+    # Ajouter les champs supplémentaires (alignés sur gemini-cli converter.js)
+    if cached_content:
+        vertex_request["cachedContent"] = cached_content
+
+    if tools and len(tools) > 0:
         vertex_request["tools"] = _convert_tools_to_gemini_format(tools)
         # CRITIQUE: Ajouter toolConfig pour éviter erreur 500 (comme gemini-cli)
         # Le toolConfig est requis quand des outils sont présents
@@ -83,26 +149,13 @@ def to_generate_content_request(
                     "mode": function_calling_mode  # AUTO, ANY, ou NONE
                 }
             }
-    
-    # Construire la configuration de génération
-    generation_config: Dict[str, Any] = {
-        "temperature": temperature,
-    }
-    
-    if max_tokens:
-        generation_config["maxOutputTokens"] = max_tokens
-    
-    # Ajouter d'autres paramètres de génération depuis kwargs
-    if "top_p" in kwargs:
-        generation_config["topP"] = kwargs["top_p"]
-    if "top_k" in kwargs:
-        generation_config["topK"] = kwargs["top_k"]
-    if "stop_sequences" in kwargs:
-        generation_config["stopSequences"] = kwargs["stop_sequences"]
-    
-    if generation_config:
-        vertex_request["generationConfig"] = generation_config
-    
+
+    if safety_settings:
+        vertex_request["safetySettings"] = safety_settings
+
+    if labels:
+        vertex_request["labels"] = labels
+
     # Ajouter session_id si présent
     if session_id:
         vertex_request["session_id"] = session_id

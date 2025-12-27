@@ -5,6 +5,7 @@ Utilise l'endpoint cloudcode-pa.googleapis.com comme gemini-cli.
 
 import os
 import json
+import time
 import requests
 from typing import Optional, Dict, List, Any, Iterator, Generator
 from google.oauth2.credentials import Credentials
@@ -152,7 +153,18 @@ class CodeAssistClient:
     def _get_access_token(self) -> Optional[str]:
         """Récupère un access token valide (OAuth)."""
         try:
-            if self._creds is None or not self._creds.valid:
+            from ai_core.oauth_validator import should_refresh_token, save_oauth_credentials
+
+            # Refresh proactif: si aucun refresh depuis 30 minutes
+            force_refresh = should_refresh_token(self.token_path)
+            if force_refresh:
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "AUTH",
+                    "🔄 Token OAuth > 30min, refresh proactif..."
+                )
+
+            if self._creds is None or not self._creds.valid or force_refresh:
                 creds, error_msg = load_and_validate_oauth_credentials(self.token_path)
                 if creds is None:
                     UnifiedLogger.write(
@@ -163,12 +175,10 @@ class CodeAssistClient:
                     return None
                 self._creds = creds
             
-            # Rafraîchir si nécessaire
-            if not self._creds.valid:
-                if self._creds.expired and self._creds.refresh_token:
-                    self._creds.refresh(Request())
-                    from ai_core.oauth_validator import save_oauth_credentials
-                    save_oauth_credentials(self._creds, self.token_path)
+            # Rafraîchir si nécessaire OU si refresh proactif demandé
+            if (force_refresh or not self._creds.valid) and self._creds.refresh_token:
+                self._creds.refresh(Request())
+                save_oauth_credentials(self._creds, self.token_path)
             
             if self._creds.valid:
                 return self._creds.token
@@ -211,24 +221,10 @@ class CodeAssistClient:
         Returns:
             Réponse JSON de l'API
         """
-        access_token = self._get_access_token()
-        if not access_token:
-            raise ValueError("Impossible d'obtenir un access token OAuth valide")
-        
-        url = self._get_method_url(method)
-        
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-        
-        UnifiedLogger.write(
-            "AI_CORE",
-            "START",
-            f"CodeAssist API: {method} (OAuth)"
-        )
-        
-        # Log du payload complet pour diagnostic
+        MAX_RETRIES = 3
+        RETRY_DELAYS = [1, 2, 4]  # Backoff exponentiel
+
+        # Log du payload complet pour diagnostic (une seule fois)
         try:
             payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
             UnifiedLogger.write(
@@ -242,42 +238,96 @@ class CodeAssistClient:
                 "WARN",
                 f"Impossible de logger le payload: {e}"
             )
-        
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=300  # 5 minutes timeout
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            
+
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(MAX_RETRIES):
+            access_token = self._get_access_token()
+            if not access_token:
+                raise ValueError("Impossible d'obtenir un access token OAuth valide")
+
+            url = self._get_method_url(method)
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+
             UnifiedLogger.write(
                 "AI_CORE",
-                "SUCCESS",
-                f"CodeAssist API: {method} réussi"
+                "START",
+                f"CodeAssist API: {method} (OAuth) try {attempt + 1}/{MAX_RETRIES}"
             )
-            
-            return result
-        except requests.exceptions.RequestException as e:
-            UnifiedLogger.write(
-                "AI_CORE",
-                "ERROR",
-                f"❌ Erreur CodeAssist API {method}: {e}"
-            )
-            if hasattr(e, 'response') and e.response is not None:
+
+            try:
+                response = requests.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=300  # 5 minutes timeout
+                )
+                response.raise_for_status()
+
+                result = response.json()
+
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "SUCCESS",
+                    f"CodeAssist API: {method} réussi"
+                )
+
+                return result
+            except requests.exceptions.HTTPError as e:
+                last_exc = e
+                status_code = e.response.status_code if getattr(e, "response", None) is not None else 0
+
+                # Log détail erreur si possible
                 try:
-                    error_detail = e.response.json()
+                    if getattr(e, "response", None) is not None:
+                        error_detail = e.response.json()
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "DEBUG",
+                            f"Détails erreur: {json.dumps(error_detail, indent=2)}"
+                        )
+                except Exception:
+                    pass
+
+                # 401 -> token expiré / invalide : forcer refresh au prochain tour
+                if status_code == 401:
                     UnifiedLogger.write(
                         "AI_CORE",
-                        "DEBUG",
-                        f"Détails erreur: {json.dumps(error_detail, indent=2)}"
+                        "AUTH",
+                        f"Token expiré (401), retry {attempt + 1}/{MAX_RETRIES}"
                     )
-                except:
-                    pass
-            raise
+                    self._creds = None
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAYS[attempt])
+                        continue
+
+                # 500 -> erreurs serveur / session : retry simple
+                if status_code == 500:
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "ERROR",
+                        f"Erreur serveur (500), retry {attempt + 1}/{MAX_RETRIES}"
+                    )
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAYS[attempt])
+                        continue
+
+                raise
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "ERROR",
+                    f"❌ Erreur CodeAssist API {method}: {e}"
+                )
+                raise
+
+        if last_exc:
+            raise last_exc
+        raise Exception(f"Echec apres {MAX_RETRIES} tentatives")
     
     def _request_streaming_post(
         self,
@@ -297,27 +347,10 @@ class CodeAssistClient:
         Yields:
             Chunks de réponse JSON
         """
-        access_token = self._get_access_token()
-        if not access_token:
-            raise ValueError("Impossible d'obtenir un access token OAuth valide")
-        
-        url = self._get_method_url(method)
-        
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-        
-        # Ajouter le paramètre alt=sse pour le streaming
-        params = {"alt": "sse"}
-        
-        UnifiedLogger.write(
-            "AI_CORE",
-            "START",
-            f"CodeAssist API Streaming: {method} (OAuth)"
-        )
-        
-        # Log du payload complet pour diagnostic
+        MAX_RETRIES = 3
+        RETRY_DELAYS = [1, 2, 4]
+
+        # Log du payload complet pour diagnostic (une seule fois)
         try:
             payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
             UnifiedLogger.write(
@@ -331,72 +364,130 @@ class CodeAssistClient:
                 "WARN",
                 f"Impossible de logger le payload: {e}"
             )
-        
-        try:
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                params=params,
-                stream=True,
-                timeout=300
+
+        # Ajouter le paramètre alt=sse pour le streaming
+        params = {"alt": "sse"}
+
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(MAX_RETRIES):
+            access_token = self._get_access_token()
+            if not access_token:
+                raise ValueError("Impossible d'obtenir un access token OAuth valide")
+
+            url = self._get_method_url(method)
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+
+            UnifiedLogger.write(
+                "AI_CORE",
+                "START",
+                f"CodeAssist API Streaming: {method} (OAuth) try {attempt + 1}/{MAX_RETRIES}"
             )
-            response.raise_for_status()
-            
-            # Parser les chunks SSE
-            buffer = ""
-            for line in response.iter_lines():
-                if line:
-                    try:
-                        line_text = line.decode('utf-8')
-                        buffer += line_text + "\n"
-                        
-                        # Parser les chunks SSE de CodeAssist
-                        # Format: "data: {...}\n\n"
-                        while "\n\n" in buffer:
-                            chunk_text, buffer = buffer.split("\n\n", 1)
-                            
-                            if chunk_text.startswith("data: "):
-                                data_json = chunk_text[6:].strip()
-                                if data_json:
-                                    try:
-                                        data = json.loads(data_json)
-                                        yield data
-                                    except json.JSONDecodeError as e:
-                                        UnifiedLogger.write(
-                                            "AI_CORE",
-                                            "WARNING",
-                                            f"Erreur parsing JSON chunk: {e}"
-                                        )
-                    except Exception as e:
+
+            try:
+                response = requests.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    params=params,
+                    stream=True,
+                    timeout=300
+                )
+                response.raise_for_status()
+
+                # Parser les chunks SSE
+                buffer = ""
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            line_text = line.decode('utf-8')
+                            buffer += line_text + "\n"
+
+                            # Parser les chunks SSE de CodeAssist
+                            # Format: "data: {...}\n\n"
+                            while "\n\n" in buffer:
+                                chunk_text, buffer = buffer.split("\n\n", 1)
+
+                                if chunk_text.startswith("data: "):
+                                    data_json = chunk_text[6:].strip()
+                                    if data_json:
+                                        try:
+                                            data = json.loads(data_json)
+                                            yield data
+                                        except json.JSONDecodeError as e:
+                                            UnifiedLogger.write(
+                                                "AI_CORE",
+                                                "WARNING",
+                                                f"Erreur parsing JSON chunk: {e}"
+                                            )
+                        except Exception as e:
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "WARNING",
+                                f"Erreur traitement chunk streaming: {e}"
+                            )
+
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "SUCCESS",
+                    f"CodeAssist API Streaming: {method} terminé"
+                )
+                return
+
+            except requests.exceptions.HTTPError as e:
+                last_exc = e
+                status_code = e.response.status_code if getattr(e, "response", None) is not None else 0
+
+                # Log détail erreur si possible
+                try:
+                    if getattr(e, "response", None) is not None:
+                        error_detail = e.response.json()
                         UnifiedLogger.write(
                             "AI_CORE",
-                            "WARNING",
-                            f"Erreur traitement chunk streaming: {e}"
+                            "DEBUG",
+                            f"Détails erreur: {json.dumps(error_detail, indent=2)}"
                         )
-            
-            UnifiedLogger.write(
-                "AI_CORE",
-                "SUCCESS",
-                f"CodeAssist API Streaming: {method} terminé"
-            )
-        except requests.exceptions.RequestException as e:
-            UnifiedLogger.write(
-                "AI_CORE",
-                "ERROR",
-                f"❌ Erreur CodeAssist API Streaming {method}: {e}"
-            )
-            if hasattr(e, 'response') and e.response is not None:
-                try:
-                    error_detail = e.response.json()
+                except Exception:
+                    pass
+
+                if status_code == 401:
                     UnifiedLogger.write(
                         "AI_CORE",
-                        "DEBUG",
-                        f"Détails erreur: {json.dumps(error_detail, indent=2)}"
+                        "AUTH",
+                        f"Token expiré (401), retry {attempt + 1}/{MAX_RETRIES}"
                     )
-                except:
-                    pass
-            raise
+                    self._creds = None
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAYS[attempt])
+                        continue
+
+                if status_code == 500:
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "ERROR",
+                        f"Erreur serveur (500), retry {attempt + 1}/{MAX_RETRIES}"
+                    )
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAYS[attempt])
+                        continue
+
+                raise
+
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "ERROR",
+                    f"❌ Erreur CodeAssist API Streaming {method}: {e}"
+                )
+                raise
+
+        if last_exc:
+            raise last_exc
+        raise Exception(f"Echec apres {MAX_RETRIES} tentatives")
     
     def generate_content(
         self,
@@ -427,7 +518,39 @@ class CodeAssistClient:
         """
         import uuid
         user_prompt_id = str(uuid.uuid4())
-        
+
+        # Mapper les paramètres camelCase vers snake_case pour compatibilité
+        # Aligné sur les paramètres Vertex AI/Code Assist
+        mapped_kwargs = kwargs.copy()
+
+        # Paramètres de sécurité et configuration
+        if "safetySettings" in kwargs:
+            mapped_kwargs["safety_settings"] = kwargs["safetySettings"]
+        if "cachedContent" in kwargs:
+            mapped_kwargs["cached_content"] = kwargs["cachedContent"]
+
+        # Paramètres de génération (cas où ils seraient passés en camelCase)
+        if "responseMimeType" in kwargs:
+            mapped_kwargs["response_mime_type"] = kwargs["responseMimeType"]
+        if "responseSchema" in kwargs:
+            mapped_kwargs["response_schema"] = kwargs["responseSchema"]
+        if "responseJsonSchema" in kwargs:
+            mapped_kwargs["response_json_schema"] = kwargs["responseJsonSchema"]
+        if "thinkingConfig" in kwargs:
+            mapped_kwargs["thinking_config"] = kwargs["thinkingConfig"]
+        if "routingConfig" in kwargs:
+            mapped_kwargs["routing_config"] = kwargs["routingConfig"]
+        if "modelSelectionConfig" in kwargs:
+            mapped_kwargs["model_selection_config"] = kwargs["modelSelectionConfig"]
+        if "responseModalities" in kwargs:
+            mapped_kwargs["response_modalities"] = kwargs["responseModalities"]
+        if "mediaResolution" in kwargs:
+            mapped_kwargs["media_resolution"] = kwargs["mediaResolution"]
+        if "speechConfig" in kwargs:
+            mapped_kwargs["speech_config"] = kwargs["speechConfig"]
+        if "audioTimestamp" in kwargs:
+            mapped_kwargs["audio_timestamp"] = kwargs["audioTimestamp"]
+
         # OPTIMISATION: Récupérer automatiquement les outils depuis le serveur MCP HTTP si non fournis
         if tools is None:
             tools = get_tools_from_mcp_server()
@@ -467,7 +590,7 @@ class CodeAssistClient:
             max_tokens=max_tokens,
             tools=tools,
             system_instruction=system_instruction,
-            **kwargs
+            **mapped_kwargs
         )
         
         # Vérification post-conversion
