@@ -43,29 +43,41 @@ def to_generate_content_request(
     if user_prompt_id is None:
         user_prompt_id = str(uuid.uuid4())
     
-    # Extraire les instructions système des messages
-    system_parts = []
+    # MODE GEMINI-CLI: Tout mettre dans systemInstruction, contents reste vide
+    # Cela correspond à la structure exacte observée dans les logs de gemini-cli
+    # qui fonctionne avec CodeAssist
     
+    # Construction du systemInstruction complet (comme gemini-cli)
+    system_parts = []
+
     # 1. Ajouter l'instruction système explicite si présente
     if system_instruction:
         system_parts.append(system_instruction)
-    
-    # 2. Extraire les messages avec role='system' de la liste des messages
+
+    # 2. Concaténer TOUS les messages (system + user + assistant) dans systemInstruction
+    # C'est la structure utilisée par gemini-cli qui fonctionne avec CodeAssist
     for msg in messages:
-        if msg.get("role") == "system":
-            content = msg.get("content", "")
-            if content:
+        content = msg.get("content", "")
+        if content:
+            role = msg.get("role", "user")
+            # Formater avec le rôle pour contexte
+            if role == "user":
+                system_parts.append(f"User: {content}")
+            elif role == "assistant" or role == "model":
+                system_parts.append(f"Assistant: {content}")
+            elif role == "system":
+                # Les messages system sont ajoutés directement sans préfixe
                 system_parts.append(str(content))
-    
-    # Convertir les messages au format CodeAssist (en excluant les system qui sont gérés ci-dessus)
-    contents = _to_contents(messages)
+
+    # 3. Laisser contents vide (comme gemini-cli)
+    contents = []
     
     # Construire la requête Vertex (format interne CodeAssist - aligné sur gemini-cli)
     vertex_request: Dict[str, Any] = {
         "contents": contents,
     }
     
-    # Ajouter l'instruction système si présente (concaténée)
+    # Ajouter l'instruction système si présente (tout le contexte concaténé)
     if system_parts:
         full_system_instruction = "\n\n".join(system_parts)
         vertex_request["systemInstruction"] = {

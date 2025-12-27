@@ -17,6 +17,7 @@ from ai_core.code_assist_converter import (
     to_generate_content_request,
     from_generate_content_response
 )
+from ai_core.sessions import _save_codeassist_payload_log
 
 
 def get_tools_from_mcp_server() -> Optional[List[Dict[str, Any]]]:
@@ -258,6 +259,22 @@ class CodeAssistClient:
                 f"CodeAssist API: {method} (OAuth) try {attempt + 1}/{MAX_RETRIES}"
             )
 
+            # Log du payload final juste avant l'envoi HTTP (comme gemini-cli)
+            try:
+                _save_codeassist_payload_log(
+                    payload.get("model", "unknown"),
+                    payload,
+                    {
+                        "method": method,
+                        "attempt": attempt + 1,
+                        "max_retries": MAX_RETRIES,
+                        "is_streaming": False,
+                        "endpoint": url
+                    }
+                )
+            except Exception as log_err:
+                UnifiedLogger.write("AI_CORE", "WARN", f"Echec logging payload final: {log_err}")
+
             try:
                 response = requests.post(
                     url,
@@ -386,6 +403,22 @@ class CodeAssistClient:
                 "START",
                 f"CodeAssist API Streaming: {method} (OAuth) try {attempt + 1}/{MAX_RETRIES}"
             )
+
+            # Log du payload final juste avant l'envoi HTTP (comme gemini-cli)
+            try:
+                _save_codeassist_payload_log(
+                    payload.get("model", "unknown"),
+                    payload,
+                    {
+                        "method": method,
+                        "attempt": attempt + 1,
+                        "max_retries": MAX_RETRIES,
+                        "is_streaming": True,
+                        "endpoint": url
+                    }
+                )
+            except Exception as log_err:
+                UnifiedLogger.write("AI_CORE", "WARN", f"Echec logging payload final: {log_err}")
 
             try:
                 response = requests.post(
@@ -551,7 +584,38 @@ class CodeAssistClient:
         if "audioTimestamp" in kwargs:
             mapped_kwargs["audio_timestamp"] = kwargs["audioTimestamp"]
 
-        # OPTIMISATION: Récupérer automatiquement les outils depuis le serveur MCP HTTP si non fournis
+        # RÉSOLUTION DES OUTILS MCP
+        # Si tools contient des entrées de type "mcp" (référence MCP), les remplacer par les vraies définitions
+        if tools is not None and len(tools) > 0:
+            has_mcp_reference = any(
+                isinstance(t, dict) and t.get("type") == "mcp" 
+                for t in tools
+            )
+            if has_mcp_reference:
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "MCP",
+                    "🔧 Détection d'outils MCP (références). Résolution vers définitions réelles..."
+                )
+                # Remplacer par les vraies définitions d'outils depuis le serveur MCP
+                resolved_tools = get_tools_from_mcp_server()
+                if resolved_tools and len(resolved_tools) > 0:
+                    tools = resolved_tools
+                    tool_count = len(tools[0].get('functionDeclarations', [])) if isinstance(tools[0], dict) else 0
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "MCP",
+                        f"✅ {tool_count} outils MCP résolus vers définitions réelles"
+                    )
+                else:
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "WARNING",
+                        "⚠️ Échec résolution outils MCP, utilisation sans outils"
+                    )
+                    tools = None
+        
+        # FALLBACK: Récupérer automatiquement les outils depuis le serveur MCP HTTP si non fournis
         if tools is None:
             tools = get_tools_from_mcp_server()
             if tools and len(tools) > 0:
