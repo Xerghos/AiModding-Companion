@@ -163,61 +163,32 @@ class Worker(threading.Thread):
         """
         Récupère le contexte hybride avec Repo Map.
         Retourne un dict avec les composants séparés pour injection en blocs distincts.
-        OPTIMISATION: Parallélisation de Repo Map et RAG Docs pour réduire le temps total.
         """
         if not database or not self.rag_enabled or len(query) < 3: 
             return {"repo_map": None, "docs": None, "ltm": None}
         
         rag_components = {"repo_map": None, "docs": None, "ltm": None}
         
-        # OPTIMISATION: Paralléliser Repo Map et RAG Docs pour réduire le temps total
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        def get_repo_map():
-            """Fonction pour récupérer la Repo Map."""
-            try:
-                from features.context.repo_map import get_repo_map_generator
-                from features.CacheManager import GlobalCacheManager
-                db_path = get_path(APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid"))
-                repo_map_gen = get_repo_map_generator(db_path)
-                # Pas de limite : Repo Map complète (non tronquée)
-                repo_map = repo_map_gen.get_repo_map_for_context(max_chars=None)
-                if repo_map:
-                    # OPTIMISATION: Mettre en cache la repo_map pour éviter la double génération dans CacheManager
-                    if GlobalCacheManager:
-                        GlobalCacheManager.set_repo_map_cache(repo_map)
-                    return repo_map
-            except Exception as e:
-                log.debug(f"Repo Map non disponible: {e}")
-            return None
-        
-        def get_rag_docs():
-            """Fonction pour récupérer les documents RAG."""
-            try:
-                db_path = get_path(APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid"))
-                # Utiliser la recherche hybride (FAISS + FTS5 avec RRF, k=60 comme Cursor)
-                # Récupérer plus de candidats initialement pour meilleur filtrage (style Cursor: 50-100 candidats)
-                # On prend 15 candidats puis on filtre par seuil RRF pour obtenir les 3-5 meilleurs
-                results, _ = database.search_hybrid(query, db_path, max_results=15, use_hybrid=True)
-                return results
-            except Exception as e:
-                log.debug(f"RAG Docs non disponible: {e}")
-            return None
-        
-        # Lancer les deux opérations en parallèle
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_repo_map = executor.submit(get_repo_map)
-            future_rag_docs = executor.submit(get_rag_docs)
-            
-            # Attendre les résultats
-            repo_map = future_repo_map.result()
+        # A. Repo Map (contexte structurel global)
+        try:
+            from features.context.repo_map import get_repo_map_generator
+            db_path = get_path(APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid"))
+            repo_map_gen = get_repo_map_generator(db_path)
+            # Pas de limite : Repo Map complète (non tronquée)
+            repo_map = repo_map_gen.get_repo_map_for_context(max_chars=None)
             if repo_map:
                 rag_components["repo_map"] = repo_map
-            
-            results = future_rag_docs.result()
+        except Exception as e:
+            log.debug(f"Repo Map non disponible: {e}")
         
         # B. Documents (RAG Hybride) - Style Cursor
         try:
+            db_path = get_path(APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid"))
+            # Utiliser la recherche hybride (FAISS + FTS5 avec RRF, k=60 comme Cursor)
+            # Récupérer plus de candidats initialement pour meilleur filtrage (style Cursor: 50-100 candidats)
+            # On prend 15 candidats puis on filtre par seuil RRF pour obtenir les 3-5 meilleurs
+            results, _ = database.search_hybrid(query, db_path, max_results=15, use_hybrid=True)
+            
             doc_ctx_lines = []
             if results:
                 log.debug(f"RAG: {len(results)} résultats initiaux de la recherche hybride")

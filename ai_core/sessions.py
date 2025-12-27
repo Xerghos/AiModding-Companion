@@ -9,7 +9,6 @@ import re
 from enum import Enum
 import datetime
 from threading import Lock, Thread
-import threading
 from queue import Queue, Empty
 import subprocess
 import shutil
@@ -25,6 +24,7 @@ from features.Decorators import trace_action
 from features.UnifiedLogger import UnifiedLogger
 
 from ai_core.prompt_builders import build_cli_system_md, build_cli_prompt
+from ai_core.gemini_cli_process_pool import GLOBAL_CLI_POOL
 
 # Note : TokenManager est importé localement pour éviter les cycles.
 
@@ -179,39 +179,39 @@ def _save_response_log(session_type: str, model_name: str, response_data: dict, 
 
 def _save_codeassist_payload_log(model_name: str, payload_data: dict, extra_meta: dict = None):
     """
-    Sauvegarde un payload CodeAssist dans logs/ avec timestamp.
-    OPTIMISATION: Écriture asynchrone pour ne pas bloquer le thread principal.
-    """
-    def save_async():
-        """Thread pour l'écriture asynchrone du fichier."""
-        try:
-            logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
-            os.makedirs(logs_dir, exist_ok=True)
-            
-            timestamp = datetime.datetime.now().strftime("%d-%b_%Hh%M_%S")
-            safe_model = model_name.replace("/", "_").replace(":", "_")
-            filename = f"codeassist_final_{safe_model}_{timestamp}.json"
-            filepath = os.path.join(logs_dir, filename)
-            
-            log_content = {
-                "timestamp": datetime.datetime.now().isoformat(),
-                "session_type": "codeassist_final",
-                "model": model_name,
-                "payload": payload_data
-            }
-            if extra_meta:
-                log_content["meta"] = extra_meta
-            
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(log_content, f, indent=2, ensure_ascii=False)
-            
-            UnifiedLogger.write("AI_CORE", "CODEASSIST_PAYLOAD_LOG", f"📤 Payload CodeAssist final sauvegardé: {filename}")
-        except Exception as e:
-            UnifiedLogger.write("AI_CORE", "WARN", f"Echec sauvegarde payload CodeAssist: {e}")
+    Sauvegarde le payload FINAL CodeAssist dans logs/ avec timestamp.
+    Ce payload représente exactement ce que gemini-cli envoie à CodeAssist.
     
-    # Lancer l'écriture en arrière-plan dans un thread daemon
-    thread = Thread(target=save_async, daemon=True)
-    thread.start()
+    Args:
+        model_name: nom du modèle utilisé
+        payload_data: le payload CodeAssist complet (CAGenerateContentRequest)
+        extra_meta: métadonnées additionnelles
+    """
+    try:
+        logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        
+        timestamp = datetime.datetime.now().strftime("%d-%b_%Hh%M_%S")
+        safe_model = model_name.replace("/", "_").replace(":", "_")
+        filename = f"codeassist_final_{safe_model}_{timestamp}.json"
+        filepath = os.path.join(logs_dir, filename)
+        
+        log_content = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "session_type": "codeassist_final",
+            "model": model_name,
+            "payload": payload_data
+        }
+        if extra_meta:
+            log_content["meta"] = extra_meta
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(log_content, f, indent=2, ensure_ascii=False)
+        
+        UnifiedLogger.write("AI_CORE", "CODEASSIST_PAYLOAD_LOG", f"📤 Payload CodeAssist final sauvegardé: {filename}")
+        
+    except Exception as e:
+        UnifiedLogger.write("AI_CORE", "WARN", f"Echec sauvegarde payload CodeAssist: {e}")
 
 
 # --- HELPER DE CONVERSION D'OUTILS ---
@@ -1452,134 +1452,6 @@ class GeminiSession:
         except Exception as e:
             UnifiedLogger.write("AI_CORE", "WARNING", f"Pas de métriques: {e}")
 
-# --- CLASSE POOL DE PROCESSUS CLI (OPTIMISATION PERFORMANCES) ---
-class CliProcessPool:
-    """
-    Pool de processus CLI préchauffés pour réduire le temps de découverte MCP.
-    Maintient un processus "prêt" en arrière-plan pour la prochaine requête.
-    """
-    def __init__(self, cli_path, model_name, cli_workdir, cli_env, mcp_http_available):
-        self.cli_path = cli_path
-        self.model_name = model_name
-        self.cli_workdir = cli_workdir
-        self.cli_env = cli_env
-        self.mcp_http_available = mcp_http_available
-        
-        # Processus prêt à être utilisé (None si aucun disponible)
-        self._ready_process = None
-        self._ready_process_lock = threading.Lock()
-        self._prewarm_thread = None
-        
-        # Démarrer le préchauffage en arrière-plan
-        self._start_prewarm()
-    
-    def _start_prewarm(self):
-        """Démarre un thread de préchauffage pour maintenir un processus prêt."""
-        def prewarm_worker():
-            """Worker qui maintient un processus prêt."""
-            while True:
-                try:
-                    # Attendre un peu avant de créer le processus
-                    time.sleep(1.0)
-                    
-                    with self._ready_process_lock:
-                        # Si on a déjà un processus prêt, ne pas en créer un autre
-                        if self._ready_process is not None:
-                            # Vérifier si le processus est toujours valide
-                            if self._ready_process.poll() is None:
-                                # Processus toujours actif, continuer
-                                continue
-                            else:
-                                # Processus terminé, nettoyer
-                                self._ready_process = None
-                        
-                        # Créer un nouveau processus de test pour préchauffer
-                        # Ce processus sera utilisé pour la prochaine requête
-                        test_cmd = [
-                            self.cli_path,
-                            "--model",
-                            self.model_name,
-                            "--output-format",
-                            "text",
-                            "--prompt",
-                            "test"
-                        ]
-                        
-                        process = subprocess.Popen(
-                            test_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            stdin=subprocess.PIPE,
-                            text=True,
-                            encoding='utf-8',
-                            errors='replace',
-                            bufsize=65536,
-                            cwd=self.cli_workdir or os.getcwd(),
-                            env=self.cli_env
-                        )
-                        
-                        # Vérifier que le processus démarre correctement
-                        time.sleep(0.1)
-                        if process.poll() is None:
-                            # Processus actif, le marquer comme prêt
-                            # Note: Ce processus sera utilisé pour tester la disponibilité MCP
-                            # mais ne sera pas réutilisé directement car subprocess ne le permet pas
-                            self._ready_process = process
-                            UnifiedLogger.write(
-                                "AI_CORE",
-                                "DEBUG",
-                                f"CLI Pool: Processus préchauffé créé (PID: {process.pid})"
-                            )
-                            
-                except Exception as e:
-                    UnifiedLogger.write(
-                        "AI_CORE",
-                        "DEBUG",
-                        f"CLI Pool: Erreur préchauffage (non bloquant): {e}"
-                    )
-                    time.sleep(5.0)  # Attendre plus longtemps en cas d'erreur
-        
-        self._prewarm_thread = Thread(target=prewarm_worker, daemon=True)
-        self._prewarm_thread.start()
-    
-    def get_process(self, cmd):
-        """
-        Obtient un processus pour la commande donnée.
-        Pour l'instant, crée toujours un nouveau processus car subprocess ne peut être réutilisé.
-        Mais le processus préchauffé garantit que Node.js/MCP sont en cache.
-        """
-        # Toujours créer un nouveau processus car subprocess ne peut être réutilisé
-        # Le processus préchauffé sert juste à avoir Node.js/MCP en cache système
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            bufsize=65536,
-            cwd=self.cli_workdir or os.getcwd(),
-            env=self.cli_env
-        )
-        
-        # Nettoyer le processus prêt s'il existe (il a servi son but)
-        with self._ready_process_lock:
-            if self._ready_process is not None:
-                try:
-                    if self._ready_process.poll() is None:
-                        self._ready_process.terminate()
-                        try:
-                            self._ready_process.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            self._ready_process.kill()
-                            self._ready_process.wait()
-                except Exception:
-                    pass
-                self._ready_process = None
-        
-        return process
-
 # --- CLASSE GEMINI CLI SESSION (PONT CLI) ---
 class GeminiCliSession(BaseSession):
     """
@@ -1613,19 +1485,31 @@ class GeminiCliSession(BaseSession):
         self._static_prompt_buffer = None
         self._static_buffer_cache_hash = None  # Hash pour détecter les changements du cache
         
-        # Pool de processus pré-chauffés (pour réutilisation)
-        # Initialisé après _init_cli_isolation pour avoir accès à cli_workdir et cli_env
-        self._process_pool = None
-
         UnifiedLogger.write(
             "AI_CORE",
             "CLI_BRIDGE",
             f"🌉 Pont CLI activé pour {model_name} (path: {self.cli_path})"
         )
-        
-        # OPTIMISATION: Pré-chauffer un processus en arrière-plan
-        # Cela élimine le délai de démarrage Node.js + initialisation MCP pour la première requête
-        self._prewarm_process()
+
+        # OPTIMISATION: Pré-chauffer un processus en arrière-plan via le Pool
+        try:
+            from features.CacheManager import GlobalCacheManager
+            if GlobalCacheManager:
+                # Charger le contexte statique pour le pré-chauffage exact
+                comps = GlobalCacheManager.get_components()
+                cfg = self._get_cli_bridge_cfg()
+                self._update_static_buffer(comps, cfg["prompt_limits"], cfg["max_history_turns"])
+                
+                # Commande fixe (sans le message)
+                cmd = [self.cli_path, "--model", self.model_name, "--output-format", "text"]
+                cwd = self._cli_workdir or os.getcwd()
+                env = self._cli_env
+                
+                # Lancer le pré-chauffage
+                GLOBAL_CLI_POOL.prepare_next(cmd, cwd, env, self._static_prompt_buffer or "")
+                UnifiedLogger.write("AI_CORE", "DEBUG", f"CLI Init: Pré-chauffage lancé (Static: {len(self._static_prompt_buffer or '')} chars)")
+        except Exception as e:
+            UnifiedLogger.write("AI_CORE", "WARNING", f"CLI Init: Echec pré-chauffage pool: {e}")
 
     def _get_cli_bridge_cfg(self):
         """
@@ -1856,23 +1740,6 @@ class GeminiCliSession(BaseSession):
 
         # Nettoyage à la fin du process (best-effort)
         atexit.register(lambda: shutil.rmtree(workdir, ignore_errors=True))
-        
-        # OPTIMISATION: Initialiser le pool de processus après avoir configuré l'isolation
-        # Cela permet de maintenir des processus préchauffés pour réduire le temps de découverte MCP
-        try:
-            self._process_pool = CliProcessPool(
-                self.cli_path,
-                self.model_name,
-                self._cli_workdir,
-                self._cli_env,
-                self._mcp_http_available
-            )
-        except Exception as e:
-            UnifiedLogger.write(
-                "AI_CORE",
-                "WARNING",
-                f"CLI Pool: Échec initialisation (non bloquant): {e}"
-            )
     
     def _find_gemini_cli(self):
         """
@@ -1904,87 +1771,6 @@ class GeminiCliSession(BaseSession):
                     return npm_path
         
         return None
-    
-    def _prewarm_process(self):
-        """
-        Pré-chauffe un processus gemini-cli en arrière-plan pour éliminer le délai de démarrage.
-        Démarre Node.js, charge les modules, et initialise le runtime MCP.
-        Le processus se termine après un test simple, mais Node.js et les modules restent en cache.
-        """
-        def prewarm_thread():
-            """Thread en arrière-plan pour pré-chauffer le processus."""
-            try:
-                # Attendre un peu pour ne pas bloquer l'initialisation
-                time.sleep(0.5)
-                
-                # Créer une commande de test simple (juste pour démarrer Node.js et charger les modules)
-                test_cmd = [
-                    self.cli_path,
-                    "--model",
-                    self.model_name,
-                    "--output-format",
-                    "text",
-                    "--prompt",
-                    "test",  # Message minimal pour déclencher le démarrage
-                ]
-                
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "DEBUG",
-                    "CLI Pré-chauffage: démarrage processus test en arrière-plan..."
-                )
-                
-                prewarm_start = time.time()
-                
-                # Démarrer le processus (il se terminera rapidement après avoir chargé les modules)
-                process = subprocess.Popen(
-                    test_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    stdin=subprocess.PIPE,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    bufsize=65536,
-                    cwd=self._cli_workdir or os.getcwd(),
-                    env=self._cli_env
-                )
-                
-                # Écrire un message minimal et fermer stdin
-                try:
-                    process.stdin.write("test\n")
-                    process.stdin.close()
-                except Exception:
-                    pass
-                
-                # Lire rapidement la sortie (ou timeout)
-                try:
-                    # Attendre max 5 secondes pour le pré-chauffage
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    # Si le processus prend trop de temps, le tuer
-                    process.kill()
-                    process.wait()
-                
-                prewarm_duration = (time.time() - prewarm_start) * 1000
-                
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "DEBUG",
-                    f"CLI Pré-chauffage terminé en {prewarm_duration:.0f}ms (Node.js et modules chargés en cache)"
-                )
-                
-            except Exception as e:
-                # Ne pas bloquer si le pré-chauffage échoue
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "WARNING",
-                    f"CLI Pré-chauffage échoué (non bloquant): {e}"
-                )
-        
-        # Lancer le thread de pré-chauffage en arrière-plan
-        prewarm_thread_obj = Thread(target=prewarm_thread, daemon=True)
-        prewarm_thread_obj.start()
 
     def _create_msg(self, role, text):
         """Crée un message au format standard."""
@@ -2145,10 +1931,10 @@ class GeminiCliSession(BaseSession):
                 f"CLI Buffer statique réutilisé (hash: {current_cache_hash[:8]}...)"
             )
         
-        # 2. Construire uniquement la partie dynamique
+        # 2. Construire uniquement la partie dynamique (avec le message utilisateur)
         dynamic_start = time.time()
         dynamic_part = self._get_dynamic_prompt(
-            message="",  # message via --prompt
+            message=msg_arg,  # Message INCLUS dans le prompt dynamique (plus de --prompt)
             rag_context=rag_context,
             history=self.history,
             cache_components=comps,
@@ -2157,31 +1943,24 @@ class GeminiCliSession(BaseSession):
         )
         dynamic_time = (time.time() - dynamic_start) * 1000
         
-        # 3. Concaténer rapidement statique + dynamique
+        # 3. Préparer le contenu pour les logs (stdin_prompt pour CodeAssist reconstruction)
+        # Note: Pour l'exécution réelle, 'static' est déjà dans le processus, on enverra 'dynamic_part' via .use()
         concat_start = time.time()
-        if self._static_prompt_buffer and dynamic_part:
-            stdin_prompt = f"{self._static_prompt_buffer}\n\n{dynamic_part}"
-        elif self._static_prompt_buffer:
-            stdin_prompt = self._static_prompt_buffer
-        elif dynamic_part:
-            stdin_prompt = dynamic_part
-        else:
-            stdin_prompt = ""
+        stdin_prompt_for_log = f"{self._static_prompt_buffer or ''}\n\n{dynamic_part}"
         concat_time = (time.time() - concat_start) * 1000
         
         UnifiedLogger.write(
             "AI_CORE",
             "DEBUG",
-            f"CLI Prompt construit: dynamique en {dynamic_time:.2f}ms, concaténation en {concat_time:.2f}ms, total: {len(stdin_prompt)} chars"
+            f"CLI Prompt Dynamic: {len(dynamic_part)} chars (Static: {len(self._static_prompt_buffer or '')} chars)"
         )
         
-        # Créer une meta simplifiée pour compatibilité (on n'a pas la meta complète car on a construit séparément)
-        # On va recalculer les tailles pour la meta
+        # Créer une meta simplifiée
         from ai_core.prompt_builders import PromptBuildMeta
         stdin_meta = PromptBuildMeta(
-            total_chars=len(stdin_prompt),
-            truncated={},  # On ne track pas la troncature dans ce mode optimisé
-            sizes={}  # On ne track pas les tailles individuelles dans ce mode optimisé
+            total_chars=len(stdin_prompt_for_log),
+            truncated={}, 
+            sizes={}
         )
 
         # Attache meta pour logs
@@ -2367,7 +2146,7 @@ class GeminiCliSession(BaseSession):
             "messages": messages_log,
             "stream": stream,
             "cli_specific": {
-                "stdin_prompt_length": len(stdin_prompt) if stdin_prompt else 0,
+                "stdin_prompt_length": len(stdin_prompt_for_log),
                 "message_arg_length": len(msg_arg) if msg_arg else 0,
                 "meta": {
                     "total_chars": stdin_meta.total_chars,
@@ -2382,9 +2161,10 @@ class GeminiCliSession(BaseSession):
 
         # Reconstruire et logger le payload FINAL CodeAssist
         try:
+            # msg_arg est maintenant inclus dans stdin_prompt_for_log
             final_ca_payload = self._build_codeassist_final_payload(
-                stdin_prompt=stdin_prompt,
-                msg_arg=msg_arg,
+                stdin_prompt=stdin_prompt_for_log,
+                msg_arg="", 
                 model_name=self.model_name
             )
             
@@ -2463,26 +2243,20 @@ class GeminiCliSession(BaseSession):
             "--model",
             self.model_name,
             "--output-format",
-            "text",
-            "--prompt",
-            msg_arg,
+            "text"
+            # "--prompt" REMOVED: Tout passe par stdin via le Pool
         ]
         
         # Logger la commande exécutée (sans le prompt complet pour éviter le spam)
         UnifiedLogger.write(
             "AI_CORE",
             "DEBUG",
-            f"CLI Commande: {self.cli_path} --model {self.model_name} --output-format text --prompt [{(len(msg_arg))} chars]"
+            f"CLI Commande: {self.cli_path} --model {self.model_name} --output-format text (Prompt via Stdin Pool)"
         )
         UnifiedLogger.write(
             "AI_CORE",
             "DEBUG",
             f"CLI CWD: {self._cli_workdir or os.getcwd()}"
-        )
-        UnifiedLogger.write(
-            "AI_CORE",
-            "DEBUG",
-            f"CLI Transport MCP: {'HTTP/SSE' if self._mcp_http_available else 'stdio'}"
         )
         
         # Diagnostic léger : tailles/troncature (sans contenu sensible)
@@ -2511,210 +2285,53 @@ class GeminiCliSession(BaseSession):
         UnifiedLogger.write(
             "AI_CORE",
             "START",
-            f"Gemini CLI ({self.model_name}) generating...",
-            {"prompt_preview": (stdin_prompt[:80] + " ..." if len(stdin_prompt) > 80 else stdin_prompt)},
+            f"Gemini CLI ({self.model_name}) generating... (Pool Mode)",
+            {"prompt_preview": (stdin_prompt_for_log[:80] + " ..." if len(stdin_prompt_for_log) > 80 else stdin_prompt_for_log)},
         )
         
         try:
             start_t = time.time()
             
+            # Paramètres pour le pool (pour match exact)
+            pool_cmd = cmd
+            pool_cwd = self._cli_workdir or os.getcwd()
+            pool_env = self._cli_env
+            # Le pool utilise le static_prompt pour identifier le process pré-chauffé
+            # On doit utiliser exactement ce qui a été utilisé pour prepare_next
+            pool_static = self._static_prompt_buffer or ""
+            
             if stream:
                 # Mode streaming : on lit stdout ligne par ligne
                 def cli_generator():
                     try:
-                        # Mesure du temps de démarrage du processus
+                        # 1. Récupération du processus pré-chauffé (Hot Start 🔥)
                         process_start = time.time()
+                        hot_process = GLOBAL_CLI_POOL.get_process(pool_cmd, pool_cwd, pool_env, pool_static)
                         
-                        # OPTIMISATION: Utiliser le pool de processus si disponible
-                        if hasattr(self, '_process_pool') and self._process_pool:
-                            process = self._process_pool.get_process(cmd)
-                        else:
-                            # Fallback: créer un nouveau processus
-                            process = subprocess.Popen(
-                                cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                stdin=subprocess.PIPE,
-                                text=True,
-                                encoding='utf-8',
-                                errors='replace',
-                                bufsize=65536,  # Buffer de 64KB pour réduire les appels système
-                                cwd=self._cli_workdir or os.getcwd(),
-                                env=self._cli_env
-                            )
+                        # 2. Utilisation (écriture du prompt dynamique + fermeture stdin)
+                        # Note: dynamic_part contient le message utilisateur
+                        process = hot_process.use(dynamic_part)
+                        
+                        # 3. Lancement immédiat du pré-chauffage pour le PROCHAIN tour (en arrière-plan)
+                        GLOBAL_CLI_POOL.prepare_next(pool_cmd, pool_cwd, pool_env, pool_static)
+                        
                         process_created = time.time()
-                        
-                        # Vérifier immédiatement si le processus est toujours actif
-                        if process.poll() is not None:
-                            # Le processus s'est terminé immédiatement - lire stderr pour comprendre pourquoi
-                            try:
-                                stderr_output = process.stderr.read()
-                                if stderr_output:
-                                    UnifiedLogger.write(
-                                        "AI_CORE",
-                                        "ERROR",
-                                        f"CLI Process terminé immédiatement (code: {process.poll()}): {stderr_output[:1000]}"
-                                    )
-                            except Exception:
-                                pass
-                            raise Exception(f"Processus gemini-cli terminé immédiatement après création (code: {process.poll()})")
-                        
                         UnifiedLogger.write(
                             "AI_CORE",
                             "DEBUG",
-                            f"CLI Process créé en {(process_created - process_start)*1000:.0f}ms (PID: {process.pid})"
+                            f"CLI Process Pool utilisé en {(process_created - process_start)*1000:.0f}ms (PID: {process.pid})"
                         )
 
-                        # OPTIMISATION: Écriture stdin asynchrone dans un thread séparé
-                        # Cela évite le blocage pendant que le processus démarre et découvre les outils MCP
-                        stdin_start = time.time()
-                        stdin_write_error = [None]  # Liste pour capturer l'erreur depuis le thread
-                        stdin_write_complete = [False]  # Flag pour indiquer la fin de l'écriture
-                        
-                        def write_stdin_async(process, full_prompt):
-                            """Écrit stdin dans un thread séparé pour éviter le blocage."""
-                            try:
-                                # Attendre un peu pour que le processus soit prêt (évite les erreurs de timing)
-                                # Avec SSE, gemini-cli peut prendre un peu plus de temps pour initialiser la connexion MCP
-                                import time
-                                wait_time = 0.2 if self._mcp_http_available else 0.1  # Plus de temps si SSE
-                                time.sleep(wait_time)
-                                
-                                # Vérifier que le processus est toujours actif avant d'écrire
-                                if process.poll() is not None:
-                                    # Le processus s'est terminé avant qu'on puisse écrire
-                                    exit_code = process.poll()
-                                    # Lire stderr pour comprendre pourquoi
-                                    stderr_msg = ""
-                                    try:
-                                        if process.stderr:
-                                            # Essayer de lire stderr de manière non-bloquante
-                                            import select
-                                            import sys
-                                            if sys.platform != 'win32':
-                                                # Sur Unix, on peut utiliser select
-                                                if select.select([process.stderr], [], [], 0)[0]:
-                                                    stderr_msg = process.stderr.read()
-                                            else:
-                                                # Sur Windows, essayer de lire directement
-                                                try:
-                                                    stderr_msg = process.stderr.read(1000)
-                                                except Exception:
-                                                    pass
-                                    except Exception:
-                                        pass
-                                    
-                                    error_msg = f"Processus terminé avant écriture stdin (code: {exit_code})"
-                                    if stderr_msg:
-                                        error_msg += f" - stderr: {stderr_msg[:500]}"
-                                    
-                                    UnifiedLogger.write(
-                                        "AI_CORE",
-                                        "ERROR",
-                                        f"CLI Erreur stdin: {error_msg}"
-                                    )
-                                    raise Exception(error_msg)
-                                
-                                # Vérifier que stdin est toujours ouvert
-                                if process.stdin is None:
-                                    raise Exception("stdin est None - le processus n'a pas de stdin")
-                                if process.stdin.closed:
-                                    raise Exception("stdin est déjà fermé - le processus a peut-être terminé")
-                                
-                                # Écrire le prompt
-                                UnifiedLogger.write(
-                                    "AI_CORE",
-                                    "DEBUG",
-                                    f"CLI Écriture stdin: {len(full_prompt)} caractères (transport: {'SSE' if self._mcp_http_available else 'stdio'})"
-                                )
-                                
-                                process.stdin.write(full_prompt)
-                                if not full_prompt.endswith("\n"):
-                                    process.stdin.write("\n")
-                                process.stdin.flush()  # Forcer l'écriture
-                                process.stdin.close()
-                                stdin_write_complete[0] = True
-                                
-                                UnifiedLogger.write(
-                                    "AI_CORE",
-                                    "DEBUG",
-                                    "CLI stdin écrit avec succès"
-                                )
-                                
-                            except Exception as e:
-                                stdin_write_error[0] = e
-                                
-                                # Log détaillé de l'erreur
-                                UnifiedLogger.write(
-                                    "AI_CORE",
-                                    "ERROR",
-                                    f"CLI Erreur écriture stdin: {str(e)} (transport: {'SSE' if self._mcp_http_available else 'stdio'})"
-                                )
-                                
-                                # Log l'erreur stderr si disponible pour diagnostic
-                                try:
-                                    if process.stderr:
-                                        # Lire stderr de manière non-bloquante
-                                        import select
-                                        import sys
-                                        if sys.platform != 'win32':
-                                            # Sur Unix, on peut utiliser select
-                                            if select.select([process.stderr], [], [], 0)[0]:
-                                                stderr_output = process.stderr.read()
-                                                if stderr_output:
-                                                    UnifiedLogger.write(
-                                                        "AI_CORE",
-                                                        "DEBUG",
-                                                        f"CLI stderr (erreur stdin): {stderr_output[:500]}"
-                                                    )
-                                        else:
-                                            # Sur Windows, essayer de lire directement
-                                            try:
-                                                stderr_output = process.stderr.read(1000)
-                                                if stderr_output:
-                                                    UnifiedLogger.write(
-                                                        "AI_CORE",
-                                                        "DEBUG",
-                                                        f"CLI stderr (erreur stdin): {stderr_output[:500]}"
-                                                    )
-                                            except Exception:
-                                                pass
-                                except Exception:
-                                    pass
-                                
-                                # Fermer stdin proprement
-                                try:
-                                    if process.stdin and not process.stdin.closed:
-                                        process.stdin.close()
-                                except Exception:
-                                    pass
-                        
-                        # Lancer le thread d'écriture stdin immédiatement
-                        stdin_thread = Thread(target=write_stdin_async, args=(process, stdin_prompt), daemon=True)
-                        stdin_thread.start()
-                        
-                        # On continue immédiatement à lire stdout pendant que stdin s'écrit en arrière-plan
-                        # Le thread se terminera automatiquement quand stdin sera fermé
-                        stdin_sent = time.time()
-                        UnifiedLogger.write(
-                            "AI_CORE",
-                            "DEBUG",
-                            f"CLI stdin écriture asynchrone lancée ({len(stdin_prompt)} chars) en {(stdin_sent - stdin_start)*1000:.2f}ms"
-                        )
-                        
                         # OPTIMISATION: Lecture stdout non-bloquante avec thread + queue
-                        # Permet de détecter rapidement la première ligne sans bloquer
                         stdout_queue = Queue()
-                        stdout_finished = [False]  # Flag pour indiquer la fin de la lecture
-                        stdout_error = [None]  # Capturer les erreurs depuis le thread
+                        stdout_finished = [False]
+                        stdout_error = [None]
                         
-                        # OPTIMISATION: Lecture stderr non-bloquante pour diagnostiquer les erreurs
                         stderr_queue = Queue()
                         stderr_finished = [False]
-                        stderr_lines = []  # Capturer toutes les lignes stderr pour diagnostic
+                        stderr_lines = []
                         
                         def read_stdout_thread(process, queue, finished_flag, error_flag):
-                            """Thread qui lit stdout et met les lignes dans la queue."""
                             try:
                                 for line in process.stdout:
                                     queue.put(line)
@@ -2724,52 +2341,32 @@ class GeminiCliSession(BaseSession):
                                 finished_flag[0] = True
                         
                         def read_stderr_thread(process, queue, finished_flag, lines_list):
-                            """Thread qui lit stderr et met les lignes dans la queue + liste."""
                             try:
                                 for line in process.stderr:
                                     line_text = line.strip()
                                     if line_text:
                                         lines_list.append(line_text)
                                         queue.put(line_text)
-                                        # Logger immédiatement les erreurs stderr pour diagnostic
-                                        UnifiedLogger.write(
-                                            "AI_CORE",
-                                            "DEBUG",
-                                            f"CLI stderr: {line_text[:500]}"
-                                        )
+                                        UnifiedLogger.write("AI_CORE", "DEBUG", f"CLI stderr: {line_text[:500]}")
                                 finished_flag[0] = True
                             except Exception as e:
-                                UnifiedLogger.write(
-                                    "AI_CORE",
-                                    "DEBUG",
-                                    f"CLI Erreur lecture stderr: {e}"
-                                )
                                 finished_flag[0] = True
                         
-                        # Lancer les threads de lecture stdout et stderr
-                        stdout_thread = Thread(
-                            target=read_stdout_thread,
-                            args=(process, stdout_queue, stdout_finished, stdout_error),
-                            daemon=True
-                        )
+                        stdout_thread = Thread(target=read_stdout_thread, args=(process, stdout_queue, stdout_finished, stdout_error), daemon=True)
                         stdout_thread.start()
                         
-                        stderr_thread = Thread(
-                            target=read_stderr_thread,
-                            args=(process, stderr_queue, stderr_finished, stderr_lines),
-                            daemon=True
-                        )
+                        stderr_thread = Thread(target=read_stderr_thread, args=(process, stderr_queue, stderr_finished, stderr_lines), daemon=True)
                         stderr_thread.start()
                         
                         # Mesure du temps avant la première ligne de sortie
                         first_line_received = False
-                        first_line_time = None
                         full_response = ""
+                        # stdin est déjà fermé par .use(), on considère l'envoi terminé
+                        stdin_sent = time.time() 
                         
                         # Lire depuis la queue de manière non-bloquante
                         while not stdout_finished[0] or not stdout_queue.empty():
                             try:
-                                # Timeout court pour éviter de bloquer indéfiniment
                                 line = stdout_queue.get(timeout=0.1)
                                 
                                 if not first_line_received:
@@ -2778,7 +2375,7 @@ class GeminiCliSession(BaseSession):
                                     UnifiedLogger.write(
                                         "AI_CORE",
                                         "DEBUG",
-                                        f"CLI Première ligne reçue après {first_line_delay:.0f}ms (découverte MCP + construction payload + latence réseau)"
+                                        f"CLI Première ligne reçue après {first_line_delay:.0f}ms (vs 15s+ sans Pool!)"
                                     )
                                     first_line_received = True
                                 
@@ -2787,91 +2384,36 @@ class GeminiCliSession(BaseSession):
                                     yield line
                                     
                             except Empty:
-                                # Pas de ligne disponible, continuer la boucle
                                 continue
                         
-                        # Vérifier s'il y a eu une erreur dans le thread de lecture
                         if stdout_error[0]:
                             raise Exception(f"Erreur lecture stdout: {stdout_error[0]}")
                         
-                        # Attendre que les threads se terminent
                         stdout_thread.join(timeout=1.0)
                         stderr_thread.join(timeout=1.0)
                         
-                        # Logger toutes les erreurs stderr capturées si le processus s'est terminé sans sortie
                         if not first_line_received and stderr_lines:
-                            UnifiedLogger.write(
-                                "AI_CORE",
-                                "ERROR",
-                                f"CLI Aucune sortie stdout, mais {len(stderr_lines)} lignes stderr capturées: {stderr_lines[:10]}"
-                            )
+                            UnifiedLogger.write("AI_CORE", "ERROR", f"CLI Aucune sortie stdout, stderr: {stderr_lines[:10]}")
                         
-                        # Attente de la fin du processus
                         process.wait()
-                        process_end = time.time()
-                        
-                        # Vérifier si l'écriture stdin a terminé et s'il y a eu une erreur
-                        if stdin_write_error[0]:
-                            raise Exception(f"Erreur écriture stdin: {stdin_write_error[0]}")
-                        
-                        # Attendre que le thread stdin se termine (devrait déjà être terminé)
-                        stdin_thread.join(timeout=1.0)  # Timeout de 1s pour éviter de bloquer indéfiniment
-                        if stdin_thread.is_alive():
-                            UnifiedLogger.write(
-                                "AI_CORE",
-                                "WARNING",
-                                "CLI Thread stdin n'a pas terminé dans les temps (timeout 1s)"
-                            )
-                        
-                        # Calculer le temps réel d'écriture stdin (approximatif, car asynchrone)
-                        # On utilise le temps jusqu'à la première ligne comme proxy
-                        stdin_write_complete_time = first_line_time if first_line_received else stdin_sent
-                        stdin_duration_ms = (stdin_write_complete_time - stdin_start) * 1000
-                        
-                        # Logs détaillés des timings
-                        total_duration = (process_end - process_start) * 1000
-                        process_creation_ms = (process_created - process_start) * 1000
-                        first_line_delay_ms = (first_line_time - stdin_sent) * 1000 if first_line_received else 0
-                        streaming_duration_ms = (process_end - first_line_time) * 1000 if first_line_received else 0
-                        
-                        UnifiedLogger.write(
-                            "AI_CORE",
-                            "DEBUG",
-                            "CLI Timing Breakdown",
-                            {
-                                "process_creation_ms": process_creation_ms,
-                                "stdin_write_ms": stdin_duration_ms,
-                                "first_line_delay_ms": first_line_delay_ms,
-                                "streaming_duration_ms": streaming_duration_ms,
-                                "total_ms": total_duration,
-                                "response_length": len(full_response)
-                            }
-                        )
                         
                         if process.returncode != 0:
-                            error_output = process.stderr.read()
+                            error_output = "\n".join(stderr_lines)
                             raise Exception(f"CLI Error (code {process.returncode}): {error_output}")
                         
                         # Ajout à l'historique
                         self.history.append(self._create_msg("user", message))
                         self.history.append(self._create_msg("assistant", full_response))
                         
-                        # Calculer le texte d'entrée total
-                        input_text_total = (stdin_prompt or "") + "\n" + (msg_arg or "")
-                        
-                        duration = time.time() - start_t
-                        
-                        # NOTE: On ne sauvegarde PAS la réponse pour GeminiCliSession
-                        # Le payload CodeAssist final contient déjà toutes les informations nécessaires
-                        # _save_response_log("gemini_cli", self.model_name, response_log_data, {...})  # Désactivé
-                        
                         # Logger les métriques
+                        # input_text est approx (static + dynamic)
+                        input_text_total = f"{pool_static}\n\n{dynamic_part}"
                         self._log_metrics(start_t, input_text_total, full_response)
                         
-                        UnifiedLogger.write("AI_CORE", "SUCCESS", f"Gemini CLI Stream terminé ({duration:.2f}s)")
+                        UnifiedLogger.write("AI_CORE", "SUCCESS", f"Gemini CLI Stream terminé ({time.time() - start_t:.2f}s)")
                         
                     except FileNotFoundError:
-                        raise FatalKeyError("Commande 'gemini' introuvable. Vérifiez l'installation du CLI.")
+                        raise FatalKeyError("Commande 'gemini' introuvable.")
                     except Exception as e:
                         UnifiedLogger.write("AI_CORE", "ERROR", f"Gemini CLI Exception: {e}")
                         raise e
@@ -2879,50 +2421,28 @@ class GeminiCliSession(BaseSession):
                 return cli_generator()
             
             else:
-                # Mode non-stream : on capture toute la sortie
-                result = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    input=stdin_prompt,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    cwd=self._cli_workdir or os.getcwd(),
-                    env=self._cli_env,
-                    timeout=120
-                )
+                # Mode non-stream (simplifié avec le Pool)
+                hot_process = GLOBAL_CLI_POOL.get_process(pool_cmd, pool_cwd, pool_env, pool_static)
+                process = hot_process.use(dynamic_part)
+                GLOBAL_CLI_POOL.prepare_next(pool_cmd, pool_cwd, pool_env, pool_static)
                 
-                if result.returncode != 0:
-                    error_msg = result.stderr.strip() or "Erreur inconnue du CLI"
-                    if "not logged in" in error_msg.lower() or "authentication" in error_msg.lower():
-                        raise FatalKeyError(
-                            f"CLI non authentifié. Exécutez: gemini auth login\n"
-                            f"Détails: {error_msg}"
-                        )
-                    raise Exception(f"CLI Error (code {result.returncode}): {error_msg}")
+                stdout, stderr = process.communicate(timeout=120)
                 
-                content = result.stdout.strip()
+                if process.returncode != 0:
+                    error_msg = stderr.strip() or "Erreur inconnue du CLI"
+                    raise Exception(f"CLI Error (code {process.returncode}): {error_msg}")
+                
+                content = stdout.strip()
                 
                 # Ajout à l'historique
                 self.history.append(self._create_msg("user", message))
                 self.history.append(self._create_msg("assistant", content))
                 
-                # Calculer le texte d'entrée total
-                input_text_total = (stdin_prompt or "") + "\n" + (msg_arg or "")
-                
-                duration = time.time() - start_t
-                
-                # NOTE: On ne sauvegarde PAS la réponse pour GeminiCliSession
-                # Le payload CodeAssist final contient déjà toutes les informations nécessaires
-                # _save_response_log("gemini_cli", self.model_name, response_log_data, {...})  # Désactivé
-                
-                # Logger les métriques
+                input_text_total = f"{pool_static}\n\n{dynamic_part}"
                 self._log_metrics(start_t, input_text_total, content)
                 
-                UnifiedLogger.write("AI_CORE", "SUCCESS", f"Gemini CLI terminé ({duration:.2f}s)")
+                UnifiedLogger.write("AI_CORE", "SUCCESS", f"Gemini CLI terminé ({time.time() - start_t:.2f}s)")
                 
-                # Retour au format UniversalResponseWrapper pour compatibilité
                 return UniversalResponseWrapper(content, None)
         
         except subprocess.TimeoutExpired:
