@@ -18,6 +18,94 @@ from ai_core.code_assist_converter import (
 )
 
 
+def get_tools_from_mcp_server() -> Optional[List[Dict[str, Any]]]:
+    """
+    Récupère les outils depuis le serveur MCP HTTP long-running.
+    Convertit le format MCP vers le format Gemini/OpenAI.
+    
+    Returns:
+        Liste des outils au format Gemini/OpenAI, ou None en cas d'erreur
+    """
+    try:
+        mcp_http_port = int(os.environ.get("MCP_HTTP_PORT", "8765"))
+        mcp_http_host = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
+        mcp_url = f"http://{mcp_http_host}:{mcp_http_port}/mcp/tools"
+        
+        # Faire une requête GET au serveur MCP HTTP
+        response = requests.get(mcp_url, timeout=5)
+        response.raise_for_status()
+        
+        data = response.json()
+        mcp_tools = data.get("tools", [])
+        
+        if not mcp_tools:
+            UnifiedLogger.write(
+                "AI_CORE",
+                "WARNING",
+                "⚠️ Aucun outil retourné par le serveur MCP HTTP"
+            )
+            return None
+        
+        # Convertir le format MCP vers le format Gemini/OpenAI
+        gemini_tools = []
+        for mcp_tool in mcp_tools:
+            # Format MCP: {"name": "...", "description": "...", "inputSchema": {...}}
+            # Format Gemini/OpenAI: {"name": "...", "description": "...", "parameters": {...}}
+            gemini_tool = {
+                "name": mcp_tool.get("name"),
+                "description": mcp_tool.get("description", ""),
+                "parameters": mcp_tool.get("inputSchema", {})
+            }
+            
+            # Convertir les types en majuscules pour Gemini (Gemini utilise uppercase)
+            def convert_types_to_uppercase(obj):
+                """Convertit récursivement les types en majuscules."""
+                if isinstance(obj, dict):
+                    result = {}
+                    for k, v in obj.items():
+                        if k == "type" and isinstance(v, str):
+                            result[k] = v.upper()
+                        else:
+                            result[k] = convert_types_to_uppercase(v)
+                    return result
+                elif isinstance(obj, list):
+                    return [convert_types_to_uppercase(item) for item in obj]
+                else:
+                    return obj
+            
+            gemini_tool["parameters"] = convert_types_to_uppercase(gemini_tool["parameters"])
+            gemini_tools.append(gemini_tool)
+        
+        UnifiedLogger.write(
+            "AI_CORE",
+            "INFO",
+            f"✅ {len(gemini_tools)} outils récupérés depuis le serveur MCP HTTP"
+        )
+        
+        # Retourner au format attendu par Gemini API: [{"functionDeclarations": [...]}]
+        return [{"functionDeclarations": gemini_tools}]
+        
+    except requests.exceptions.RequestException as e:
+        UnifiedLogger.write(
+            "AI_CORE",
+            "WARNING",
+            f"⚠️ Impossible de récupérer les outils depuis le serveur MCP HTTP: {e}. Utilisation des outils par défaut."
+        )
+        # Fallback vers TOOLS_SCHEMA si le serveur MCP n'est pas disponible
+        try:
+            from config.tools_schema import TOOLS_SCHEMA
+            return [{"functionDeclarations": TOOLS_SCHEMA}]
+        except ImportError:
+            return None
+    except Exception as e:
+        UnifiedLogger.write(
+            "AI_CORE",
+            "ERROR",
+            f"❌ Erreur lors de la récupération des outils MCP: {e}"
+        )
+        return None
+
+
 class CodeAssistClient:
     """
     Client CodeAssist pour l'API Gemini avec OAuth.
@@ -339,6 +427,17 @@ class CodeAssistClient:
         """
         import uuid
         user_prompt_id = str(uuid.uuid4())
+        
+        # OPTIMISATION: Récupérer automatiquement les outils depuis le serveur MCP HTTP si non fournis
+        if tools is None:
+            tools = get_tools_from_mcp_server()
+            if tools and len(tools) > 0:
+                tool_count = len(tools[0].get('functionDeclarations', [])) if isinstance(tools[0], dict) else 0
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "INFO",
+                    f"✅ {tool_count} outils récupérés depuis le serveur MCP HTTP"
+                )
         
         # Log des outils si présents
         if tools:

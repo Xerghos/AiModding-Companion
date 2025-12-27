@@ -25,7 +25,6 @@ except ImportError:
     print("❌ Erreur: Package 'mcp' non installé. Installez-le avec: pip install mcp")
     sys.exit(1)
 
-from config.tools_schema import TOOLS_SCHEMA
 from features.UnifiedLogger import UnifiedLogger
 
 # Créer le serveur MCP
@@ -37,6 +36,10 @@ _action_log_path = "action_log.json"
 _result_queue = None
 _task_queue = None
 
+# Cache module-level pour TOOLS_SCHEMA et les outils MCP convertis
+_TOOLS_SCHEMA_CACHE = None
+_MCP_TOOLS_CACHE = None
+
 
 def set_session_context(session, action_log_path="action_log.json", result_queue=None, task_queue=None):
     """Définit le contexte de session pour l'exécution des outils."""
@@ -47,15 +50,32 @@ def set_session_context(session, action_log_path="action_log.json", result_queue
     _task_queue = task_queue
 
 
-@server.list_tools()
-async def list_tools() -> List[Tool]:
+def _get_tools_schema():
     """
-    Liste tous nos outils depuis TOOLS_SCHEMA.
-    Convertit le format OpenAI/Gemini vers le format MCP Tool.
+    Lazy import de TOOLS_SCHEMA pour éviter de charger au démarrage du module.
+    Utilise un cache module-level pour ne charger qu'une seule fois.
     """
+    global _TOOLS_SCHEMA_CACHE
+    if _TOOLS_SCHEMA_CACHE is None:
+        from config.tools_schema import TOOLS_SCHEMA
+        _TOOLS_SCHEMA_CACHE = TOOLS_SCHEMA
+    return _TOOLS_SCHEMA_CACHE
+
+
+def _convert_tools_to_mcp_format(tools_schema):
+    """
+    Convertit TOOLS_SCHEMA (format OpenAI/Gemini) vers le format MCP Tool.
+    Utilise un cache pour éviter de reconvertir à chaque appel.
+    """
+    global _MCP_TOOLS_CACHE
+    
+    # Si le cache existe et que TOOLS_SCHEMA n'a pas changé, retourner le cache
+    if _MCP_TOOLS_CACHE is not None:
+        return _MCP_TOOLS_CACHE
+    
     mcp_tools = []
     
-    for tool_def in TOOLS_SCHEMA:
+    for tool_def in tools_schema:
         # TOOLS_SCHEMA est au format OpenAI: {"name": "...", "description": "...", "parameters": {...}}
         # Convertir vers MCP Tool
         name = tool_def.get("name")
@@ -87,11 +107,54 @@ async def list_tools() -> List[Tool]:
             inputSchema=mcp_schema
         ))
     
+    # Mettre en cache le résultat
+    _MCP_TOOLS_CACHE = mcp_tools
+    
     UnifiedLogger.write(
         "MCP_SERVER",
         "INFO",
-        f"📋 {len(mcp_tools)} outils exposés via MCP"
+        f"📋 {len(mcp_tools)} outils exposés via MCP (cache initialisé)"
     )
+    
+    return mcp_tools
+
+
+def get_mcp_tools_for_cache() -> List[Dict[str, Any]]:
+    """
+    Retourne les outils MCP au format dict pour le cache.
+    Utilisé pour sauvegarder les outils découverts dans le cache.
+    """
+    tools_schema = _get_tools_schema()
+    mcp_tools = _convert_tools_to_mcp_format(tools_schema)
+    
+    # Convertir les objets Tool en dict pour la sérialisation JSON
+    tools_dict = []
+    for tool in mcp_tools:
+        tools_dict.append({
+            "name": tool.name,
+            "description": tool.description,
+            "inputSchema": tool.inputSchema
+        })
+    
+    return tools_dict
+
+
+@server.list_tools()
+async def list_tools() -> List[Tool]:
+    """
+    Liste tous nos outils depuis TOOLS_SCHEMA.
+    Convertit le format OpenAI/Gemini vers le format MCP Tool.
+    Utilise un cache pour éviter de recharger et reconvertir à chaque appel.
+    """
+    # Lazy import de TOOLS_SCHEMA
+    tools_schema = _get_tools_schema()
+    
+    # Convertir vers format MCP (avec cache)
+    mcp_tools = _convert_tools_to_mcp_format(tools_schema)
+    
+    # Retourner directement depuis le cache si disponible
+    if _MCP_TOOLS_CACHE is not None:
+        return _MCP_TOOLS_CACHE
     
     return mcp_tools
 

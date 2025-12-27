@@ -21,6 +21,18 @@ try:
 except ImportError:
     pass
 
+# 3.5. Démarrage du serveur MCP HTTP long-running
+try:
+    from ai_core.mcp_server_http import start_server_background
+    mcp_server_thread = start_server_background()
+    if 'UnifiedLogger' in locals():
+        UnifiedLogger.write("run", "INFO", "✅ Serveur MCP HTTP démarré en arrière-plan")
+except Exception as e:
+    if 'UnifiedLogger' in locals():
+        UnifiedLogger.write("run", "WARNING", f"⚠️ Impossible de démarrer le serveur MCP HTTP: {e}")
+    else:
+        print(f"⚠️ Serveur MCP HTTP non démarré: {e}")
+
 # 4. Import UI
 try:
     from ui.main_window import GeminiApp
