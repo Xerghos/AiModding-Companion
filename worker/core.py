@@ -607,18 +607,6 @@ class Worker(threading.Thread):
             
             self.response_queue.put({'type': 'ui_stream_end'})
             
-            # OPTIMISATION CRITIQUE : Préparer la mémoire APRÈS la réponse (asynchrone)
-            # Cela permet de préparer la compression pendant que l'utilisateur réfléchit,
-            # au lieu de bloquer la prochaine requête avec une compression synchrone
-            if not self.abort_current_stream and full_text.strip():
-                # Sauvegarder l'historique d'abord
-                if GlobalMemoryManager and session:
-                    GlobalMemoryManager.save_session_history(session)
-                    
-                    # Lancer l'optimisation en arrière-plan (non-bloquant)
-                    # Cette optimisation préparera la prochaine requête
-                    self.bg_executor.submit(GlobalMemoryManager.optimize_history, session)
-            
             if not self.abort_current_stream:
                 # 1. Détection !native_tool standard (JSON Strict) - Reconstruit par Session
                 native_match = re.search(r"(!native_tool\s*\{.*?\})", full_text, re.DOTALL)
@@ -897,9 +885,9 @@ class Worker(threading.Thread):
 
                 if action == 'chat':
                     # [BACKGROUND] Lancement threadé pour ne pas bloquer le STOP
-                    # OPTIMISÉ : optimize_history est maintenant appelé APRÈS la réponse dans _handle_chat_stream
-                    # pour préparer la prochaine requête pendant que l'utilisateur réfléchit
                     self.bg_executor.submit(self._handle_chat_stream, payload)
+                    if GlobalMemoryManager and self.main_session:
+                        self.bg_executor.submit(GlobalMemoryManager.optimize_history, self.main_session)
                 
                 # ... (Dans la boucle while, méthode run)
                 elif action == 'command':
