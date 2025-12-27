@@ -1608,53 +1608,72 @@ class GeminiCliSession(BaseSession):
         # Vérifier que le serveur MCP HTTP est disponible avant de l'utiliser
         # On fait plusieurs tentatives car le serveur peut être en cours de démarrage
         self._mcp_http_available = False
-        health_url = f"http://{mcp_http_host}:{mcp_http_port}/health"
+        
+        # Liste des URLs à tester (parfois localhost passe mieux que 127.0.0.1 ou inversement)
+        candidate_hosts = [mcp_http_host]
+        if mcp_http_host == "127.0.0.1": candidate_hosts.append("localhost")
+        elif mcp_http_host == "localhost": candidate_hosts.append("127.0.0.1")
         
         import time
-        max_retries = 3
-        retry_delay = 0.5
+        import requests
+        
+        # Configuration renforcée pour la détection
+        max_retries = 5
+        retry_delay = 1.0
         
         for attempt in range(max_retries):
-            try:
-                import requests
-                response = requests.get(health_url, timeout=2)
-                if response.status_code == 200:
-                    self._mcp_http_available = True
-                    tools_count = response.json().get('tools_count', 0)
-                    UnifiedLogger.write(
-                        "AI_CORE",
-                        "DEBUG",
-                        f"✅ Serveur MCP HTTP disponible sur {health_url} ({tools_count} outils, tentative {attempt + 1}/{max_retries})"
-                    )
-                    break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
+            success = False
+            for host in candidate_hosts:
+                health_url = f"http://{host}:{mcp_http_port}/health"
+                try:
+                    # Timeout augmenté à 5s pour éviter les faux négatifs sous charge
+                    response = requests.get(health_url, timeout=5)
+                    if response.status_code == 200:
+                        self._mcp_http_available = True
+                        tools_count = response.json().get('tools_count', 0)
+                        # Mettre à jour l'URL finale avec l'hôte qui a fonctionné
+                        mcp_server_url = f"http://{host}:{mcp_http_port}/mcp"
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "DEBUG",
+                            f"✅ Serveur MCP HTTP détecté sur {health_url} ({tools_count} outils)"
+                        )
+                        success = True
+                        break
+                except Exception:
                     continue
-                else:
-                    UnifiedLogger.write(
-                        "AI_CORE",
-                        "WARNING",
-                        f"⚠️ Serveur MCP HTTP non disponible ({health_url}) après {max_retries} tentatives: {e}. Utilisation de stdio en fallback."
-                    )
+            
+            if success:
+                break
+            
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 1.5 # Backoff exponentiel léger
+            else:
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "WARNING",
+                    f"⚠️ Serveur MCP HTTP non joignable après {max_retries} tentatives. Passage forcé en mode Stdio (LENT)."
+                )
         
         # Configuration SSE/HTTP si disponible, sinon fallback sur stdio
         # NOTE: gemini-cli détecte automatiquement le transport SSE si on utilise "url"
-        # (pas besoin de la clé "transport" qui n'est pas reconnue)
         if self._mcp_http_available:
             mcp_server_config = {
-                "url": mcp_server_url,  # URL SSE - gemini-cli détecte automatiquement le transport
+                "url": mcp_server_url,
                 "trust": True,
-                "timeout": 30000
+                "timeout": 60000  # 60s pour gérer les gros contextes
             }
         else:
             # Fallback sur stdio si le serveur HTTP n'est pas disponible
+            # ATTENTION: Ce mode lance un nouveau process Python par requête (très lent)
+            UnifiedLogger.write("AI_CORE", "CRITICAL", "🚨 MODE DÉGRADÉ ACTIF: Serveur MCP inaccessible. Lenteurs extrêmes attendues.")
             mcp_server_config = {
                 "command": sys.executable,
                 "args": ["-m", "ai_core.mcp_server"],
                 "cwd": project_root_abs,  # Chemin absolu pré-calculé
                 "trust": True,
-                "timeout": 30000
+                "timeout": 60000
             }
         
         settings = {
