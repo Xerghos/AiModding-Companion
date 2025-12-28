@@ -225,21 +225,6 @@ class CodeAssistClient:
         MAX_RETRIES = 3
         RETRY_DELAYS = [1, 2, 4]  # Backoff exponentiel
 
-        # Log du payload complet pour diagnostic (une seule fois)
-        try:
-            payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
-            UnifiedLogger.write(
-                "AI_CORE",
-                "DEBUG",
-                f"Payload CodeAssist ({method}):\n{payload_str}"
-            )
-        except Exception as e:
-            UnifiedLogger.write(
-                "AI_CORE",
-                "WARN",
-                f"Impossible de logger le payload: {e}"
-            )
-
         last_exc: Optional[Exception] = None
 
         for attempt in range(MAX_RETRIES):
@@ -366,21 +351,6 @@ class CodeAssistClient:
         """
         MAX_RETRIES = 3
         RETRY_DELAYS = [1, 2, 4]
-
-        # Log du payload complet pour diagnostic (une seule fois)
-        try:
-            payload_str = json.dumps(payload, indent=2, ensure_ascii=False)
-            UnifiedLogger.write(
-                "AI_CORE",
-                "DEBUG",
-                f"Payload CodeAssist Streaming ({method}):\n{payload_str}"
-            )
-        except Exception as e:
-            UnifiedLogger.write(
-                "AI_CORE",
-                "WARN",
-                f"Impossible de logger le payload: {e}"
-            )
 
         # Ajouter le paramètre alt=sse pour le streaming
         params = {"alt": "sse"}
