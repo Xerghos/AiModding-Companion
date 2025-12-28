@@ -377,20 +377,22 @@ class CodeAssistClient:
             )
 
             # Log du payload final juste avant l'envoi HTTP (comme gemini-cli)
-            try:
-                _save_codeassist_payload_log(
-                    payload.get("model", "unknown"),
-                    payload,
-                    {
-                        "method": method,
-                        "attempt": attempt + 1,
-                        "max_retries": MAX_RETRIES,
-                        "is_streaming": True,
-                        "endpoint": url
-                    }
-                )
-            except Exception as log_err:
-                UnifiedLogger.write("AI_CORE", "WARN", f"Echec logging payload final: {log_err}")
+            # Sauvegarder seulement au premier essai pour éviter les doublons
+            if attempt == 0:
+                try:
+                    _save_codeassist_payload_log(
+                        payload.get("model", "unknown"),
+                        payload,
+                        {
+                            "method": method,
+                            "attempt": attempt + 1,
+                            "max_retries": MAX_RETRIES,
+                            "is_streaming": True,
+                            "endpoint": url
+                        }
+                    )
+                except Exception as log_err:
+                    UnifiedLogger.write("AI_CORE", "WARN", f"Echec logging payload final: {log_err}")
 
             try:
                 response = requests.post(
