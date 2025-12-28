@@ -133,8 +133,10 @@ def to_generate_content_request(
     IMPORTANT: Aligné sur le payload gemini-cli qui fonctionne:
     - contents: [] (VIDE)
     - systemInstruction contient TOUT le contexte + messages
-    - generationConfig: REQUIS avec temperature (le payload fonctionnel l'inclut)
-    - toolConfig: ajouté pour éviter erreurs 500 (null pointer exceptions)
+    - Ordre des clés CRITIQUE pour API v1internal:
+      1. tools (si présent)
+      2. toolConfig (si tools présents)
+      3. generationConfig EN DERNIER (requis avec temperature)
     - Sanitizer appliqué sur les outils (types MAJUSCULES, champs interdits supprimés)
     """
     if user_prompt_id is None:
@@ -181,12 +183,7 @@ def to_generate_content_request(
             "parts": [{"text": full_system_instruction}]
         }
     
-    # 3. generationConfig (REQUIS pour éviter erreur 500 - le payload fonctionnel l'inclut)
-    vertex_request["generationConfig"] = {
-        "temperature": temperature
-    }
-    
-    # 4. Outils avec toolConfig conditionnel
+    # 3. Outils avec toolConfig conditionnel (EN PREMIER - ordre critique pour API v1internal)
     # BLINDAGE ERREUR 500: toolConfig peut être requis pour éviter null pointer exceptions
     if tools and len(tools) > 0:
         vertex_request["tools"] = _convert_tools_to_gemini_format(tools)
@@ -197,6 +194,12 @@ def to_generate_content_request(
                 "mode": "AUTO"
             }
         }
+    
+    # 4. generationConfig EN DERNIER (REQUIS - ordre critique pour API v1internal)
+    # Le payload fonctionnel gemini-cli place generationConfig après tools/toolConfig
+    vertex_request["generationConfig"] = {
+        "temperature": temperature
+    }
     
     # Optionnels (garder pour compatibilité mais généralement non utilisés par gemini-cli)
     if safety_settings:
