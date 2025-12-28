@@ -301,9 +301,20 @@ class LiteLLMSession(BaseSession):
                 # Modèle non-bridged OU OAuth non disponible: utiliser API key
                 try:
                     self.current_key = self.key_mgr.get_key(self.model_name)
-                except Exception:
-                    # Pas de clé disponible
-                    pass
+                    if self.current_key:
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "AUTH",
+                            f"🔑 API key obtenue pour {self.model_name} (Gemini non-bridged)"
+                        )
+                except Exception as e:
+                    # Pas de clé disponible - logger l'erreur
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "WARNING",
+                        f"⚠️ Impossible d'obtenir une clé API pour {self.model_name}: {e}"
+                    )
+                    self.current_key = None
         else:
             # Pour les autres providers, API key requise
             self.current_key = self.key_mgr.get_key(self.model_name)

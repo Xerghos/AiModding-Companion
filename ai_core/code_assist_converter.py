@@ -2,10 +2,11 @@
 Convertisseur entre les formats Gemini API et CodeAssist.
 Base sur packages/core/src/code_assist/converter.ts de gemini-cli.
 
-CORRECTION: Aligne sur le vrai code gemini-cli-core/converter.js:
-- contents: contient les messages user/assistant (pas vide!)
-- systemInstruction: UNIQUEMENT l instruction systeme
-- generationConfig: seulement temperature par defaut (pas maxOutputTokens)
+CORRECTION FINALE: Aligné sur le payload gemini-cli qui FONCTIONNE:
+- contents: VIDE [] (gemini-cli met tout dans systemInstruction)
+- systemInstruction: contient TOUT (contexte + messages user/assistant)
+- PAS de generationConfig
+- PAS de toolConfig
 """
 
 from typing import Dict, List, Any, Optional, Union
@@ -27,54 +28,76 @@ def to_generate_content_request(
     cached_content: Optional[Dict] = None,
     **kwargs
 ) -> Dict[str, Any]:
+    """
+    Convertit les messages au format CodeAssist.
+    
+    IMPORTANT: Aligné sur le payload gemini-cli qui fonctionne:
+    - contents: [] (VIDE)
+    - systemInstruction contient TOUT le contexte + messages
+    - Pas de generationConfig
+    - Pas de toolConfig
+    """
     if user_prompt_id is None:
         user_prompt_id = str(uuid.uuid4())
     
-    # 1. CONTENTS: Messages user/assistant (NON VIDE!)
-    contents = _to_contents(messages)
+    # 1. CONTENTS: VIDE (gemini-cli fait ainsi)
+    contents: List[Dict[str, Any]] = []
     
-    # 2. SYSTEM INSTRUCTION
-    system_parts = []
+    # 2. SYSTEM INSTRUCTION: contient TOUT (contexte + messages user/assistant)
+    all_text_parts = []
+    
+    # Ajouter l'instruction système si fournie
     if system_instruction:
-        system_parts.append(system_instruction)
+        all_text_parts.append(system_instruction)
+    
+    # Ajouter les messages système des messages
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
         if role == "system" and content:
-            system_parts.append(str(content))
+            all_text_parts.append(str(content))
     
-    vertex_request: Dict[str, Any] = {"contents": contents}
+    # Ajouter les messages user/assistant à la fin (comme gemini-cli le fait)
+    # gemini-cli ajoute les messages de l'historique dans systemInstruction
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "system":
+            continue  # Déjà traité
+        if content:
+            # Format: ajouter le message avec préfixe pour indiquer le rôle
+            if role == "user":
+                all_text_parts.append(f"\nUser:\n{content}")
+            elif role in ("assistant", "model"):
+                all_text_parts.append(f"\nAssistant:\n{content}")
     
-    if system_parts:
-        full_system_instruction = "\n\n".join(system_parts)
+    # Construire le payload request
+    vertex_request: Dict[str, Any] = {"contents": contents}  # VIDE!
+    
+    if all_text_parts:
+        full_system_instruction = "\n\n".join(all_text_parts)
         vertex_request["systemInstruction"] = {
-            "role": "user",
+            "role": "system",
             "parts": [{"text": full_system_instruction}]
         }
     
-    generation_config: Dict[str, Any] = {"temperature": temperature}
-    if max_tokens is not None and max_tokens > 0:
-        generation_config["maxOutputTokens"] = min(max_tokens, 8192)
+    # 3. PAS de generationConfig (gemini-cli ne l'inclut pas)
+    # 4. PAS de toolConfig (gemini-cli ne l'inclut pas)
     
-    if generation_config:
-        vertex_request["generationConfig"] = generation_config
-    
-    if cached_content:
-        vertex_request["cachedContent"] = cached_content
-    
+    # Outils (sans toolConfig)
     if tools and len(tools) > 0:
         vertex_request["tools"] = _convert_tools_to_gemini_format(tools)
-        if "toolConfig" not in vertex_request:
-            function_calling_mode = kwargs.get("function_calling_mode", "AUTO")
-            vertex_request["toolConfig"] = {"functionCallingConfig": {"mode": function_calling_mode}}
+        # NE PAS ajouter toolConfig - gemini-cli ne le fait pas
     
+    # Optionnels (garder pour compatibilité mais généralement non utilisés par gemini-cli)
     if safety_settings:
         vertex_request["safetySettings"] = safety_settings
     if labels:
         vertex_request["labels"] = labels
+    if cached_content:
+        vertex_request["cachedContent"] = cached_content
     
-    vertex_request["session_id"] = session_id if session_id else ""
-    
+    # Construire la requête CodeAssist finale
     ca_request: Dict[str, Any] = {"model": model, "request": vertex_request}
     if project_id:
         ca_request["project"] = project_id
@@ -102,6 +125,10 @@ def from_generate_content_response(response: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _to_contents(messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """
+    DEPRECATED: Cette fonction n'est plus utilisée car contents doit être vide.
+    Gardée pour compatibilité.
+    """
     contents = []
     for msg in messages:
         role = msg.get("role", "user")

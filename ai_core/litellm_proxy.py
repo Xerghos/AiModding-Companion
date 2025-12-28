@@ -322,11 +322,20 @@ class LiteLLMProxy:
                     raise e
             elif api_key:
                 # Fallback sur API key si OAuth non disponible
+                # IMPORTANT: Préfixer avec "gemini/" pour forcer Google AI Studio
+                # Sans ce préfixe, LiteLLM détecte "gemini" et route vers Vertex AI
+                # qui nécessite des credentials GCP (Application Default Credentials)
+                if not normalized_model.startswith("gemini/"):
+                    litellm_model = f"gemini/{normalized_model}"
+                else:
+                    litellm_model = normalized_model
+                
+                model_config["model"] = litellm_model
                 model_config["api_key"] = api_key
                 UnifiedLogger.write(
                     "AI_CORE",
                     "AUTH",
-                    f"🔑 Utilisation API key pour {normalized_model}"
+                    f"🔑 Utilisation API key pour {litellm_model} (Google AI Studio)"
                 )
             else:
                 # Pas d'API key et pas d'OAuth - erreur

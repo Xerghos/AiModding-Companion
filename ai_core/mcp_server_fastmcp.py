@@ -279,6 +279,36 @@ async def health_check(request=None):
     })
 
 
+# Route REST pour lister les outils (compatible avec code_assist_client.py)
+@mcp.custom_route("/mcp/tools", methods=["GET"])
+async def list_tools_rest(request=None):
+    """
+    Endpoint REST pour lister les outils au format JSON.
+    Compatible avec get_tools_from_mcp_server() dans code_assist_client.py.
+    """
+    from starlette.responses import JSONResponse
+    
+    # Convertir TOOLS_SCHEMA au format MCP attendu
+    tools = []
+    for tool_schema in TOOLS_SCHEMA:
+        tools.append({
+            "name": tool_schema.get("name"),
+            "description": tool_schema.get("description", ""),
+            "inputSchema": tool_schema.get("parameters", {})
+        })
+    
+    UnifiedLogger.write(
+        "MCP_FASTMCP",
+        "INFO",
+        f"📋 Liste outils REST demandée: {len(tools)} outils retournés"
+    )
+    
+    return JSONResponse({
+        "tools": tools,
+        "count": len(tools)
+    })
+
+
 if __name__ == "__main__":
     # Pour les tests directs du serveur FastMCP
     import os
