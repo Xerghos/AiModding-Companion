@@ -149,7 +149,8 @@ class SmartSessionFactory:
             model_name=real_model,
             system_instruction=system_instruction,
             base_url=base_url,
-            agent_name=agent_identity
+            agent_name=agent_identity,
+            enable_tools=enable_tools
         )
 
     @trace_action(source="factory")

@@ -660,25 +660,17 @@ class CodeAssistClient:
         # Vérification post-conversion
         request_data = ca_request.get("request", {})
         if tools:
-            has_toolconfig = "toolConfig" in request_data
-            UnifiedLogger.write(
-                "AI_CORE",
-                "DEBUG",
-                f"Vérification post-conversion: toolConfig présent = {has_toolconfig}"
-            )
-            if has_toolconfig:
-                toolconfig_str = json.dumps(request_data.get("toolConfig"), indent=2, ensure_ascii=False)
+            # Log des outils convertis pour débogage
+            try:
+                tools_converted = request_data.get("tools", [])
+                tools_count = len(tools_converted)
                 UnifiedLogger.write(
                     "AI_CORE",
                     "DEBUG",
-                    f"toolConfig généré:\n{toolconfig_str}"
+                    f"Outils convertis dans request: {tools_count} groupes d'outils"
                 )
-            else:
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "ERROR",
-                    "[CRITICAL] toolConfig MANQUANT après conversion!"
-                )
+            except:
+                pass
         
         if stream:
             # Mode streaming

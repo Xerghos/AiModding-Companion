@@ -44,7 +44,8 @@ class LiteLLMSession(BaseSession):
         model_name: str = "deepseek-chat",
         system_instruction: Optional[str] = None,
         base_url: Optional[str] = None,
-        agent_name: Optional[str] = None
+        agent_name: Optional[str] = None,
+        enable_tools: bool = True
     ):
         """
         Initialise la session LiteLLM.
@@ -55,6 +56,7 @@ class LiteLLMSession(BaseSession):
             system_instruction: Instructions système
             base_url: URL de base (optionnel, pour DeepSeek spécial)
             agent_name: Nom de l'agent (pour logging)
+            enable_tools: Activer ou non les outils
         """
         super().__init__(key_manager, model_name, system_instruction)
         
@@ -63,6 +65,7 @@ class LiteLLMSession(BaseSession):
         self.model_name = model_name
         self.agent_name = agent_name
         self.system_instruction = system_instruction
+        self.enable_tools = enable_tools
         self.current_key = None
         self._history = []  # Historique interne (utilisé seulement si pas de CLI)
         self.base_url = base_url  # Conservé pour compatibilité
@@ -346,7 +349,12 @@ class LiteLLMSession(BaseSession):
         native_tools = None
         use_mcp = True  # Utiliser MCP par défaut pour CodeAssist
         
-        if use_mcp and self._use_oauth:
+        if not self.enable_tools:
+            # Si les outils sont désactivés, on passe une liste vide explicite
+            # pour empêcher le client de charger les outils par défaut
+            native_tools = []
+            UnifiedLogger.write("AI_CORE", "DEBUG", "🚫 Outils désactivés pour cette session")
+        elif use_mcp and self._use_oauth:
             # CAS 3: CodeAssist (OAuth) -> Utiliser MCP au lieu de passer les outils directement
             # Cela réduit la taille du payload et évite les erreurs 500
             native_tools = [{
