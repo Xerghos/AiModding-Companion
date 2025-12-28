@@ -11,7 +11,7 @@ context_links.json
 # Custom - CORRIGÉ avec wildcards
 secrets.enc
 db_key_states.json.md
-DOC_CLI_FRAMEWORKS_DEPENDANCES/
+DOC_codes_sources/
 src/
 temp/
 logs/
