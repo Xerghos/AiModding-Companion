@@ -6,11 +6,110 @@ CORRECTION FINALE: Aligné sur le payload gemini-cli qui FONCTIONNE:
 - contents: VIDE [] (gemini-cli met tout dans systemInstruction)
 - systemInstruction: contient TOUT (contexte + messages user/assistant)
 - PAS de generationConfig
-- PAS de toolConfig
+- toolConfig: OPTIONNEL (peut être requis pour éviter null pointer exceptions sur v1internal)
+
+BLINDAGE ERREUR 500:
+- Sanitizer de schéma: types en MAJUSCULES, suppression champs interdits
+- Détection arrays d'objets imbriqués (bug connu Google)
 """
 
 from typing import Dict, List, Any, Optional, Union
 import uuid
+
+
+# =============================================================================
+# SANITIZER DE SCHEMA POUR CODEASSIST (BLINDAGE ERREUR 500)
+# =============================================================================
+
+# Champs JSON qui font crasher le parseur Protobuf de l'API v1internal
+FORBIDDEN_SCHEMA_FIELDS = {"title", "default", "examples", "additionalProperties", "$schema", "$id", "$ref"}
+
+
+def sanitize_schema_for_codeassist(schema: Any, _depth: int = 0) -> Any:
+    """
+    Sanitize récursivement un schéma JSON pour le rendre compatible avec l'API v1internal.
+    
+    Actions:
+    1. Convertir tous les types en MAJUSCULES (object -> OBJECT, string -> STRING)
+    2. Supprimer les champs interdits (title, default, examples, additionalProperties, etc.)
+    3. Détecter et logger les arrays d'objets imbriqués (bug connu Google - peut causer erreur 500)
+    
+    Args:
+        schema: Le schéma JSON à sanitizer (dict, list, ou valeur primitive)
+        _depth: Profondeur de récursion (pour logging debug)
+    
+    Returns:
+        Le schéma sanitizé compatible avec l'API CodeAssist v1internal
+    """
+    # Protection contre récursion infinie
+    if _depth > 50:
+        return schema
+    
+    # Cas de base: pas un dict
+    if not isinstance(schema, dict):
+        if isinstance(schema, list):
+            return [sanitize_schema_for_codeassist(item, _depth + 1) for item in schema]
+        return schema
+    
+    result = {}
+    
+    for key, value in schema.items():
+        # 1. Supprimer les champs interdits
+        if key in FORBIDDEN_SCHEMA_FIELDS:
+            continue
+        
+        # 2. Convertir "const" en "enum" à une valeur (const non supporté par Protobuf)
+        if key == "const":
+            result["enum"] = [value]
+            continue
+        
+        # 3. Convertir les types en MAJUSCULES
+        if key == "type":
+            if isinstance(value, str):
+                result[key] = value.upper()
+            elif isinstance(value, list):
+                # Type union (ex: ["string", "null"]) - prendre le premier non-null
+                non_null_types = [t for t in value if t != "null"]
+                if non_null_types:
+                    result[key] = non_null_types[0].upper()
+                else:
+                    result[key] = "STRING"  # Fallback
+            else:
+                result[key] = value
+            continue
+        
+        # 4. Traitement récursif des propriétés
+        if key == "properties" and isinstance(value, dict):
+            result[key] = {k: sanitize_schema_for_codeassist(v, _depth + 1) for k, v in value.items()}
+            continue
+        
+        # 5. Traitement récursif des items (pour les arrays)
+        if key == "items" and isinstance(value, dict):
+            sanitized_items = sanitize_schema_for_codeassist(value, _depth + 1)
+            # DETECTION BUG: Array d'objets imbriqués (bug connu Google)
+            if sanitized_items.get("type") == "OBJECT":
+                # Logger un warning mais continuer (le bug peut être corrigé côté Google)
+                try:
+                    from features.UnifiedLogger import UnifiedLogger
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "WARNING",
+                        f"⚠️ Détection array d'objets imbriqués dans schéma (bug connu Google - peut causer erreur 500)"
+                    )
+                except Exception:
+                    pass
+            result[key] = sanitized_items
+            continue
+        
+        # 6. Traitement récursif des autres dicts
+        if isinstance(value, dict):
+            result[key] = sanitize_schema_for_codeassist(value, _depth + 1)
+        elif isinstance(value, list):
+            result[key] = [sanitize_schema_for_codeassist(item, _depth + 1) if isinstance(item, dict) else item for item in value]
+        else:
+            result[key] = value
+    
+    return result
 
 
 def to_generate_content_request(
@@ -34,8 +133,9 @@ def to_generate_content_request(
     IMPORTANT: Aligné sur le payload gemini-cli qui fonctionne:
     - contents: [] (VIDE)
     - systemInstruction contient TOUT le contexte + messages
-    - Pas de generationConfig
-    - Pas de toolConfig
+    - generationConfig: REQUIS avec temperature (le payload fonctionnel l'inclut)
+    - toolConfig: ajouté pour éviter erreurs 500 (null pointer exceptions)
+    - Sanitizer appliqué sur les outils (types MAJUSCULES, champs interdits supprimés)
     """
     if user_prompt_id is None:
         user_prompt_id = str(uuid.uuid4())
@@ -81,13 +181,22 @@ def to_generate_content_request(
             "parts": [{"text": full_system_instruction}]
         }
     
-    # 3. PAS de generationConfig (gemini-cli ne l'inclut pas)
-    # 4. PAS de toolConfig (gemini-cli ne l'inclut pas)
+    # 3. generationConfig (REQUIS pour éviter erreur 500 - le payload fonctionnel l'inclut)
+    vertex_request["generationConfig"] = {
+        "temperature": temperature
+    }
     
-    # Outils (sans toolConfig)
+    # 4. Outils avec toolConfig conditionnel
+    # BLINDAGE ERREUR 500: toolConfig peut être requis pour éviter null pointer exceptions
     if tools and len(tools) > 0:
         vertex_request["tools"] = _convert_tools_to_gemini_format(tools)
-        # NE PAS ajouter toolConfig - gemini-cli ne le fait pas
+        # Ajouter toolConfig pour lever l'ambiguïté du mode d'exécution
+        # Mode AUTO: le modèle décide s'il doit appeler un outil ou générer du texte
+        vertex_request["toolConfig"] = {
+            "functionCallingConfig": {
+                "mode": "AUTO"
+            }
+        }
     
     # Optionnels (garder pour compatibilité mais généralement non utilisés par gemini-cli)
     if safety_settings:
@@ -170,18 +279,52 @@ def _content_to_parts(content: Any) -> List[Dict[str, Any]]:
 
 
 def _convert_tools_to_gemini_format(tools: List[Dict]) -> List[Dict[str, Any]]:
+    """
+    Convertit les outils au format Gemini FunctionDeclaration.
+    Applique le sanitizer pour garantir la compatibilité avec l'API v1internal.
+    """
     if not tools:
         return []
+    
     function_declarations = []
+    
     for tool in tools:
         if isinstance(tool, dict):
+            func_decl = None
+            
+            # Format OpenAI: {"type": "function", "function": {...}}
             if "type" in tool and tool.get("type") == "function" and "function" in tool:
                 func_def = tool["function"]
-                function_declarations.append({"name": func_def.get("name", ""), "description": func_def.get("description", ""), "parameters": func_def.get("parameters", {})})
+                func_decl = {
+                    "name": func_def.get("name", ""),
+                    "description": func_def.get("description", ""),
+                    "parameters": func_def.get("parameters", {})
+                }
+            
+            # Format Gemini: {"functionDeclarations": [...]}
             elif "functionDeclarations" in tool:
-                function_declarations.extend(tool["functionDeclarations"])
+                for decl in tool["functionDeclarations"]:
+                    sanitized_decl = {
+                        "name": decl.get("name", ""),
+                        "description": decl.get("description", ""),
+                        "parameters": sanitize_schema_for_codeassist(decl.get("parameters", {}))
+                    }
+                    function_declarations.append(sanitized_decl)
+                continue
+            
+            # Format direct: {"name": "...", "parameters": {...}}
             elif "name" in tool and "parameters" in tool:
-                function_declarations.append({"name": tool.get("name", ""), "description": tool.get("description", ""), "parameters": tool.get("parameters", {})})
+                func_decl = {
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("parameters", {})
+                }
+            
+            # Appliquer le sanitizer sur les paramètres
+            if func_decl:
+                func_decl["parameters"] = sanitize_schema_for_codeassist(func_decl["parameters"])
+                function_declarations.append(func_decl)
+    
     if function_declarations:
         return [{"functionDeclarations": function_declarations}]
     return []

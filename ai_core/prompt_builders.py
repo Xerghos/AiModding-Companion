@@ -1,367 +1,290 @@
-import re
+"""
+Constructeurs de prompts pour gemini-cli bridge.
+Gère la construction des prompts système et utilisateur pour l'intégration CLI.
+"""
+
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from features.UnifiedLogger import UnifiedLogger
 
 
 @dataclass
 class PromptBuildMeta:
+    """Métadonnées de construction de prompt."""
     total_chars: int
-    truncated: Dict[str, bool]
+    truncated: Dict[str, int]
     sizes: Dict[str, int]
 
 
-def _truncate(text: str, max_chars: int) -> Tuple[str, bool]:
-    if not text:
-        return "", False
-    if max_chars <= 0:
-        return "", True
-    if len(text) <= max_chars:
-        return text, False
-    # On garde le début (le plus informatif pour sections structurées) + marqueur.
-    marker = f"\n\n...[TRONQUÉ: {len(text) - max_chars} caractères]..."
-    keep = max(0, max_chars - len(marker))
-    return text[:keep] + marker, True
-
-
-def sanitize_system_instruction_for_cli(system_instruction: Optional[str]) -> str:
+def _truncate(text: str, max_length: int) -> Tuple[str, int]:
     """
-    Nettoie le system prompt issu du Swarm/Agent pour éviter les comportements indésirables
-    côté Gemini CLI (qui n’a pas de tool-calling intégré dans notre app).
-    """
-    if not system_instruction:
-        return ""
-
-    s = str(system_instruction)
-
-    # 1) Retirer le manuel d’outils (souvent très long et inadapté au mode CLI stateless)
-    #    Exemple bloc: --- 🛠️ MANUEL DES OUTILS AUTORISÉS --- ... (jusqu’au prochain --- ou fin)
-    s = re.sub(r"\n---\s*🛠️\s*MANUEL[\s\S]*?(?=\n---|\Z)", "\n", s, flags=re.MULTILINE)
-
-    # 2) Retirer les lignes qui incitent explicitement à appeler des outils
-    s = re.sub(r"^.*(!native_tool|native_tool|JSON natif|POUR UTILISER UN OUTIL).*?$", "", s, flags=re.MULTILINE | re.IGNORECASE)
-
-    # 3) Nettoyage espaces multiples
-    s = re.sub(r"\n{3,}", "\n\n", s).strip()
-    return s
-
-
-def build_cli_system_md(system_instruction: Optional[str], *, language: str = "fr", extra: str = "") -> str:
-    """
-    Contenu du fichier `.gemini/system.md` utilisé via `GEMINI_SYSTEM_MD`.
-    Objectif: remplacer le system prompt intégré du CLI (souvent orienté \"commande\")
-    par un comportement de chat cohérent avec AiModding-Companion.
-    """
-    base = sanitize_system_instruction_for_cli(system_instruction)
-
-    lang = (language or "fr").strip().lower()
-    lang_line = "Réponds en français." if lang.startswith("fr") else f"Respond in {language}."
-
-    guardrails = (
-        "IMPORTANT:\n"
-        "- Tu es un assistant conversationnel (pas un interpréteur de commandes).\n"
-        f"- {lang_line}\n"
-        "- N’invente pas d’outils, n’appelle pas de commandes, n’utilise pas de formats de tool-calling.\n"
-        "- Si une demande nécessite des actions sur le code, propose les étapes au lieu d’exécuter des commandes.\n"
-    )
-
-    extra_block = (extra or "").strip()
-    if extra_block:
-        extra_block = f"\n\n---\n\n{extra_block}\n"
-
-    if base:
-        return f"{base}\n\n---\n\n{guardrails}{extra_block}\n"
-    return guardrails + (extra_block + "\n" if extra_block else "\n")
-
-
-def _format_history(history: List[Dict[str, Any]], max_turns: int) -> str:
-    if not history:
-        return ""
-    # max_turns = nombre d'échanges (user+assistant) => 2*max_turns messages
-    tail = history[-(max_turns * 2):]
-    lines: List[str] = []
-    for msg in tail:
-        role = (msg.get("role") or "user").strip().lower()
-        content = msg.get("content") or ""
-        if not isinstance(content, str):
-            content = str(content)
-        if role == "assistant":
-            lines.append(f"Assistant: {content}")
-        else:
-            lines.append(f"User: {content}")
-    formatted = "\n".join(lines).strip()
+    Tronque un texte à une longueur maximale.
     
-    # Log pour diagnostic
-    import logging
-    log = logging.getLogger("Features.prompt_builders")
-    log.debug(f"📝 Historique formaté: {len(history)} messages totaux, {len(tail)} messages sélectionnés (max_turns={max_turns}), {len(formatted)} caractères")
-    
-    return formatted
-
-
-def _detect_query_type(query: str) -> str:
-    """
-    Détecte le type de requête pour adapter l'allocation de contexte.
-    
-    Retourne: "code", "concept", "debug", "refactor", "general"
-    """
-    query_lower = query.lower()
-    
-    # Mots-clés pour chaque type
-    code_keywords = ['écris', 'écrire', 'code', 'fonction', 'classe', 'méthode', 'implémenter', 'créer', 'ajouter']
-    concept_keywords = ['explique', 'expliquer', 'comment', 'pourquoi', 'qu\'est-ce', 'définir', 'concept']
-    debug_keywords = ['erreur', 'bug', 'ne fonctionne pas', 'problème', 'corriger', 'fix', 'débugger', 'debug']
-    refactor_keywords = ['refactoriser', 'refactor', 'améliorer', 'optimiser', 'réorganiser', 'restructurer']
-    
-    # Compter les occurrences de chaque type
-    code_score = sum(1 for kw in code_keywords if kw in query_lower)
-    concept_score = sum(1 for kw in concept_keywords if kw in query_lower)
-    debug_score = sum(1 for kw in debug_keywords if kw in query_lower)
-    refactor_score = sum(1 for kw in refactor_keywords if kw in query_lower)
-    
-    # Déterminer le type dominant
-    scores = {
-        'code': code_score,
-        'concept': concept_score,
-        'debug': debug_score,
-        'refactor': refactor_score
-    }
-    max_score = max(scores.values())
-    
-    if max_score > 0:
-        # Retourner le type avec le score le plus élevé
-        for qtype, score in scores.items():
-            if score == max_score:
-                return qtype
-    
-    # Par défaut, analyser la longueur et la structure
-    if len(query) < 30:
-        return "general"
-    elif '?' in query or query_lower.startswith(('pourquoi', 'comment', 'qu\'est')):
-        return "concept"
-    else:
-        return "code"
-
-
-def build_cli_prompt_split(
-    *,
-    message: str,
-    rag_context: Optional[str],
-    history: List[Dict[str, Any]],
-    cache_components: Optional[Dict[str, str]] = None,
-    max_history_turns: int = 3,
-    limits: Optional[Dict[str, int]] = None,
-    defer_message: bool = False,
-) -> Tuple[str, str, PromptBuildMeta]:
-    """
-    Version optimisée de build_cli_prompt qui sépare les parties statique et dynamique.
+    Args:
+        text: Texte à tronquer
+        max_length: Longueur maximale
     
     Returns:
-        Tuple[static_part, dynamic_part, meta]
-        - static_part: Repo Map/Arch, Tree, LTM (mis en cache, ~15-18 KB)
-        - dynamic_part: RAG Context, History, Message (change à chaque requête, ~3-4 KB)
-        - meta: Métadonnées de construction
+        Tuple (texte_tronqué, nombre_caractères_tronqués)
     """
-    # Détecter le type de requête pour allocation adaptative
-    query_type = _detect_query_type(message if isinstance(message, str) else str(message))
-    
-    # Allocation de base
-    limits = limits or {}
-    total_max = int(limits.get("total", 24000))
-    base_arch_max = int(limits.get("arch", 7000))
-    base_tree_max = int(limits.get("tree", 7000))
-    base_ltm_max = int(limits.get("ltm", 5000))
-    base_rag_max = int(limits.get("rag", 8000))
-    base_history_max = int(limits.get("history", 6000))
-    message_max = int(limits.get("message", 6000))
-    
-    # Allocation adaptative selon le type de requête
-    if query_type == "code":
-        arch_max = int(base_arch_max * 1.2)
-        tree_max = int(base_tree_max * 1.1)
-        ltm_max = int(base_ltm_max * 0.7)
-        rag_max = base_rag_max
-        history_max = base_history_max
-    elif query_type == "concept":
-        arch_max = base_arch_max
-        tree_max = int(base_tree_max * 0.7)
-        ltm_max = int(base_ltm_max * 1.3)
-        rag_max = base_rag_max
-        history_max = int(base_history_max * 1.1)
-    elif query_type == "debug":
-        arch_max = int(base_arch_max * 0.8)
-        tree_max = base_tree_max
-        ltm_max = base_ltm_max
-        rag_max = int(base_rag_max * 1.3)
-        history_max = base_history_max
-    elif query_type == "refactor":
-        arch_max = int(base_arch_max * 1.1)
-        tree_max = base_tree_max
-        ltm_max = int(base_ltm_max * 0.8)
-        rag_max = int(base_rag_max * 1.1)
-        history_max = base_history_max
-    else:  # general
-        arch_max = base_arch_max
-        tree_max = base_tree_max
-        ltm_max = base_ltm_max
-        rag_max = base_rag_max
-        history_max = base_history_max
+    if len(text) <= max_length:
+        return text, 0
+    return text[:max_length], len(text) - max_length
 
-    comps = cache_components or {}
-    # Utiliser repo_map si disponible, sinon arch
-    repo_map_raw = comps.get("repo_map")
-    repo_map = str(repo_map_raw) if repo_map_raw else ""
-    
-    arch_raw = comps.get("arch")
-    arch = str(arch_raw) if arch_raw and not repo_map else ""
-    
-    tree_raw = comps.get("tree")
-    tree = str(tree_raw) if tree_raw else ""
-    
-    ltm_raw = comps.get("ltm")
-    ltm = str(ltm_raw) if ltm_raw else ""
 
-    # Troncatures par bloc (avec repo_map si disponible) - PARTIE STATIQUE
-    if repo_map:
-        repo_map_t, repo_map_tr = _truncate(repo_map, arch_max)
-        arch_t, arch_tr = "", False
-    else:
-        repo_map_t, repo_map_tr = "", False
-        arch_t, arch_tr = _truncate(arch, arch_max)
-    tree_t, tree_tr = _truncate(tree, tree_max)
-    ltm_t, ltm_tr = _truncate(ltm, ltm_max)
+def build_cli_system_md(
+    system_instruction: Optional[str] = None,
+    language: str = "fr",
+    extra: Optional[str] = None
+) -> str:
+    """
+    Construit le fichier system.md pour gemini-cli.
     
-    # Construire la partie STATIQUE (Repo Map/Arch, Tree, LTM)
-    static_parts: List[str] = []
-    static_parts.append("=== CONTEXTE PROJET (AUTOMATIQUE) ===")
-    if repo_map_t:
-        static_parts.append(repo_map_t)
-    elif arch_t:
-        static_parts.append(arch_t)
-    if tree_t:
-        static_parts.append(tree_t)
-    if ltm_t:
-        static_parts.append(ltm_t)
+    Args:
+        system_instruction: Instruction système de base
+        language: Langue (fr/en)
+        extra: Contenu additionnel
     
-    static_part = "\n\n".join([str(p) for p in static_parts if p]).strip()
+    Returns:
+        Contenu du fichier system.md
+    """
+    parts = []
     
-    # PARTIE DYNAMIQUE (RAG Context, History, Message)
-    rag_context_str = ""
-    if rag_context:
-        if isinstance(rag_context, dict):
-            if "docs" in rag_context:
-                rag_context_str = str(rag_context["docs"])
-            else:
-                rag_context_str = str(rag_context)
-        else:
-            rag_context_str = str(rag_context)
+    if system_instruction:
+        parts.append(system_instruction)
     
-    rag_t, rag_tr = _truncate(rag_context_str, rag_max)
-    hist_raw = _format_history(history, max_turns=max_history_turns)
-    hist_t, hist_tr = _truncate(hist_raw, history_max)
+    if extra:
+        parts.append(extra)
     
-    if defer_message:
-        msg_t, msg_tr = "", False
-    else:
-        msg_t, msg_tr = _truncate(message if isinstance(message, str) else str(message), message_max)
-
-    dynamic_parts: List[str] = []
-    if rag_t:
-        dynamic_parts.append("=== 📂 RAG CONTEXT (DOCS) ===")
-        dynamic_parts.append(rag_t)
-    if hist_t:
-        dynamic_parts.append("=== HISTORIQUE RÉCENT ===")
-        dynamic_parts.append(hist_t)
-    dynamic_parts.append("=== MESSAGE ACTUEL ===")
-    if not defer_message:
-        dynamic_parts.append(msg_t)
-    
-    dynamic_part = "\n\n".join([str(p) for p in dynamic_parts if p]).strip()
-    
-    # Concaténer pour le prompt complet (pour compatibilité avec build_cli_prompt)
-    full_prompt = static_part
-    if dynamic_part:
-        if full_prompt:
-            full_prompt = f"{full_prompt}\n\n{dynamic_part}"
-        else:
-            full_prompt = dynamic_part
-    
-    # Contrôle total (si on dépasse, on coupe depuis les sections les moins critiques)
-    truncated: Dict[str, bool] = {
-        "repo_map": repo_map_tr,
-        "arch": arch_tr,
-        "tree": tree_tr,
-        "ltm": ltm_tr,
-        "rag": rag_tr,
-        "history": hist_tr,
-        "message": msg_tr,
-        "total": False,
-    }
-
-    if len(full_prompt) > total_max:
-        full_prompt, total_tr = _truncate(full_prompt, total_max)
-        truncated["total"] = total_tr
-        # Si tronqué au total, on doit aussi tronquer les parties
-        if len(static_part) + len(dynamic_part) > total_max:
-            # Prioriser la partie statique, tronquer la dynamique si nécessaire
-            available_for_dynamic = max(0, total_max - len(static_part))
-            if len(dynamic_part) > available_for_dynamic:
-                dynamic_part, _ = _truncate(dynamic_part, available_for_dynamic)
-
-    sizes: Dict[str, int] = {
-        "repo_map": len(repo_map_t),
-        "arch": len(arch_t),
-        "tree": len(tree_t),
-        "ltm": len(ltm_t),
-        "rag": len(rag_t),
-        "history": len(hist_t),
-        "message": len(msg_t),
-    }
-
-    meta = PromptBuildMeta(
-        total_chars=len(full_prompt),
-        truncated=truncated,
-        sizes=sizes,
-    )
-
-    return static_part, dynamic_part, meta
+    return "\n\n".join(parts) if parts else ""
 
 
 def build_cli_prompt(
-    *,
     message: str,
-    rag_context: Optional[str],
-    history: List[Dict[str, Any]],
-    cache_components: Optional[Dict[str, str]] = None,
-    max_history_turns: int = 3,
-    limits: Optional[Dict[str, int]] = None,
-    defer_message: bool = False,
+    rag_context: Optional[Any] = None,
+    history: Optional[List[Dict[str, Any]]] = None,
+    cache_components: Optional[Dict[str, Any]] = None,
+    max_history_turns: int = 10,
+    limits: Optional[Dict[str, int]] = None
 ) -> Tuple[str, PromptBuildMeta]:
     """
-    Builder stateless (texte) pour `gemini prompt`.
-    Produit un prompt structuré façon DeepSeek: instructions + arch/tree + RAG + historique + message.
+    Construit le prompt complet pour gemini-cli.
     
-    Note: Utilise build_cli_prompt_split() en interne pour la rétrocompatibilité.
+    Args:
+        message: Message utilisateur
+        rag_context: Contexte RAG
+        history: Historique des messages
+        cache_components: Composants du cache (arch, tree, ltm, etc.)
+        max_history_turns: Nombre max de tours d'historique
+        limits: Limites de troncature
+    
+    Returns:
+        Tuple (prompt_complet, métadonnées)
     """
-    static_part, dynamic_part, meta = build_cli_prompt_split(
-        message=message,
-        rag_context=rag_context,
-        history=history,
-        cache_components=cache_components,
-        max_history_turns=max_history_turns,
-        limits=limits,
-        defer_message=defer_message,
+    if limits is None:
+        limits = {}
+    
+    parts = []
+    truncated = {}
+    sizes = {}
+    
+    # Ajouter les composants du cache
+    if cache_components:
+        if cache_components.get("arch"):
+            arch_text = str(cache_components["arch"])
+            arch_truncated, arch_trunc = _truncate(arch_text, limits.get("arch", 10000))
+            parts.append(f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_truncated}")
+            if arch_trunc > 0:
+                truncated["arch"] = arch_trunc
+            sizes["arch"] = len(arch_text)
+        
+        if cache_components.get("tree"):
+            tree_text = str(cache_components["tree"])
+            tree_truncated, tree_trunc = _truncate(tree_text, limits.get("tree", 5000))
+            parts.append(f"--- ARBORESCENCE PROJET ---\n{tree_truncated}")
+            if tree_trunc > 0:
+                truncated["tree"] = tree_trunc
+            sizes["tree"] = len(tree_text)
+        
+        if cache_components.get("ltm"):
+            ltm_text = str(cache_components["ltm"])
+            ltm_truncated, ltm_trunc = _truncate(ltm_text, limits.get("ltm", 3000))
+            parts.append(f"--- 📜 MÉMOIRE LONG TERME (Résumé Consolidé) ---\n{ltm_truncated}")
+            if ltm_trunc > 0:
+                truncated["ltm"] = ltm_trunc
+            sizes["ltm"] = len(ltm_text)
+    
+    # Ajouter le contexte RAG
+    if rag_context:
+        if isinstance(rag_context, dict):
+            if rag_context.get("docs"):
+                docs_text = str(rag_context["docs"])
+                docs_truncated, docs_trunc = _truncate(docs_text, limits.get("rag", 5000))
+                parts.append(f"--- 📂 CONTEXTE RAG PERTINENT ---\n{docs_truncated}")
+                if docs_trunc > 0:
+                    truncated["rag"] = docs_trunc
+                sizes["rag"] = len(docs_text)
+        else:
+            rag_text = str(rag_context)
+            rag_truncated, rag_trunc = _truncate(rag_text, limits.get("rag", 5000))
+            parts.append(f"--- 📂 CONTEXTE RAG PERTINENT ---\n{rag_truncated}")
+            if rag_trunc > 0:
+                truncated["rag"] = rag_trunc
+            sizes["rag"] = len(rag_text)
+    
+    # Ajouter l'historique
+    if history:
+        history_parts = []
+        history_turns = history[-max_history_turns:] if len(history) > max_history_turns else history
+        
+        for msg in history_turns:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user":
+                history_parts.append(f"User: {content}")
+            elif role in ("assistant", "model"):
+                history_parts.append(f"Assistant: {content}")
+        
+        if history_parts:
+            history_text = "\n".join(history_parts)
+            history_truncated, history_trunc = _truncate(history_text, limits.get("history", 8000))
+            parts.append(f"--- HISTORIQUE RÉCENT ---\n{history_truncated}")
+            if history_trunc > 0:
+                truncated["history"] = history_trunc
+            sizes["history"] = len(history_text)
+    
+    # Ajouter le message utilisateur
+    if message:
+        msg_truncated, msg_trunc = _truncate(message, limits.get("message", 6000))
+        parts.append(f"--- MESSAGE ACTUEL ---\n\n{msg_truncated}")
+        if msg_trunc > 0:
+            truncated["message"] = msg_trunc
+        sizes["message"] = len(message)
+    
+    prompt = "\n\n".join(parts)
+    total_chars = len(prompt)
+    
+    meta = PromptBuildMeta(
+        total_chars=total_chars,
+        truncated=truncated,
+        sizes=sizes
     )
     
-    # Concaténer les parties pour retourner le prompt complet
-    if static_part and dynamic_part:
-        prompt = f"{static_part}\n\n{dynamic_part}"
-    elif static_part:
-        prompt = static_part
-    elif dynamic_part:
-        prompt = dynamic_part
-    else:
-        prompt = ""
+    return prompt, meta
+
+
+def build_cli_prompt_split(
+    message: str,
+    rag_context: Optional[Any] = None,
+    history: Optional[List[Dict[str, Any]]] = None,
+    cache_components: Optional[Dict[str, Any]] = None,
+    max_history_turns: int = 10,
+    limits: Optional[Dict[str, int]] = None,
+    defer_message: bool = False
+) -> Tuple[str, str, PromptBuildMeta]:
+    """
+    Construit le prompt en deux parties : statique et dynamique.
     
-    return prompt.strip(), meta
-
-
+    Args:
+        message: Message utilisateur
+        rag_context: Contexte RAG
+        history: Historique des messages
+        cache_components: Composants du cache
+        max_history_turns: Nombre max de tours d'historique
+        limits: Limites de troncature
+        defer_message: Si True, ne pas inclure le message dans la partie statique
+    
+    Returns:
+        Tuple (partie_statique, partie_dynamique, métadonnées)
+    """
+    if limits is None:
+        limits = {}
+    
+    static_parts = []
+    dynamic_parts = []
+    truncated = {}
+    sizes = {}
+    
+    # Partie statique : composants du cache (arch, tree, ltm)
+    if cache_components:
+        if cache_components.get("arch"):
+            arch_text = str(cache_components["arch"])
+            arch_truncated, arch_trunc = _truncate(arch_text, limits.get("arch", 10000))
+            static_parts.append(f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_truncated}")
+            if arch_trunc > 0:
+                truncated["arch"] = arch_trunc
+            sizes["arch"] = len(arch_text)
+        
+        if cache_components.get("tree"):
+            tree_text = str(cache_components["tree"])
+            tree_truncated, tree_trunc = _truncate(tree_text, limits.get("tree", 5000))
+            static_parts.append(f"--- ARBORESCENCE PROJET ---\n{tree_truncated}")
+            if tree_trunc > 0:
+                truncated["tree"] = tree_trunc
+            sizes["tree"] = len(tree_text)
+        
+        if cache_components.get("ltm"):
+            ltm_text = str(cache_components["ltm"])
+            ltm_truncated, ltm_trunc = _truncate(ltm_text, limits.get("ltm", 3000))
+            static_parts.append(f"--- 📜 MÉMOIRE LONG TERME (Résumé Consolidé) ---\n{ltm_truncated}")
+            if ltm_trunc > 0:
+                truncated["ltm"] = ltm_trunc
+            sizes["ltm"] = len(ltm_text)
+    
+    # Partie dynamique : RAG, historique, message
+    if rag_context:
+        if isinstance(rag_context, dict):
+            if rag_context.get("docs"):
+                docs_text = str(rag_context["docs"])
+                docs_truncated, docs_trunc = _truncate(docs_text, limits.get("rag", 5000))
+                dynamic_parts.append(f"--- 📂 CONTEXTE RAG PERTINENT ---\n{docs_truncated}")
+                if docs_trunc > 0:
+                    truncated["rag"] = docs_trunc
+                sizes["rag"] = len(docs_text)
+        else:
+            rag_text = str(rag_context)
+            rag_truncated, rag_trunc = _truncate(rag_text, limits.get("rag", 5000))
+            dynamic_parts.append(f"--- 📂 CONTEXTE RAG PERTINENT ---\n{rag_truncated}")
+            if rag_trunc > 0:
+                truncated["rag"] = rag_trunc
+            sizes["rag"] = len(rag_text)
+    
+    if history:
+        history_parts = []
+        history_turns = history[-max_history_turns:] if len(history) > max_history_turns else history
+        
+        for msg in history_turns:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user":
+                history_parts.append(f"User: {content}")
+            elif role in ("assistant", "model"):
+                history_parts.append(f"Assistant: {content}")
+        
+        if history_parts:
+            history_text = "\n".join(history_parts)
+            history_truncated, history_trunc = _truncate(history_text, limits.get("history", 8000))
+            dynamic_parts.append(f"--- HISTORIQUE RÉCENT ---\n{history_truncated}")
+            if history_trunc > 0:
+                truncated["history"] = history_trunc
+            sizes["history"] = len(history_text)
+    
+    if message and not defer_message:
+        msg_truncated, msg_trunc = _truncate(message, limits.get("message", 6000))
+        dynamic_parts.append(f"--- MESSAGE ACTUEL ---\n\n{msg_truncated}")
+        if msg_trunc > 0:
+            truncated["message"] = msg_trunc
+        sizes["message"] = len(message)
+    
+    static_part = "\n\n".join(static_parts) if static_parts else ""
+    dynamic_part = "\n\n".join(dynamic_parts) if dynamic_parts else ""
+    
+    total_chars = len(static_part) + len(dynamic_part)
+    
+    meta = PromptBuildMeta(
+        total_chars=total_chars,
+        truncated=truncated,
+        sizes=sizes
+    )
+    
+    return static_part, dynamic_part, meta

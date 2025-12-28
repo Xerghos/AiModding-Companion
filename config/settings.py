@@ -151,7 +151,8 @@ DEFAULT_SETTINGS = {
         "NETWORK": True,
         "UI": False,
         "FILES": True,
-        "AUDIO": False
+        "AUDIO": False,
+        "SYMBOL_GRAPH": False
     },
     "automation": {
         "arch_update_interval": 900,
@@ -310,8 +311,9 @@ LOG_SOURCE_MAP = {
     "factory": "SYSTEM", "core": "SYSTEM", "run": "SYSTEM", "settings": "SETTINGS", "config": "SYSTEM",
     "features.UnifiedLogger": "SYSTEM",
     "worker.core": "WORKER", "swarm_manager": "WORKER", "agent_personas": "WORKER", "Worker": "WORKER",
-    "SemanticMemory": "MEMORY", "features.context": "MEMORY", "database": "DATABASE", "rag": "MEMORY",
+    "SemanticMemory": "MEMORY", "features.context": "MEMORY", "features.context.symbol_graph": "SYMBOL_GRAPH", "database": "DATABASE", "rag": "MEMORY",
     "features.SemanticMemory": "MEMORY", "features.context.database": "DATABASE", "sqlite": "DATABASE",
+    "symbol_graph": "SYMBOL_GRAPH",
     "github": "NETWORK", "keys": "NETWORK", "ai_core.keys": "NETWORK", "google_api": "NETWORK",
     "main_window": "UI", "widgets": "UI", "syntax": "UI", "explorer": "UI", "ui.main_window": "UI",
     "BackupManager": "FILES", "ProjectManager": "FILES", "FileSystem": "FILES", "core_backup": "FILES",

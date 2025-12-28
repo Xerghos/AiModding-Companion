@@ -138,26 +138,42 @@ class UnifiedLogger:
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         timestamp_full = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         
-        # 1. ÉCRITURE FICHIER (Complet & Technique)
-        log_entry = f"[{timestamp}] [{threading.current_thread().name:<15}] [{source:<15}] [{msg_type:<10}] {message}"
-        if data:
-            try:
-                if isinstance(data, str):
-                    log_entry += f"\nData: {data}"
-                else:
-                    safe_data = json.dumps(data, default=str, indent=2)
-                    log_entry += f"\n{safe_data}"
-            except:
-                log_entry += f"\n[Data Error]: {str(data)[:100]}"
+        # Vérification si le canal est activé (même logique que pour le terminal)
+        should_log = True
+        is_important = msg_type in ["ERROR", "CRITICAL", "BAN", "WARNING", "FAIL", "METRICS"]
         
-        log_entry += "\n" + "-"*80 + "\n"
-
-        with LOCK:
+        if not is_important:
             try:
-                log_file_path = _get_or_create_log_file()
-                with open(log_file_path, "a", encoding="utf-8") as f:
-                    f.write(log_entry)
-            except: pass
+                from config.settings import LOGGING_CHANNELS, LOG_SOURCE_MAP
+                clean_source = source.split(".")[-1]
+                channel = LOG_SOURCE_MAP.get(source) or LOG_SOURCE_MAP.get(clean_source) or "SYSTEM"
+                
+                if not LOGGING_CHANNELS.get(channel, True):
+                    should_log = False
+            except ImportError:
+                should_log = True
+        
+        # 1. ÉCRITURE FICHIER (Complet & Technique) - seulement si le canal est activé
+        if should_log:
+            log_entry = f"[{timestamp}] [{threading.current_thread().name:<15}] [{source:<15}] [{msg_type:<10}] {message}"
+            if data:
+                try:
+                    if isinstance(data, str):
+                        log_entry += f"\nData: {data}"
+                    else:
+                        safe_data = json.dumps(data, default=str, indent=2)
+                        log_entry += f"\n{safe_data}"
+                except:
+                    log_entry += f"\n[Data Error]: {str(data)[:100]}"
+            
+            log_entry += "\n" + "-"*80 + "\n"
+
+            with LOCK:
+                try:
+                    log_file_path = _get_or_create_log_file()
+                    with open(log_file_path, "a", encoding="utf-8") as f:
+                        f.write(log_entry)
+                except: pass
 
         # 2. AFFICHAGE TERMINAL (Design & Metrics)
         UnifiedLogger._print_beautified(timestamp, source, msg_type, message, data)
