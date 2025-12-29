@@ -670,10 +670,16 @@ class CodeAssistClient:
         
         # Log des outils si présents
         if tools:
+            # Compter le nombre réel de fonctions
+            total_funcs = 0
+            for tool in tools:
+                if "functionDeclarations" in tool:
+                    total_funcs += len(tool["functionDeclarations"])
+            
             UnifiedLogger.write(
                 "AI_CORE",
                 "DEBUG",
-                f"Outils passés à CodeAssist: {len(tools)} outils"
+                f"Outils passés à CodeAssist: {total_funcs} fonctions (dans {len(tools)} groupe(s))"
             )
             try:
                 tools_str = json.dumps(tools, indent=2, ensure_ascii=False)
