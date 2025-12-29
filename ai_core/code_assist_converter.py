@@ -221,6 +221,10 @@ def to_generate_content_request(
         vertex_request["labels"] = labels
     if cached_content:
         vertex_request["cachedContent"] = cached_content
+        
+    # Ajout du session_id dans la requête (comme dans gemini_cli_captured_payload.json)
+    if session_id:
+        vertex_request["session_id"] = session_id
     
     # Construire la requête CodeAssist finale avec OrderedDict pour garantir l'ordre exact
     # ORDRE CRITIQUE : model → project → user_prompt_id → request (comme payload capturé gemini-cli)

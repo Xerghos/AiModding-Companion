@@ -593,7 +593,9 @@ class CodeAssistClient:
             Réponse de l'API ou générateur si stream=True
         """
         import uuid
-        user_prompt_id = str(uuid.uuid4())
+        import os
+        # Format Gemini CLI: hex string de 14 caractères (ex: "c59ec6dbb5bc58")
+        user_prompt_id = os.urandom(7).hex()
 
         # Mapper les paramètres camelCase vers snake_case pour compatibilité
         # Aligné sur les paramètres Vertex AI/Code Assist
