@@ -236,19 +236,33 @@ def to_generate_content_request(
 
 
 def from_generate_content_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    # L'API CodeAssist encapsule la réponse Gemini dans un champ "response"
     inner_response = response.get("response", {})
     trace_id = response.get("traceId")
-    gemini_response: Dict[str, Any] = {"candidates": inner_response.get("candidates", [])}
+    
+    # Construire l'objet compatible Gemini API
+    gemini_response: Dict[str, Any] = {
+        "candidates": inner_response.get("candidates", [])
+    }
+    
+    # Extraire les métadonnées de haut niveau
     if "promptFeedback" in inner_response:
         gemini_response["promptFeedback"] = inner_response["promptFeedback"]
+    
+    # METRICS: CodeAssist peut mettre usageMetadata dans inner_response ou directement dans candidates[0]
     if "usageMetadata" in inner_response:
         gemini_response["usageMetadata"] = inner_response["usageMetadata"]
+    elif gemini_response["candidates"] and "usageMetadata" in gemini_response["candidates"][0]:
+        gemini_response["usageMetadata"] = gemini_response["candidates"][0]["usageMetadata"]
+        
     if "modelVersion" in inner_response:
         gemini_response["modelVersion"] = inner_response["modelVersion"]
     if "automaticFunctionCallingHistory" in inner_response:
         gemini_response["automaticFunctionCallingHistory"] = inner_response["automaticFunctionCallingHistory"]
+    
     if trace_id:
         gemini_response["responseId"] = trace_id
+        
     return gemini_response
 
 

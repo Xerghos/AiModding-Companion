@@ -764,6 +764,18 @@ class CodeAssistClient:
                                 chunk_obj = ChunkObject(choice)
                                 
                                 yield chunk_obj
+                    
+                    # LOGGING DES METRICS (Usage Metadata)
+                    if "usageMetadata" in gemini_chunk:
+                        usage = gemini_chunk["usageMetadata"]
+                        prompt_tokens = usage.get("promptTokenCount", 0)
+                        candidates_tokens = usage.get("candidatesTokenCount", 0)
+                        total_tokens = usage.get("totalTokenCount", 0)
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "METRICS",
+                            f"📊 Usage: Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
+                        )
                 
                 # Dernier chunk avec le texte complet
                 if full_text:
