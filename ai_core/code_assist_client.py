@@ -262,10 +262,29 @@ class CodeAssistClient:
                 except Exception as log_err:
                     UnifiedLogger.write("AI_CORE", "WARN", f"Echec logging payload final: {log_err}")
 
+            # Solution 1 : Sérialisation manuelle JSON pour garantir l'ordre exact des clés
+            payload_json = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+            payload_size = len(payload_json.encode('utf-8'))
+            
+            # Solution 4 : Logging détaillé du JSON sérialisé + vérification ordre des clés
+            request_data = payload.get("request", {})
+            request_keys = list(request_data.keys()) if isinstance(request_data, dict) else []
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Payload JSON sérialisé: {payload_size} bytes, ordre clés dans request: {request_keys}"
+            )
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Preview JSON (1000 chars): {payload_json[:1000]}"
+            )
+
             try:
+                # Envoyer le JSON sérialisé manuellement pour garantir l'ordre exact
                 response = requests.post(
                     url,
-                    json=payload,
+                    data=payload_json.encode('utf-8'),
                     headers=headers,
                     timeout=300  # 5 minutes timeout
                 )
@@ -394,10 +413,29 @@ class CodeAssistClient:
                 except Exception as log_err:
                     UnifiedLogger.write("AI_CORE", "WARN", f"Echec logging payload final: {log_err}")
 
+            # Solution 1 : Sérialisation manuelle JSON pour garantir l'ordre exact des clés
+            payload_json = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+            payload_size = len(payload_json.encode('utf-8'))
+            
+            # Solution 4 : Logging détaillé du JSON sérialisé + vérification ordre des clés
+            request_data = payload.get("request", {})
+            request_keys = list(request_data.keys()) if isinstance(request_data, dict) else []
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Payload JSON sérialisé: {payload_size} bytes, ordre clés dans request: {request_keys}"
+            )
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Preview JSON (1000 chars): {payload_json[:1000]}"
+            )
+
             try:
+                # Envoyer le JSON sérialisé manuellement pour garantir l'ordre exact
                 response = requests.post(
                     url,
-                    json=payload,
+                    data=payload_json.encode('utf-8'),
                     headers=headers,
                     params=params,
                     stream=True,

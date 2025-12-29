@@ -14,6 +14,7 @@ BLINDAGE ERREUR 500:
 """
 
 from typing import Dict, List, Any, Optional, Union
+from collections import OrderedDict
 import uuid
 
 
@@ -173,8 +174,9 @@ def to_generate_content_request(
             elif role in ("assistant", "model"):
                 all_text_parts.append(f"\nAssistant:\n{content}")
     
-    # Construire le payload request
-    vertex_request: Dict[str, Any] = {"contents": contents}  # VIDE!
+    # Construire le payload request avec OrderedDict pour garantir l'ordre exact
+    vertex_request = OrderedDict()
+    vertex_request["contents"] = contents  # VIDE!
     
     if all_text_parts:
         full_system_instruction = "\n\n".join(all_text_parts)
@@ -198,7 +200,7 @@ def to_generate_content_request(
     # 4. generationConfig EN DERNIER (REQUIS - ordre critique pour API v1internal)
     # Le payload fonctionnel gemini-cli place generationConfig après tools/toolConfig
     vertex_request["generationConfig"] = {
-        "temperature": temperature
+        "temperature": float(temperature)  # Forcer float explicite
     }
     
     # Optionnels (garder pour compatibilité mais généralement non utilisés par gemini-cli)
@@ -209,8 +211,10 @@ def to_generate_content_request(
     if cached_content:
         vertex_request["cachedContent"] = cached_content
     
-    # Construire la requête CodeAssist finale
-    ca_request: Dict[str, Any] = {"model": model, "request": vertex_request}
+    # Construire la requête CodeAssist finale avec OrderedDict pour garantir l'ordre exact
+    ca_request = OrderedDict()
+    ca_request["model"] = model
+    ca_request["request"] = vertex_request
     if project_id:
         ca_request["project"] = project_id
     if user_prompt_id:
