@@ -27,6 +27,60 @@ import uuid
 FORBIDDEN_SCHEMA_FIELDS = {"title", "default", "examples", "additionalProperties", "$schema", "$id", "$ref"}
 
 
+def _build_ordered_schema(schema: Dict[str, Any], use_uppercase: bool = False) -> OrderedDict:
+    """
+    Construit un schéma avec l'ordre exact : properties → required → type
+    (comme dans le payload gemini-cli fonctionnel)
+    
+    Args:
+        schema: Le schéma JSON à ordonner
+        use_uppercase: Si True, convertit les types en MAJUSCULES (pour "parameters"), sinon garde minuscules (pour "parametersJsonSchema")
+    
+    Returns:
+        OrderedDict avec l'ordre : properties → required → type
+    """
+    result = OrderedDict()
+    
+    # 1. properties EN PREMIER
+    if "properties" in schema:
+        result["properties"] = sanitize_schema_for_codeassist(schema["properties"], use_uppercase=use_uppercase)
+    
+    # 2. required EN DEUXIÈME
+    if "required" in schema:
+        result["required"] = schema["required"]
+    
+    # 3. type EN DERNIER
+    if "type" in schema:
+        type_val = schema["type"]
+        if isinstance(type_val, str):
+            result["type"] = type_val.upper() if use_uppercase else type_val.lower()
+        elif isinstance(type_val, list):
+            # Type union (ex: ["string", "null"]) - prendre le premier non-null
+            non_null_types = [t for t in type_val if t != "null"]
+            if non_null_types:
+                result["type"] = non_null_types[0].upper() if use_uppercase else non_null_types[0].lower()
+            else:
+                result["type"] = "STRING" if use_uppercase else "string"  # Fallback
+        else:
+            result["type"] = type_val
+    
+    # Autres champs (items, enum, etc.) - les ajouter après type
+    for key, value in schema.items():
+        if key not in ("properties", "required", "type"):
+            # Supprimer les champs interdits
+            if key in FORBIDDEN_SCHEMA_FIELDS:
+                continue
+            # Traitement récursif pour les autres dicts
+            if isinstance(value, dict):
+                result[key] = sanitize_schema_for_codeassist(value, use_uppercase=use_uppercase)
+            elif isinstance(value, list):
+                result[key] = [sanitize_schema_for_codeassist(item, use_uppercase=use_uppercase) if isinstance(item, dict) else item for item in value]
+            else:
+                result[key] = value
+    
+    return result
+
+
 def sanitize_schema_for_codeassist(schema: Any, _depth: int = 0, use_uppercase: bool = False) -> Any:
     """
     Sanitize récursivement un schéma JSON pour le rendre compatible avec l'API v1internal.
@@ -198,19 +252,45 @@ def to_generate_content_request(
     # 4. generationConfig EN DERNIER (REQUIS - ordre critique pour API v1internal)
     # Le payload fonctionnel gemini-cli place generationConfig après tools/toolConfig
     # Utiliser OrderedDict pour garantir l'ordre exact des clés
+    
+    # Détecter si le modèle est gemini-3
+    is_gemini3 = "gemini-3" in model.lower()
+    
+    # Température : 1.0 pour gemini-3, sinon utiliser la valeur fournie
+    final_temperature = float(1.0 if is_gemini3 else temperature)
+    
+    # Construire generationConfig avec tous les paramètres (comme gemini-cli)
     gen_config = OrderedDict([
-        ("temperature", float(temperature))  # Forcer float explicite
+        ("temperature", final_temperature),
+        ("topP", float(kwargs.get("top_p", 0.95))),  # Toujours inclure (valeur par défaut gemini-cli)
+        ("topK", int(kwargs.get("top_k", 64)))  # Toujours inclure (valeur par défaut gemini-cli)
     ])
-
+    
+    # Pour gemini-3 : toujours inclure thinkingConfig
+    if is_gemini3:
+        # Si thinking_config est fourni dans kwargs, l'utiliser, sinon utiliser les valeurs par défaut
+        if "thinking_config" in kwargs:
+            thinking_config = kwargs["thinking_config"]
+            if isinstance(thinking_config, dict):
+                gen_config["thinkingConfig"] = OrderedDict([
+                    ("includeThoughts", thinking_config.get("includeThoughts", True)),
+                    ("thinkingLevel", thinking_config.get("thinkingLevel", "HIGH"))
+                ])
+            else:
+                gen_config["thinkingConfig"] = thinking_config
+        else:
+            # Valeurs par défaut pour gemini-3 (comme dans gemini-cli)
+            gen_config["thinkingConfig"] = OrderedDict([
+                ("includeThoughts", True),
+                ("thinkingLevel", "HIGH")
+            ])
+    elif "thinking_config" in kwargs:
+        # Pour les modèles non-gemini-3, inclure seulement si explicitement fourni
+        gen_config["thinkingConfig"] = kwargs["thinking_config"]
+    
+    # maxOutputTokens (optionnel)
     if max_tokens is not None:
         gen_config["maxOutputTokens"] = int(max_tokens)
-    
-    if "top_p" in kwargs:
-        gen_config["topP"] = float(kwargs["top_p"])
-    if "top_k" in kwargs:
-        gen_config["topK"] = int(kwargs["top_k"])
-    if "thinking_config" in kwargs:
-        gen_config["thinkingConfig"] = kwargs["thinking_config"]
     
     vertex_request["generationConfig"] = gen_config
     
@@ -253,11 +333,39 @@ def from_generate_content_response(response: Dict[str, Any]) -> Dict[str, Any]:
     if "promptFeedback" in inner_response:
         gemini_response["promptFeedback"] = inner_response["promptFeedback"]
     
-    # METRICS: CodeAssist peut mettre usageMetadata dans inner_response ou directement dans candidates[0]
-    if "usageMetadata" in inner_response:
+    # METRICS: CodeAssist peut mettre usageMetadata à plusieurs endroits
+    # 1. Dans response directement (niveau racine)
+    if "usageMetadata" in response:
+        gemini_response["usageMetadata"] = response["usageMetadata"]
+    # 2. Dans inner_response
+    elif "usageMetadata" in inner_response:
         gemini_response["usageMetadata"] = inner_response["usageMetadata"]
-    elif gemini_response["candidates"] and "usageMetadata" in gemini_response["candidates"][0]:
-        gemini_response["usageMetadata"] = gemini_response["candidates"][0]["usageMetadata"]
+    # 3. Dans candidates[0]
+    elif gemini_response["candidates"] and len(gemini_response["candidates"]) > 0:
+        candidate = gemini_response["candidates"][0]
+        if "usageMetadata" in candidate:
+            gemini_response["usageMetadata"] = candidate["usageMetadata"]
+    
+    # DEBUG: Log si usageMetadata n'a pas été trouvé (pour diagnostic)
+    if "usageMetadata" not in gemini_response:
+        try:
+            from features.UnifiedLogger import UnifiedLogger
+            # Log les clés disponibles pour debug
+            available_keys = list(response.keys())
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"usageMetadata non trouvé. Clés disponibles dans response: {available_keys}"
+            )
+            if inner_response:
+                inner_keys = list(inner_response.keys())
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "DEBUG",
+                    f"Clés disponibles dans inner_response: {inner_keys}"
+                )
+        except Exception:
+            pass
         
     if "modelVersion" in inner_response:
         gemini_response["modelVersion"] = inner_response["modelVersion"]
@@ -342,13 +450,19 @@ def _convert_tools_to_gemini_format(tools: List[Dict]) -> List[Dict[str, Any]]:
             elif "functionDeclarations" in tool:
                 for decl in tool["functionDeclarations"]:
                     # IMPORTANT: utiliser "parametersJsonSchema" (pas "parameters") avec types en minuscules
+                    # Utiliser _build_ordered_schema pour garantir l'ordre : properties → required → type
+                    raw_schema = decl.get("parameters", decl.get("parametersJsonSchema", {}))
+                    if isinstance(raw_schema, dict) and raw_schema.get("type") == "object":
+                        # Schéma racine : utiliser _build_ordered_schema pour l'ordre correct
+                        ordered_schema = _build_ordered_schema(raw_schema, use_uppercase=False)
+                    else:
+                        # Schéma imbriqué : utiliser sanitize_schema_for_codeassist
+                        ordered_schema = sanitize_schema_for_codeassist(raw_schema, use_uppercase=False)
+                    
                     sanitized_decl = {
                         "name": decl.get("name", ""),
                         "description": decl.get("description", ""),
-                        "parametersJsonSchema": sanitize_schema_for_codeassist(
-                            decl.get("parameters", decl.get("parametersJsonSchema", {})),
-                            use_uppercase=False  # Types en minuscules pour parametersJsonSchema
-                        )
+                        "parametersJsonSchema": ordered_schema
                     }
                     function_declarations.append(sanitized_decl)
                 continue
@@ -364,10 +478,15 @@ def _convert_tools_to_gemini_format(tools: List[Dict]) -> List[Dict[str, Any]]:
             # Appliquer le sanitizer sur les paramètres
             if func_decl:
                 # IMPORTANT: utiliser "parametersJsonSchema" avec types en minuscules
-                func_decl["parametersJsonSchema"] = sanitize_schema_for_codeassist(
-                    func_decl.get("parametersJsonSchema", {}),
-                    use_uppercase=False  # Types en minuscules pour parametersJsonSchema
-                )
+                # Utiliser _build_ordered_schema pour garantir l'ordre : properties → required → type
+                raw_schema = func_decl.get("parametersJsonSchema", {})
+                if isinstance(raw_schema, dict) and raw_schema.get("type") == "object":
+                    # Schéma racine : utiliser _build_ordered_schema pour l'ordre correct
+                    func_decl["parametersJsonSchema"] = _build_ordered_schema(raw_schema, use_uppercase=False)
+                else:
+                    # Schéma imbriqué : utiliser sanitize_schema_for_codeassist
+                    func_decl["parametersJsonSchema"] = sanitize_schema_for_codeassist(raw_schema, use_uppercase=False)
+                
                 # Supprimer "parameters" si présent (on utilise seulement parametersJsonSchema)
                 if "parameters" in func_decl:
                     del func_decl["parameters"]

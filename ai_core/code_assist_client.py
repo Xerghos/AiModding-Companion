@@ -732,6 +732,32 @@ class CodeAssistClient:
             def stream_generator():
                 full_text = ""
                 for chunk in chunks:
+                    # DEBUG: Log la structure du chunk si usageMetadata est présent
+                    if isinstance(chunk, dict):
+                        # Vérifier usageMetadata dans le chunk original (avant conversion)
+                        if "usageMetadata" in chunk:
+                            usage = chunk["usageMetadata"]
+                            prompt_tokens = usage.get("promptTokenCount", 0)
+                            candidates_tokens = usage.get("candidatesTokenCount", 0)
+                            total_tokens = usage.get("totalTokenCount", 0)
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "METRICS",
+                                f"📊 Usage (chunk direct): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
+                            )
+                        # Vérifier aussi dans response si présent
+                        if "response" in chunk and isinstance(chunk["response"], dict):
+                            if "usageMetadata" in chunk["response"]:
+                                usage = chunk["response"]["usageMetadata"]
+                                prompt_tokens = usage.get("promptTokenCount", 0)
+                                candidates_tokens = usage.get("candidatesTokenCount", 0)
+                                total_tokens = usage.get("totalTokenCount", 0)
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "METRICS",
+                                    f"📊 Usage (response): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
+                                )
+                    
                     # Convertir chaque chunk
                     gemini_chunk = from_generate_content_response(chunk)
                     
@@ -767,7 +793,7 @@ class CodeAssistClient:
                                 
                                 yield chunk_obj
                     
-                    # LOGGING DES METRICS (Usage Metadata)
+                    # LOGGING DES METRICS (Usage Metadata) - après conversion
                     if "usageMetadata" in gemini_chunk:
                         usage = gemini_chunk["usageMetadata"]
                         prompt_tokens = usage.get("promptTokenCount", 0)
@@ -776,8 +802,21 @@ class CodeAssistClient:
                         UnifiedLogger.write(
                             "AI_CORE",
                             "METRICS",
-                            f"📊 Usage: Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
+                            f"📊 Usage (gemini_chunk): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
                         )
+                    # Vérifier aussi dans candidates[0] si présent
+                    elif "candidates" in gemini_chunk and len(gemini_chunk["candidates"]) > 0:
+                        candidate = gemini_chunk["candidates"][0]
+                        if "usageMetadata" in candidate:
+                            usage = candidate["usageMetadata"]
+                            prompt_tokens = usage.get("promptTokenCount", 0)
+                            candidates_tokens = usage.get("candidatesTokenCount", 0)
+                            total_tokens = usage.get("totalTokenCount", 0)
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "METRICS",
+                                f"📊 Usage (candidate): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
+                            )
                 
                 # Dernier chunk avec le texte complet
                 if full_text:
