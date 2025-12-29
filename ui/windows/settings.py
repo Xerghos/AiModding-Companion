@@ -15,7 +15,7 @@ from config.logs import get_logger
 
 # --- IMPORTS UI BASE ---
 from ui.windows.base import BaseWindow
-from ui.widgets import show_messagebox
+from ui.widgets import show_messagebox, add_tooltip
 
 # --- IMPORTS AI CORE (Pour Audit & Découverte) ---
 from ai_core.factory import SessionFactory
@@ -168,10 +168,17 @@ class SettingsWindow(BaseWindow):
         btn_frame = ctk.CTkFrame(self, height=50, fg_color="transparent")
         btn_frame.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
         
-        ctk.CTkButton(btn_frame, text="🛠️ JSON Brut", command=self._open_json_editor, fg_color="gray", width=120).pack(side="left", padx=10)
+        btn_json = ctk.CTkButton(btn_frame, text="🛠️ JSON Brut", command=self._open_json_editor, fg_color="gray", width=120)
+        btn_json.pack(side="left", padx=10)
+        add_tooltip(btn_json, "Ouvrir l'éditeur JSON brut pour modifier la configuration directement")
         
-        ctk.CTkButton(btn_frame, text="Annuler", command=self.destroy, fg_color=COLORS["BG_SECONDARY"], width=100).pack(side="right", padx=10)
-        ctk.CTkButton(btn_frame, text="💾 Sauvegarder & Appliquer", command=self.save_all_settings, fg_color=COLORS["SUCCESS"], width=200, font=("Arial", 14, "bold")).pack(side="right")
+        btn_cancel = ctk.CTkButton(btn_frame, text="Annuler", command=self.destroy, fg_color=COLORS["BG_SECONDARY"], width=100)
+        btn_cancel.pack(side="right", padx=10)
+        add_tooltip(btn_cancel, "Annuler les modifications et fermer")
+        
+        btn_save = ctk.CTkButton(btn_frame, text="💾 Sauvegarder & Appliquer", command=self.save_all_settings, fg_color=COLORS["SUCCESS"], width=200, font=("Arial", 14, "bold"))
+        btn_save.pack(side="right")
+        add_tooltip(btn_save, "Sauvegarder toutes les modifications et les appliquer immédiatement")
 
         # [MODIF] Lancement différé de l'audit et de la découverte (SUR SettingsWindow, pas Tooltip !)
         self.after(1000, lambda: threading.Thread(target=self._startup_checks, daemon=True).start())
@@ -349,11 +356,18 @@ class SettingsWindow(BaseWindow):
         btn_k_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         btn_k_frame.pack(fill="x", padx=10, pady=5)
         
-        ctk.CTkButton(btn_k_frame, text="➕ Ajouter Clé", command=self._add_key_dialog, width=100, fg_color=COLORS["ACCENT"]).pack(side="left", padx=5)
-        ctk.CTkButton(btn_k_frame, text="❌ Supprimer", command=self._delete_key, width=100, fg_color=COLORS["ERROR"]).pack(side="left", padx=5)
+        btn_add_key = ctk.CTkButton(btn_k_frame, text="➕ Ajouter Clé", command=self._add_key_dialog, width=100, fg_color=COLORS["ACCENT"])
+        btn_add_key.pack(side="left", padx=5)
+        add_tooltip(btn_add_key, "Ajouter une nouvelle clé API")
+        
+        btn_delete_key = ctk.CTkButton(btn_k_frame, text="❌ Supprimer", command=self._delete_key, width=100, fg_color=COLORS["ERROR"])
+        btn_delete_key.pack(side="left", padx=5)
+        add_tooltip(btn_delete_key, "Supprimer la clé sélectionnée")
         
         # Le bouton appelle _manual_refresh qui lance _perform_update_cycle
-        ctk.CTkButton(btn_k_frame, text="🔍 Audit Connexion", command=self._manual_refresh, width=120, fg_color="#9C27B0").pack(side="right", padx=5)
+        btn_audit = ctk.CTkButton(btn_k_frame, text="🔍 Audit Connexion", command=self._manual_refresh, width=120, fg_color="#9C27B0")
+        btn_audit.pack(side="right", padx=5)
+        add_tooltip(btn_audit, "Vérifier la connexion et découvrir les modèles disponibles")
 
         # --- SELECTION MODELES (ROLES COMPLETS) ---
         self._add_header(scroll, "Modèles par Rôle (Registry)")
@@ -402,13 +416,15 @@ class SettingsWindow(BaseWindow):
         adc_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         adc_frame.pack(fill="x", padx=10, pady=5)
         
-        ctk.CTkButton(
+        btn_oauth = ctk.CTkButton(
             adc_frame, 
             text="🔐 Login with Google (OAuth)", 
             command=self._setup_google_adc_auth,
             fg_color=COLORS["ACCENT"],
             width=200
-        ).pack(side="left", padx=5)
+        )
+        btn_oauth.pack(side="left", padx=5)
+        add_tooltip(btn_oauth, "S'authentifier avec Google pour utiliser les tokens gratuits (60 req/min, 1000/jour)")
         
         self.adc_status_label = ctk.CTkLabel(adc_frame, text="", font=("Arial", 10))
         self.adc_status_label.pack(side="left", padx=10)
@@ -462,7 +478,9 @@ class SettingsWindow(BaseWindow):
         # Vérification du CLI
         check_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         check_frame.pack(fill="x", padx=10, pady=10)
-        ctk.CTkButton(check_frame, text="🔍 Vérifier Installation CLI", command=self._check_cli_installation, fg_color=COLORS["INFO"]).pack(side="left", padx=5)
+        btn_check_cli = ctk.CTkButton(check_frame, text="🔍 Vérifier Installation CLI", command=self._check_cli_installation, fg_color=COLORS["INFO"])
+        btn_check_cli.pack(side="left", padx=5)
+        add_tooltip(btn_check_cli, "Vérifier si le CLI gemini est installé et accessible")
         self.cli_status_label = ctk.CTkLabel(check_frame, text="", font=("Arial", 10))
         self.cli_status_label.pack(side="left", padx=10)
     

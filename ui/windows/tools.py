@@ -1,6 +1,6 @@
 import customtkinter as ctk
 from tkinter import ttk
-from ui.widgets import COLORS, show_messagebox
+from ui.widgets import COLORS, show_messagebox, add_tooltip
 from ui.windows.base import BaseWindow
 from features.Decorators import trace_action
 
@@ -22,7 +22,9 @@ class WaitingListWindow(BaseWindow):
         self.tree.heading("Status", text="État")
         self.tree.pack(fill="both", expand=True, padx=10, pady=10)
         
-        ctk.CTkButton(self, text="Rafraîchir", command=self._refresh).pack(pady=5)
+        btn_refresh = ctk.CTkButton(self, text="Rafraîchir", command=self._refresh)
+        btn_refresh.pack(pady=5)
+        add_tooltip(btn_refresh, "Actualiser la liste des tâches en attente")
         self._refresh()
 
     @trace_action(source="tools")
@@ -63,26 +65,32 @@ class DbManagerWindow(BaseWindow):
             
             # --- Câblage Direct (Bypass IA) ---
             
-            ctk.CTkButton(
+            btn_reindex = ctk.CTkButton(
                 main, 
                 text="🔄 Reconstruire l'Index (RAG)",
                 fg_color="#2ecc71", hover_color="#27ae60",
                 command=self._reindex_direct
-            ).pack(fill="x", pady=5)
+            )
+            btn_reindex.pack(fill="x", pady=5)
+            add_tooltip(btn_reindex, "Reconstruire l'index de la base de connaissances (RAG)")
             
             if self.on_clear_chat:
-                ctk.CTkButton(
+                btn_clear = ctk.CTkButton(
                     main, 
                     text="Effacer Chat", 
                     command=self.on_clear_chat
-                ).pack(fill="x", pady=5)
+                )
+                btn_clear.pack(fill="x", pady=5)
+                add_tooltip(btn_clear, "Effacer l'historique du chat")
             
-            ctk.CTkButton(
+            btn_delete = ctk.CTkButton(
                 main, 
                 text="🗑️ Supprimer Base Locale", 
                 fg_color=COLORS["ERROR"], hover_color="#c0392b", 
                 command=self._delete_db_direct
-            ).pack(fill="x", pady=5)
+            )
+            btn_delete.pack(fill="x", pady=5)
+            add_tooltip(btn_delete, "Supprimer définitivement la base de connaissances locale")
             
             self.lbl_status = ctk.CTkLabel(main, text="Statut: Prêt", text_color="gray")
             self.lbl_status.pack(pady=10)
@@ -120,8 +128,13 @@ class BackupManagerWindow(BaseWindow):
             ctk.CTkLabel(toolbar, text="Historique (Time Machine)", font=("Arial", 14, "bold"), text_color=COLORS["ACCENT"]).pack(side="left")
             
             # Bouton corrigé
-            ctk.CTkButton(toolbar, text="📸 Créer Backup", command=self._create_backup, fg_color=COLORS["ACCENT"], width=120).pack(side="right", padx=5)
-            ctk.CTkButton(toolbar, text="🔄 Actualiser", command=self._refresh, width=100).pack(side="right", padx=5)
+            btn_create = ctk.CTkButton(toolbar, text="📸 Créer Backup", command=self._create_backup, fg_color=COLORS["ACCENT"], width=120)
+            btn_create.pack(side="right", padx=5)
+            add_tooltip(btn_create, "Créer une nouvelle sauvegarde de l'application")
+            
+            btn_refresh = ctk.CTkButton(toolbar, text="🔄 Actualiser", command=self._refresh, width=100)
+            btn_refresh.pack(side="right", padx=5)
+            add_tooltip(btn_refresh, "Actualiser la liste des sauvegardes disponibles")
 
             self.tree_frame = ctk.CTkFrame(self)
             self.tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -145,7 +158,10 @@ class BackupManagerWindow(BaseWindow):
             action_frame = ctk.CTkFrame(self, fg_color="transparent")
             action_frame.pack(fill="x", padx=10, pady=20)
             ctk.CTkLabel(action_frame, text="Sélectionnez une ligne pour restaurer.", text_color="gray").pack(side="left")
-            ctk.CTkButton(action_frame, text="🔙 Restaurer la version sélectionnée", fg_color=COLORS["ERROR"], hover_color="#AA0000", command=self._restore_selected).pack(side="right")
+            btn_restore = ctk.CTkButton(action_frame, text="🔙 Restaurer la version sélectionnée", fg_color=COLORS["ERROR"], hover_color="#AA0000", command=self._restore_selected)
+            btn_restore.pack(side="right")
+            add_tooltip(btn_restore, "Restaurer la sauvegarde sélectionnée (écrase les fichiers actuels)")
+            add_tooltip(btn_restore, "Restaurer la sauvegarde sélectionnée (écrase les fichiers actuels)")
         except Exception as e:
             self.report_error("Build Backup UI", e)
 

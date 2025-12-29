@@ -430,10 +430,11 @@ class GeminiApp:
             with open(path, 'r', encoding='utf-8') as f: content = f.read()
         except: content = "Erreur lecture."
         
-        editor = TextEditorWithLineNumbers(self.tab_view.tab(filename))
+        editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
         editor.pack(fill="both", expand=True)
-        editor.text_area.insert("1.0", content)
-        syntax_highlighter.apply_highlighting_to_editor(editor, content, syntax_highlighter.get_lexer(filename, content))
+        editor.insert("1.0", content)
+        # Note: CTkCodeBox gère déjà le syntax highlighting automatiquement
+        # On n'a plus besoin d'appeler apply_highlighting_to_editor
         
         self.tab_view.set(filename)
         self.current_file_path = path

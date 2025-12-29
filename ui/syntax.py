@@ -102,7 +102,19 @@ def configure_tags(textbox):
 def apply_highlighting_to_editor(textbox, code, lexer):
     """
     Applique la coloration à un éditeur ENTIER.
+    Note: Pour TextEditorWithLineNumbers (CTkCodeBox), le highlighting est déjà géré automatiquement.
+    Cette fonction est conservée pour compatibilité mais n'est plus utilisée pour les éditeurs de code.
     """
+    # Si c'est un TextEditorWithLineNumbers (CTkCodeBox), le highlighting est automatique
+    if hasattr(textbox, 'code_box'):
+        # CTkCodeBox gère déjà le highlighting, on insère juste le code
+        textbox.configure(state=tk.NORMAL)
+        textbox.delete("1.0", tk.END)
+        textbox.insert("1.0", code)
+        textbox.configure(state=tk.NORMAL)
+        return
+    
+    # Fallback pour d'autres types de widgets (si nécessaire)
     configure_tags(textbox)
     textbox.configure(state=tk.NORMAL)
     textbox.delete("1.0", tk.END)

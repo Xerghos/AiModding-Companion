@@ -191,10 +191,11 @@ class MainPanel(ctk.CTkFrame):
                 with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
             except Exception as e: content = f"Erreur: {e}"
 
-        editor = TextEditorWithLineNumbers(self.tab_view.tab(filename))
+        editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
         editor.pack(fill="both", expand=True)
-        lexer = syntax_highlighter.get_lexer(filename=filename, code_content=content)
-        syntax_highlighter.apply_highlighting_to_editor(editor, content, lexer)
+        editor.insert("1.0", content)
+        # Note: CTkCodeBox gère déjà le syntax highlighting automatiquement
+        # On n'a plus besoin d'appeler apply_highlighting_to_editor
         self.tab_view.set(filename)
 
     @trace_action(source="panels")

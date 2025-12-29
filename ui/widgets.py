@@ -36,6 +36,9 @@ def add_tooltip(widget, message, delay=0.5):
 
 log = logging.getLogger("ui.widgets")
 
+# Import CTkCodeBox
+from features.CTkCodeBox import CTkCodeBox
+
 # --- COULEURS GLOBALES ---
 COLORS = {
     "BG_MAIN": "#1E1E1E",
@@ -116,62 +119,93 @@ def show_messagebox(title, message, icon="info", parent=None, **kwargs):
         )
         return None
 
+# --- MAPPING LANGAGES POUR CTkCodeBox ---
+def _detect_language_from_filename(filename):
+    """
+    Détecte le langage depuis le nom de fichier pour CTkCodeBox.
+    Retourne le nom de langage compatible avec CTkCodeBox.
+    """
+    if not filename:
+        return "text"
+    
+    ext = filename.lower().split('.')[-1] if '.' in filename else ""
+    
+    # Mapping des extensions vers les langages CTkCodeBox
+    lang_map = {
+        "py": "python",
+        "js": "javascript",
+        "ts": "typescript",
+        "jsx": "react",
+        "html": "html",
+        "css": "css",
+        "json": "json",
+        "yaml": "yaml",
+        "yml": "yaml",
+        "xml": "xml",
+        "c": "c",
+        "cpp": "cpp",
+        "cxx": "cpp",
+        "cc": "cpp",
+        "h": "c",
+        "hpp": "cpp",
+        "cs": "c#",
+        "java": "java",
+        "go": "go",
+        "rs": "rust",
+        "php": "php",
+        "rb": "ruby",
+        "lua": "lua",
+        "kt": "kotlin",
+        "swift": "swift",
+        "pl": "perl",
+        "md": "text",  # Markdown n'est pas dans les langages supportés
+        "txt": "text",
+    }
+    
+    return lang_map.get(ext, "text")
+
 class TextEditorWithLineNumbers(ctk.CTkFrame):
     """
-    Éditeur de texte avancé avec numéros de ligne et Barre de Recherche (Ctrl+F).
+    Éditeur de code moderne utilisant CTkCodeBox avec syntax highlighting intégré.
     """
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, filename=None, language=None, **kwargs):
         super().__init__(master, **kwargs)
         self.pack_propagate(False)
-        
+        self.filename = filename
         self.last_search_index = "1.0"
-
-        # Configuration de la police
-        self.editor_font = ctk.CTkFont(family="Consolas", size=11) # Police Code
-        self.line_number_canvas_width = 40
-
-        # Frame principal
-        main_editor_frame = ctk.CTkFrame(self, fg_color="transparent")
-        main_editor_frame.pack(fill="both", expand=True)
-
-        # Zone des numéros de ligne (Canvas pour plus de flexibilité)
-        self.line_numbers = tk.Text(main_editor_frame, width=4, padx=4, takefocus=0, borderwidth=0,
-                                    background=COLORS["BG_SECONDARY"], foreground=COLORS["FG_SECONDARY"],
-                                    state="disabled", font=self.editor_font)
-        self.line_numbers.pack(side="left", fill="y")
         
-        # Scrollbars
-        self.vsb = ctk.CTkScrollbar(main_editor_frame, command=self._on_scroll_y)
-        self.vsb.pack(side="right", fill="y")
-
-        # Zone de texte principale
-        self.text_area = ctk.CTkTextbox(main_editor_frame, font=self.editor_font, wrap="none", undo=True,
-                                        fg_color=COLORS["BG_WIDGET"], text_color=COLORS["FG_PRIMARY"])
-        self.text_area.pack(side="left", fill="both", expand=True)
+        # Détection du langage
+        if language:
+            detected_lang = language
+        elif filename:
+            detected_lang = _detect_language_from_filename(filename)
+        else:
+            detected_lang = "text"
         
-        # Configuration Scroll Sync
-        self.text_area.configure(yscrollcommand=self._on_scroll_text_y)
+        # Création du CTkCodeBox
+        self.code_box = CTkCodeBox(
+            self,
+            language=detected_lang,
+            theme="monokai",  # Thème dark populaire
+            line_numbering=True,
+            undo=True,
+            menu=True,
+            wrap=False,  # Pas de wrap pour l'édition de code
+            height=kwargs.get("height", 200),
+            fg_color=COLORS.get("BG_WIDGET", "#2D2D30"),
+            text_color=COLORS.get("FG_PRIMARY", "#CCCCCC"),
+        )
+        self.code_box.pack(fill="both", expand=True)
         
-        # Tags pour la recherche
-        # Note: CTkTextbox n'expose pas directement tag_config de manière standard, on accède au widget tk sous-jacent si besoin
-        # Mais CTkTextbox hérite de beaucoup de méthodes. On va essayer via l'API publique ou bypass.
-        try:
-            self.text_area._textbox.tag_config("found_match", background="#FFFF00", foreground="#000000")
-        except: pass
-
-        # Barre de Recherche (Cachée par défaut)
+        # Barre de recherche (CTkCodeBox n'a pas cette fonctionnalité)
         self.find_bar_frame = ctk.CTkFrame(self, fg_color=COLORS["BG_SECONDARY"], height=35)
         self._setup_find_bar()
-
-        # Bindings
-        self.text_area.bind("<<Change>>", self._on_content_changed)
-        self.text_area.bind("<KeyRelease>", self._on_content_changed)
-        self.text_area.bind("<Return>", self._on_content_changed)
-        self.text_area.bind("<BackSpace>", self._on_content_changed)
-        self.text_area.bind("<Control-f>", self.open_find_bar)
         
-        # Init
-        self._update_line_numbers()
+        # Bindings pour la recherche
+        self.code_box.bind("<Control-f>", self.open_find_bar)
+        
+        # Pour compatibilité avec l'ancien code
+        self.text_area = self.code_box
 
     def _setup_find_bar(self):
         # Entry Recherche
@@ -192,27 +226,36 @@ class TextEditorWithLineNumbers(ctk.CTkFrame):
         ctk.CTkButton(self.find_bar_frame, text="X", width=30, fg_color=COLORS["ERROR"], command=self.close_find_bar).pack(side="right", padx=5)
 
     def open_find_bar(self, event=None):
-        self.find_bar_frame.pack(side="bottom", fill="x", before=self.text_area.master) # Hack pour mettre en bas
+        """Ouvre la barre de recherche."""
+        self.find_bar_frame.pack(side="bottom", fill="x")
         self.find_entry.focus_set()
         return "break"
 
     def close_find_bar(self, event=None):
+        """Ferme la barre de recherche."""
         self.find_bar_frame.pack_forget()
         self.text_area.focus_set()
         # Nettoyage surlignage
-        try: self.text_area._textbox.tag_remove("found_match", "1.0", "end")
-        except: pass
+        try:
+            self.text_area._textbox.tag_remove("found_match", "1.0", "end")
+        except:
+            pass
 
     def find_next(self, event=None):
+        """Recherche le terme suivant."""
         term = self.find_entry.get()
-        if not term: return
+        if not term:
+            return
         
         try:
-            # Recherche via le widget TK sous-jacent pour avoir accès à 'search'
+            # Recherche via le widget TK sous-jacent
             tk_text = self.text_area._textbox
             
             # Nettoyage précédent
-            tk_text.tag_remove("found_match", "1.0", "end")
+            try:
+                tk_text.tag_remove("found_match", "1.0", "end")
+            except:
+                pass
             
             # Recherche
             start_pos = tk_text.search(term, self.last_search_index, stopindex="end", nocase=True)
@@ -231,52 +274,47 @@ class TextEditorWithLineNumbers(ctk.CTkFrame):
             log.error(f"Erreur recherche UI: {e}")
 
     def replace_all(self, event=None):
+        """Remplace toutes les occurrences."""
         target = self.find_entry.get()
         replacement = self.replace_entry.get()
-        if not target: return
+        if not target:
+            return
         
         content = self.text_area.get("1.0", "end")
-        # Remplacement Python simple (plus stable que manipulation index TK)
         new_content = content.replace(target, replacement)
         
         self.text_area.delete("1.0", "end")
         self.text_area.insert("1.0", new_content)
-        self._update_line_numbers()
-
-    def _on_scroll_y(self, *args):
-        self.text_area.yview(*args)
-        self.line_numbers.yview(*args)
-
-    def _on_scroll_text_y(self, *args):
-        self.vsb.set(*args)
-        self.line_numbers.yview_moveto(args[0])
-
-    def _on_content_changed(self, event=None):
-        self._update_line_numbers()
-
-    def _update_line_numbers(self):
-        line_count = int(self.text_area.index('end-1c').split('.')[0])
-        lines = "\n".join(str(i) for i in range(1, line_count + 1))
-        
-        self.line_numbers.configure(state="normal")
-        self.line_numbers.delete("1.0", "end")
-        self.line_numbers.insert("1.0", lines)
-        self.line_numbers.configure(state="disabled")
-
-    # Méthodes proxy
-    def get(self, *args, **kwargs): return self.text_area.get(*args, **kwargs)
-    def insert(self, *args, **kwargs): 
-        self.text_area.insert(*args, **kwargs)
-        self._update_line_numbers()
-    def delete(self, *args, **kwargs): 
-        self.text_area.delete(*args, **kwargs)
-        self._update_line_numbers()
-    def see(self, *args, **kwargs): self.text_area.see(*args, **kwargs)
-    def configure(self, **kwargs): self.text_area.configure(**kwargs)
-    def focus(self): self.text_area.focus()
+    
+    # Méthodes proxy pour compatibilité
+    def get(self, *args, **kwargs):
+        """Proxy vers get."""
+        return self.text_area.get(*args, **kwargs)
+    
+    def insert(self, *args, **kwargs):
+        """Proxy vers insert."""
+        return self.text_area.insert(*args, **kwargs)
+    
+    def delete(self, *args, **kwargs):
+        """Proxy vers delete."""
+        return self.text_area.delete(*args, **kwargs)
+    
+    def see(self, *args, **kwargs):
+        """Proxy vers see."""
+        return self.text_area.see(*args, **kwargs)
+    
+    def configure(self, **kwargs):
+        """Proxy vers configure."""
+        return self.text_area.configure(**kwargs)
+    
+    def focus(self):
+        """Proxy vers focus."""
+        return self.text_area.focus()
     
     @property
-    def tag_config(self): return self.text_area.tag_config
+    def tag_config(self):
+        """Proxy vers tag_config."""
+        return self.text_area.tag_config
 
 class ApiKeyStatusMenu(ctk.CTkButton):
     """
