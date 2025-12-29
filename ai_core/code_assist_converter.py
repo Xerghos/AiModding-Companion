@@ -215,14 +215,15 @@ def to_generate_content_request(
         vertex_request["cachedContent"] = cached_content
     
     # Construire la requête CodeAssist finale avec OrderedDict pour garantir l'ordre exact
-    # ORDRE CRITIQUE : model → project → user_prompt_id → request (comme gemini-cli)
+    # ORDRE CRITIQUE : model → project → request → user_prompt_id (comme gemini-cli)
+    # IMPORTANT: user_prompt_id DOIT être APRÈS request (analyse payload fonctionnel)
     ca_request = OrderedDict()
     ca_request["model"] = model
     if project_id:
         ca_request["project"] = project_id
+    ca_request["request"] = vertex_request
     if user_prompt_id:
         ca_request["user_prompt_id"] = user_prompt_id
-    ca_request["request"] = vertex_request
     
     return ca_request
 

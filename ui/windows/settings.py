@@ -590,19 +590,61 @@ class SettingsWindow(BaseWindow):
                 
                 # Client ID/Secret OAuth pour Gemini (via variables d'environnement)
                 # Référence: oauth2.ts ligne 69-78 de gemini-cli
-                # Ces credentials doivent être configurés dans les variables d'environnement :
-                # GOOGLE_OAUTH_CLIENT_ID et GOOGLE_OAUTH_CLIENT_SECRET
-                # Si non définis, on utilise gcloud auth application-default login comme fallback
-                client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
-                client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+                # Utiliser les mêmes fonctions que oauth_validator.py pour cohérence
+                from ai_core.oauth_validator import _get_gemini_cli_client_id, _get_gemini_cli_client_secret, invalidate_oauth_cache
+                
+                # Invalider le cache pour utiliser les valeurs corrigées
+                invalidate_oauth_cache()
+                
+                # Priorité : variables d'environnement GOOGLE_OAUTH_* > GEMINI_CLI_* > système de secrets > valeur par défaut
+                # IMPORTANT: Utiliser directement _get_gemini_cli_client_id() pour éviter le cache
+                client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID") or os.environ.get("GEMINI_CLI_CLIENT_ID")
+                if not client_id:
+                    # Utiliser directement la fonction sans cache (valeurs corrigées)
+                    client_id = _get_gemini_cli_client_id()
+                
+                client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or os.environ.get("GEMINI_CLI_CLIENT_SECRET")
+                if not client_secret:
+                    # Utiliser directement la fonction sans cache (valeurs corrigées)
+                    client_secret = _get_gemini_cli_client_secret()
+                
+                # Validation : vérifier que les credentials sont valides
+                if not client_id or len(client_id) < 10:
+                    raise ValueError(f"Client ID invalide: {client_id}")
+                if not client_secret or len(client_secret) < 10:
+                    raise ValueError(f"Client Secret invalide: {client_secret}")
+                
+                # Log pour déboguer (sans afficher le secret complet)
+                try:
+                    from features.UnifiedLogger import UnifiedLogger
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "DEBUG",
+                        f"OAuth Client ID: {client_id[:30]}... (longueur: {len(client_id)})"
+                    )
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "DEBUG",
+                        f"OAuth Client Secret: {client_secret[:15]}... (longueur: {len(client_secret)})"
+                    )
+                    # Vérifier que le Client ID correspond à celui de gemini-cli
+                    expected_id = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+                    if client_id == expected_id:
+                        UnifiedLogger.write("AI_CORE", "DEBUG", "✅ Client ID correspond à gemini-cli")
+                    else:
+                        UnifiedLogger.write("AI_CORE", "WARNING", f"⚠️ Client ID différent de gemini-cli: {client_id[:30]}...")
+                except:
+                    pass
                 
                 if not client_id or not client_secret:
                     # Fallback vers gcloud auth application-default login
                     self.after(0, lambda: messagebox.showwarning(
                         "Configuration OAuth manquante",
-                        "Les variables d'environnement GOOGLE_OAUTH_CLIENT_ID et GOOGLE_OAUTH_CLIENT_SECRET\n"
-                        "ne sont pas définies. Utilisation de 'gcloud auth application-default login'\n"
-                        "comme méthode d'authentification alternative."
+                        "Les variables d'environnement GOOGLE_OAUTH_CLIENT_ID/GEMINI_CLI_CLIENT_ID et\n"
+                        "GOOGLE_OAUTH_CLIENT_SECRET/GEMINI_CLI_CLIENT_SECRET ne sont pas définies.\n"
+                        "Utilisation de 'gcloud auth application-default login'\n"
+                        "comme méthode d'authentification alternative.\n\n"
+                        "Note: Les valeurs par défaut gemini-cli sont utilisées si disponibles."
                     ))
                     # Utiliser gcloud auth application-default login
                     import subprocess
@@ -638,16 +680,40 @@ class SettingsWindow(BaseWindow):
                     self.after(0, lambda: self._check_adc_status())
                     return
                 
+                # Vérifier que le Client ID correspond exactement à celui de gemini-cli
+                expected_id = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+                if client_id != expected_id:
+                    try:
+                        from features.UnifiedLogger import UnifiedLogger
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "WARNING",
+                            f"⚠️ Client ID différent de gemini-cli attendu. Reçu: {client_id}, Attendu: {expected_id}"
+                        )
+                    except:
+                        pass
+                
                 client_config = {
                     "installed": {
-                        "client_id": client_id,
-                        "client_secret": client_secret,
+                        "client_id": client_id.strip(),  # Nettoyer les espaces
+                        "client_secret": client_secret.strip(),  # Nettoyer les espaces
                         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                         "token_uri": "https://oauth2.googleapis.com/token",
                         "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
                         "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
                     }
                 }
+                
+                # Log du client_config (sans le secret complet) pour déboguer
+                try:
+                    from features.UnifiedLogger import UnifiedLogger
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "DEBUG",
+                        f"Client config créé avec Client ID: {client_config['installed']['client_id'][:30]}..."
+                    )
+                except:
+                    pass
                 
                 # CRITIQUE: Supprimer l'ancien token s'il existe pour éviter les conflits de scopes
                 # Si un ancien token existe avec des scopes différents, Google refusera la connexion

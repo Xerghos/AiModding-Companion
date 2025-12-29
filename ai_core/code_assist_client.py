@@ -10,6 +10,7 @@ import requests
 from typing import Optional, Dict, List, Any, Iterator, Generator
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from google.auth.transport.requests import AuthorizedSession
 
 from features.UnifiedLogger import UnifiedLogger
 from ai_core.oauth_validator import load_and_validate_oauth_credentials
@@ -135,6 +136,7 @@ class CodeAssistClient:
         )
         self._creds: Optional[Credentials] = None
         self._access_token: Optional[str] = None
+        self._session: Optional[AuthorizedSession] = None  # Session autorisée (comme gemini-cli)
         
         # Pour utiliser le quota personnel (comme gemini-cli), on ne doit PAS définir project
         # Seulement utiliser project_id si explicitement fourni ET si use_personal_quota=False
@@ -151,8 +153,11 @@ class CodeAssistClient:
         
         self.session_id = session_id
     
-    def _get_access_token(self) -> Optional[str]:
-        """Récupère un access token valide (OAuth)."""
+    def _get_authorized_session(self) -> Optional[AuthorizedSession]:
+        """
+        Récupère une session autorisée (comme gemini-cli).
+        AuthorizedSession gère automatiquement le refresh du token et les headers.
+        """
         try:
             from ai_core.oauth_validator import should_refresh_token, save_oauth_credentials
 
@@ -175,22 +180,41 @@ class CodeAssistClient:
                     )
                     return None
                 self._creds = creds
+                # Recréer la session si les credentials ont changé
+                self._session = None
             
             # Rafraîchir si nécessaire OU si refresh proactif demandé
             if (force_refresh or not self._creds.valid) and self._creds.refresh_token:
                 self._creds.refresh(Request())
                 save_oauth_credentials(self._creds, self.token_path)
+                # Recréer la session après refresh
+                self._session = None
             
-            if self._creds.valid:
-                return self._creds.token
+            # Créer ou réutiliser la session autorisée
+            if self._creds and self._creds.valid:
+                if self._session is None:
+                    # AuthorizedSession gère automatiquement :
+                    # - Le header Authorization avec le token
+                    # - Le refresh du token si nécessaire
+                    # - Les headers supplémentaires requis par Google
+                    self._session = AuthorizedSession(self._creds)
+                return self._session
+            
             return None
         except Exception as e:
             UnifiedLogger.write(
                 "AI_CORE",
                 "ERROR",
-                f"❌ Erreur lors de la récupération du token OAuth: {e}"
+                f"❌ Erreur lors de la création de la session autorisée: {e}"
             )
             return None
+    
+    def _get_access_token(self) -> Optional[str]:
+        """Récupère un access token valide (OAuth) - méthode legacy pour compatibilité."""
+        session = self._get_authorized_session()
+        if session and self._creds and self._creds.valid:
+            return self._creds.token
+        return None
     
     def _get_method_url(self, method: str) -> str:
         """
@@ -228,20 +252,17 @@ class CodeAssistClient:
         last_exc: Optional[Exception] = None
 
         for attempt in range(MAX_RETRIES):
-            access_token = self._get_access_token()
-            if not access_token:
-                raise ValueError("Impossible d'obtenir un access token OAuth valide")
+            # Utiliser AuthorizedSession (comme gemini-cli) au lieu de requests.post() manuel
+            session = self._get_authorized_session()
+            if not session:
+                raise ValueError("Impossible d'obtenir une session autorisée OAuth valide")
 
             url = self._get_method_url(method)
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            }
 
             UnifiedLogger.write(
                 "AI_CORE",
                 "START",
-                f"CodeAssist API: {method} (OAuth) try {attempt + 1}/{MAX_RETRIES}"
+                f"CodeAssist API: {method} (OAuth AuthorizedSession) try {attempt + 1}/{MAX_RETRIES}"
             )
 
             # Log du payload final juste avant l'envoi HTTP (comme gemini-cli)
@@ -281,11 +302,17 @@ class CodeAssistClient:
             )
 
             try:
-                # Envoyer le JSON sérialisé manuellement pour garantir l'ordre exact
-                response = requests.post(
+                # Utiliser AuthorizedSession.post() (comme gemini-cli)
+                # AuthorizedSession gère automatiquement :
+                # - Le header Authorization avec le token
+                # - Le refresh du token si nécessaire
+                # - Les headers supplémentaires requis par Google
+                response = session.post(
                     url,
                     data=payload_json.encode('utf-8'),
-                    headers=headers,
+                    headers={
+                        'Content-Type': 'application/json'
+                    },
                     timeout=300  # 5 minutes timeout
                 )
                 response.raise_for_status()
@@ -379,20 +406,17 @@ class CodeAssistClient:
         last_exc: Optional[Exception] = None
 
         for attempt in range(MAX_RETRIES):
-            access_token = self._get_access_token()
-            if not access_token:
-                raise ValueError("Impossible d'obtenir un access token OAuth valide")
+            # Utiliser AuthorizedSession (comme gemini-cli) au lieu de requests.post() manuel
+            session = self._get_authorized_session()
+            if not session:
+                raise ValueError("Impossible d'obtenir une session autorisée OAuth valide")
 
             url = self._get_method_url(method)
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            }
 
             UnifiedLogger.write(
                 "AI_CORE",
                 "START",
-                f"CodeAssist API Streaming: {method} (OAuth) try {attempt + 1}/{MAX_RETRIES}"
+                f"CodeAssist API Streaming: {method} (OAuth AuthorizedSession) try {attempt + 1}/{MAX_RETRIES}"
             )
 
             # Log du payload final juste avant l'envoi HTTP (comme gemini-cli)
@@ -432,11 +456,17 @@ class CodeAssistClient:
             )
 
             try:
-                # Envoyer le JSON sérialisé manuellement pour garantir l'ordre exact
-                response = requests.post(
+                # Utiliser AuthorizedSession.post() (comme gemini-cli)
+                # AuthorizedSession gère automatiquement :
+                # - Le header Authorization avec le token
+                # - Le refresh du token si nécessaire
+                # - Les headers supplémentaires requis par Google
+                response = session.post(
                     url,
                     data=payload_json.encode('utf-8'),
-                    headers=headers,
+                    headers={
+                        'Content-Type': 'application/json'
+                    },
                     params=params,
                     stream=True,
                     timeout=300

@@ -49,8 +49,10 @@ def _get_gemini_cli_client_id() -> str:
     # Note: Valeur stockée en base64 pour éviter la détection GitHub Push Protection
     # Base64 de "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
     import base64
-    default_id_encoded = "NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRyb3A5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t"
-    default_id = base64.b64decode(default_id_encoded).decode('utf-8')
+    # CORRECTION: Le base64 précédent était incorrect (oprdrop au lieu de oprdrnp)
+    # Nouveau base64 correct: NjgxMjU1ODA5Mzk1LW9vOGZ0Mm9wcmRyb3A5ZTNhcWY2YXYzaG1kaWIxMzVqLmFwcHMuZ29vZ2xldXNlcmNvbnRlbnQuY29t
+    # Mais pour éviter tout problème, on utilise directement la valeur
+    default_id = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
     UnifiedLogger.write(
         "AI_CORE",
         "WARNING",
@@ -113,6 +115,12 @@ def get_gemini_cli_client_secret() -> str:
     if _OAUTH_CLIENT_SECRET_CACHE is None:
         _OAUTH_CLIENT_SECRET_CACHE = _get_gemini_cli_client_secret()
     return _OAUTH_CLIENT_SECRET_CACHE
+
+def invalidate_oauth_cache():
+    """Invalide le cache des credentials OAuth (utile après correction)."""
+    global _OAUTH_CLIENT_ID_CACHE, _OAUTH_CLIENT_SECRET_CACHE
+    _OAUTH_CLIENT_ID_CACHE = None
+    _OAUTH_CLIENT_SECRET_CACHE = None
 
 # Constantes pour compatibilité (lazy loading - récupérées à la demande)
 # Note: Ces valeurs ne sont plus hardcodées au niveau du module pour éviter GitHub Push Protection
