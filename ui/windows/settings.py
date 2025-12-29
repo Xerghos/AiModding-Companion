@@ -1,7 +1,7 @@
 from tkinter import filedialog as fd
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk
 import json
 import os
 import logging
@@ -15,6 +15,7 @@ from config.logs import get_logger
 
 # --- IMPORTS UI BASE ---
 from ui.windows.base import BaseWindow
+from ui.widgets import show_messagebox
 
 # --- IMPORTS AI CORE (Pour Audit & Découverte) ---
 from ai_core.factory import SessionFactory
@@ -111,7 +112,7 @@ class ModelEditorWindow(BaseWindow):
             ctk.CTkButton(btn_frame, text="Annuler", command=self.destroy, fg_color=COLORS["ERROR"]).pack(side="left")
             ctk.CTkButton(btn_frame, text="Valider & Sauvegarder", command=self._save, fg_color=COLORS["SUCCESS"]).pack(side="right")
         except Exception as e:
-            messagebox.showerror("Erreur Init Editor", str(e))
+            show_messagebox("Erreur Init Editor", str(e), icon="error", parent=self)
 
     def _save(self):
         try:
@@ -119,7 +120,7 @@ class ModelEditorWindow(BaseWindow):
             self.on_save(data)
             self.destroy()
         except Exception as e:
-            messagebox.showerror("Erreur JSON", f"Format invalide : {e}")
+            show_messagebox("Erreur JSON", f"Format invalide : {e}", icon="error", parent=self)
 
 # --- FENÊTRE PRINCIPALE SETTINGS ---
 
@@ -638,13 +639,15 @@ class SettingsWindow(BaseWindow):
                 
                 if not client_id or not client_secret:
                     # Fallback vers gcloud auth application-default login
-                    self.after(0, lambda: messagebox.showwarning(
+                    self.after(0, lambda: show_messagebox(
                         "Configuration OAuth manquante",
                         "Les variables d'environnement GOOGLE_OAUTH_CLIENT_ID/GEMINI_CLI_CLIENT_ID et\n"
                         "GOOGLE_OAUTH_CLIENT_SECRET/GEMINI_CLI_CLIENT_SECRET ne sont pas définies.\n"
                         "Utilisation de 'gcloud auth application-default login'\n"
                         "comme méthode d'authentification alternative.\n\n"
-                        "Note: Les valeurs par défaut gemini-cli sont utilisées si disponibles."
+                        "Note: Les valeurs par défaut gemini-cli sont utilisées si disponibles.",
+                        icon="warning",
+                        parent=self
                     ))
                     # Utiliser gcloud auth application-default login
                     import subprocess
@@ -665,13 +668,15 @@ class SettingsWindow(BaseWindow):
                                 break
                     
                     if not gcloud_path:
-                        self.after(0, lambda: messagebox.showerror(
+                        self.after(0, lambda: show_messagebox(
                             "gcloud non trouvé",
                             "gcloud n'a pas été trouvé dans le PATH.\n\n"
                             "Solutions:\n"
                             "1. Installez Google Cloud SDK: https://cloud.google.com/sdk/docs/install\n"
                             "2. Ajoutez gcloud au PATH système\n"
-                            "3. Ou définissez GOOGLE_OAUTH_CLIENT_ID et GOOGLE_OAUTH_CLIENT_SECRET"
+                            "3. Ou définissez GOOGLE_OAUTH_CLIENT_ID et GOOGLE_OAUTH_CLIENT_SECRET",
+                            icon="error",
+                            parent=self
                         ))
                         return
                     
@@ -807,32 +812,38 @@ class SettingsWindow(BaseWindow):
                 
                 # Afficher un message avec des informations sur les scopes
                 obtained_scopes_str = ", ".join(list(credentials.scopes) if credentials.scopes else [])
-                self.after(0, lambda: messagebox.showinfo(
+                self.after(0, lambda: show_messagebox(
                     "Authentification réussie",
                     "L'authentification Google (Login with Google) a été configurée avec succès!\n\n"
                     f"Scopes obtenus: {obtained_scopes_str}\n\n"
                     "Vous pouvez maintenant utiliser les tokens gratuits Google AI Pro\n"
                     "(60 req/min, 1000/jour) sans API key.\n\n"
                     "L'application utilise maintenant CodeAssistClient (même mécanisme que gemini-cli)\n"
-                    "qui utilise l'endpoint cloudcode-pa.googleapis.com pour l'authentification OAuth."
+                    "qui utilise l'endpoint cloudcode-pa.googleapis.com pour l'authentification OAuth.",
+                    icon="info",
+                    parent=self
                 ))
                 
             except ImportError as e:
-                self.after(0, lambda: messagebox.showerror(
+                self.after(0, lambda: show_messagebox(
                     "Erreur",
                     f"Bibliothèque manquante: {e}\n\n"
                     "Installez avec:\n"
-                    "pip install google-auth-oauthlib google-auth-httplib2"
+                    "pip install google-auth-oauthlib google-auth-httplib2",
+                    icon="error",
+                    parent=self
                 ))
             except Exception as e:
                 self.after(0, lambda: self.adc_status_label.configure(
                     text="❌ Erreur d'authentification", 
                     text_color=COLORS["ERROR"]
                 ))
-                self.after(0, lambda: messagebox.showerror(
+                self.after(0, lambda: show_messagebox(
                     "Erreur d'authentification",
                     f"Échec de l'authentification: {e}\n\n"
-                    "Assurez-vous d'avoir une connexion Internet et que le navigateur peut s'ouvrir."
+                    "Assurez-vous d'avoir une connexion Internet et que le navigateur peut s'ouvrir.",
+                    icon="error",
+                    parent=self
                 ))
                 log.error(f"Erreur setup OAuth: {e}", exc_info=True)
         
@@ -967,7 +978,7 @@ class SettingsWindow(BaseWindow):
     def _delete_key(self):
         sel = self.api_tree.selection()
         if not sel: return
-        if messagebox.askyesno("Confirmer", "Supprimer la clé sélectionnée ?"):
+        if show_messagebox("Confirmer", "Supprimer la clé sélectionnée ?", icon="question", parent=self):
             remaining = [k for k in self.settings.get("api_keys_list", []) if k.get("id") not in sel]
             self.settings["api_keys_list"] = remaining
             self._refresh_key_tree()
@@ -1103,13 +1114,13 @@ class SettingsWindow(BaseWindow):
                 if self.task_queue:
                     self.task_queue.put({"type": "reload_system"})
                 
-                messagebox.showinfo("Sauvegardé", "Configuration appliquée en temps réel !", parent=self)
+                show_messagebox("Sauvegardé", "Configuration appliquée en temps réel !", icon="info", parent=self)
                 self.destroy()
             else:
-                messagebox.showerror("Erreur", "Impossible d'écrire le fichier settings.json")
+                show_messagebox("Erreur", "Impossible d'écrire le fichier settings.json", icon="error", parent=self)
         except Exception as e:
             log.error(f"Erreur Save: {e}")
-            messagebox.showerror("Erreur Critique", str(e))
+            show_messagebox("Erreur Critique", str(e), icon="error", parent=self)
     # --- NOUVELLES MÉTHODES POUR L'EXCLUSION ---
 
     def _show_exclusion_menu(self):

@@ -1,6 +1,6 @@
 import customtkinter as ctk
-from tkinter import messagebox, ttk
-from ui.widgets import COLORS
+from tkinter import ttk
+from ui.widgets import COLORS, show_messagebox
 from ui.windows.base import BaseWindow
 from features.Decorators import trace_action
 
@@ -95,7 +95,7 @@ class DbManagerWindow(BaseWindow):
         self.destroy()
 
     def _delete_db_direct(self):
-        if messagebox.askyesno("Confirmation", "Supprimer la base de connaissances locale ?", parent=self):
+        if show_messagebox("Confirmation", "Supprimer la base de connaissances locale ?", icon="question", parent=self):
             self.task_queue.put({'type': 'delete_db'})
             self.destroy()
 
@@ -153,7 +153,7 @@ class BackupManagerWindow(BaseWindow):
     def _create_backup(self):
         # Correction : Appel direct au Worker (type 'backup_now') au lieu de passer par le chat
         self.task_queue.put({'type': 'backup_now'})
-        messagebox.showinfo("Info", "Sauvegarde lancée en arrière-plan.", parent=self)
+        show_messagebox("Info", "Sauvegarde lancée en arrière-plan.", icon="info", parent=self)
 
     @trace_action(source="tools")
     def _refresh(self):
@@ -173,10 +173,10 @@ class BackupManagerWindow(BaseWindow):
     def _restore_selected(self):
         selected = self.tree.selection()
         if not selected:
-            messagebox.showwarning("Attention", "Veuillez sélectionner un fichier à restaurer.", parent=self)
+            show_messagebox("Attention", "Veuillez sélectionner un fichier à restaurer.", icon="warning", parent=self)
             return
         item = self.tree.item(selected[0])
         backup_filename = item['values'][3]
-        if messagebox.askyesno("Confirmer la restauration", f"Voulez-vous écraser les fichiers actuels avec {backup_filename} ?", parent=self):
+        if show_messagebox("Confirmer la restauration", f"Voulez-vous écraser les fichiers actuels avec {backup_filename} ?", icon="question", parent=self):
             self.task_queue.put({'type': 'restore_backup', 'filename': backup_filename})
             self.destroy()

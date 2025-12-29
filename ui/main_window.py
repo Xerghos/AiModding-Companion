@@ -1,6 +1,6 @@
 import time
 import tkinter as tk
-from tkinter import messagebox, filedialog, ttk
+from tkinter import filedialog, ttk
 import customtkinter as ctk
 import os
 import logging
@@ -22,7 +22,7 @@ import features.audio as audio_manager
 import ui.syntax as syntax_highlighter
 
 # --- Imports UI Components ---
-from ui.widgets import TextEditorWithLineNumbers, COLORS, ApiKeyStatusMenu, ReasoningModeSwitch
+from ui.widgets import TextEditorWithLineNumbers, COLORS, ApiKeyStatusMenu, ReasoningModeSwitch, show_messagebox, add_tooltip
 from ui.windows import (
     SettingsWindow, DbManagerWindow, 
     WaitingListWindow, BackupManagerWindow,
@@ -93,6 +93,7 @@ class GeminiApp:
         # Bouton Actualiser
         btn_refresh = ctk.CTkButton(self.sidebar, text="Actualiser", height=25, command=self._refresh_explorer)
         btn_refresh.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+        add_tooltip(btn_refresh, "Actualise l'arborescence des fichiers")
         
         # Treeview
         self.tree_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -145,10 +146,12 @@ class GeminiApp:
         self.btn_mic = ctk.CTkButton(self.input_frame, text="🎤", width=40, height=40, 
                                      command=lambda: task_queue.put({'type': 'start_asr'}))
         self.btn_mic.pack(side="left", padx=5, pady=5)
+        add_tooltip(self.btn_mic, "Démarrer la reconnaissance vocale")
         
         self.btn_speak = ctk.CTkButton(self.input_frame, text="🔊", width=40, height=40, 
                                        command=lambda: task_queue.put({'type': 'start_tts', 'text': self._get_last_response()}))
         self.btn_speak.pack(side="left", padx=5, pady=5)
+        add_tooltip(self.btn_speak, "Lire la dernière réponse à voix haute")
 
         self.input_txt = ctk.CTkTextbox(self.input_frame, height=60, font=("Arial", 12))
         self.input_txt.pack(side="left", fill="both", expand=True, padx=10, pady=5)
@@ -221,7 +224,7 @@ class GeminiApp:
         try:
             current_tab = self.tab_view.get()
             if current_tab in ["Chat Principal", "Chat Secondaire"]:
-                messagebox.showinfo("Info", "Impossible de sauvegarder le chat comme fichier code.")
+                show_messagebox("Info", "Impossible de sauvegarder le chat comme fichier code.", icon="info")
                 return
 
             tab_frame = self.tab_view.tab(current_tab)
@@ -252,10 +255,10 @@ class GeminiApp:
                 self.status_var.set(f"Sauvegardé : {os.path.basename(self.current_file_path)}")
                 task_queue.put({"type": "file_updated", "path": self.current_file_path})
             else:
-                messagebox.showwarning("Erreur", "Impossible de trouver l'éditeur.")
+                show_messagebox("Erreur", "Impossible de trouver l'éditeur.", icon="warning")
 
         except Exception as e:
-            messagebox.showerror("Erreur", f"Erreur sauvegarde : {e}")
+            show_messagebox("Erreur", f"Erreur sauvegarde : {e}", icon="error")
 
     def _on_open_file(self):
         path = filedialog.askopenfilename()

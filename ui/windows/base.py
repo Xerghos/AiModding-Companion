@@ -1,9 +1,8 @@
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import messagebox
 import traceback
 import logging
-from ui.widgets import COLORS
+from ui.widgets import COLORS, show_messagebox
 from features.Decorators import trace_action
 
 log = logging.getLogger("ui.windows.base")
@@ -59,7 +58,7 @@ class BaseWindow(ctk.CTkToplevel):
         """Affiche une erreur bloquante à l'utilisateur (Fail Loud)."""
         msg = f"Erreur dans {context}: {str(e)}"
         log.error(f"{msg}\n{traceback.format_exc()}")
-        messagebox.showerror("Erreur Application", f"{msg}\n\n(Voir logs pour traceback)", parent=self)
+        show_messagebox("Erreur Application", f"{msg}\n\n(Voir logs pour traceback)", icon="error", parent=self)
 
 class KeyCaptureDialog(BaseWindow):
     """

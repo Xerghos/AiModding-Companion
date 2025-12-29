@@ -5,6 +5,35 @@ import logging
 import time
 import re # Nécessaire pour la recherche/remplacement
 
+# Import CTkMessagebox pour remplacer messagebox tkinter
+try:
+    from CTkMessagebox import CTkMessagebox
+    CTKMESSAGEBOX_AVAILABLE = True
+except ImportError:
+    CTKMESSAGEBOX_AVAILABLE = False
+    # Fallback vers messagebox tkinter si CTkMessagebox n'est pas disponible
+    from tkinter import messagebox as CTkMessagebox
+
+# Import CTkToolTip pour les tooltips modernes
+try:
+    from CTkToolTip import CTkToolTip
+    CTKTOOLTIP_AVAILABLE = True
+except ImportError:
+    CTKTOOLTIP_AVAILABLE = False
+    CTkToolTip = None
+
+def add_tooltip(widget, message, delay=0.5):
+    """
+    Ajoute un tooltip à un widget si CTkToolTip est disponible.
+    
+    Args:
+        widget: Widget auquel ajouter le tooltip
+        message: Message du tooltip
+        delay: Délai avant affichage en secondes
+    """
+    if CTKTOOLTIP_AVAILABLE and CTkToolTip:
+        CTkToolTip(widget, message=message, delay=delay)
+
 log = logging.getLogger("ui.widgets")
 
 # --- COULEURS GLOBALES ---
@@ -21,6 +50,71 @@ COLORS = {
     "WARNING": "#FF9800",
     "INFO": "#2196F3"
 }
+
+# --- WRAPPER CTkMessagebox ---
+def show_messagebox(title, message, icon="info", parent=None, **kwargs):
+    """
+    Wrapper pour CTkMessagebox avec API similaire à messagebox tkinter.
+    
+    Args:
+        title: Titre de la boîte de dialogue
+        message: Message à afficher
+        icon: Type d'icône ("info", "warning", "error", "question", "check")
+        parent: Fenêtre parente
+        **kwargs: Arguments supplémentaires pour CTkMessagebox
+    
+    Returns:
+        Résultat de la boîte de dialogue (pour askyesno: True/False)
+    """
+    if not CTKMESSAGEBOX_AVAILABLE:
+        # Fallback vers messagebox tkinter
+        from tkinter import messagebox
+        if icon == "info":
+            return messagebox.showinfo(title, message, parent=parent)
+        elif icon == "warning":
+            return messagebox.showwarning(title, message, parent=parent)
+        elif icon == "error" or icon == "cancel":
+            return messagebox.showerror(title, message, parent=parent)
+        elif icon == "question":
+            return messagebox.askyesno(title, message, parent=parent)
+        else:
+            return messagebox.showinfo(title, message, parent=parent)
+    
+    # Mapping des icônes
+    icon_map = {
+        "info": "info",
+        "warning": "warning",
+        "error": "cancel",
+        "cancel": "cancel",
+        "question": "question",
+        "check": "check"
+    }
+    
+    ctk_icon = icon_map.get(icon, "info")
+    
+    # Pour les questions (askyesno), utiliser option_1 et option_2
+    if icon == "question":
+        result = CTkMessagebox(
+            title=title,
+            message=message,
+            icon=ctk_icon,
+            option_1="Oui",
+            option_2="Non",
+            parent=parent,
+            **kwargs
+        )
+        # CTkMessagebox retourne "Oui" ou "Non", convertir en booléen
+        return result.get() == "Oui"
+    else:
+        # Pour les autres types, pas de retour de valeur
+        CTkMessagebox(
+            title=title,
+            message=message,
+            icon=ctk_icon,
+            parent=parent,
+            **kwargs
+        )
+        return None
 
 class TextEditorWithLineNumbers(ctk.CTkFrame):
     """

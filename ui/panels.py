@@ -2,7 +2,7 @@ import customtkinter as ctk
 import tkinter as tk
 import os
 import ui.syntax as syntax_highlighter
-from ui.widgets import TextEditorWithLineNumbers, COLORS, ApiKeyStatusMenu, ReasoningModeSwitch
+from ui.widgets import TextEditorWithLineNumbers, COLORS, ApiKeyStatusMenu, ReasoningModeSwitch, add_tooltip
 from ui.icons import IconProvider
 from features.Decorators import trace_action
 
@@ -44,22 +44,38 @@ class MainPanel(ctk.CTkFrame):
         self.toolbar = ctk.CTkFrame(self, height=40)
         self.toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 5))
         
-        ctk.CTkButton(self.toolbar, text="⚙️ Paramètres", width=100, command=self.cb.get('open_settings')).pack(side="left", padx=2)
+        btn_settings = ctk.CTkButton(self.toolbar, text="⚙️ Paramètres", width=100, command=self.cb.get('open_settings'))
+        btn_settings.pack(side="left", padx=2)
+        add_tooltip(btn_settings, "Ouvrir les paramètres de l'application")
+        
         self.btn_api = ctk.CTkButton(self.toolbar, text="🔑 Clés API", width=90, command=self.cb.get('toggle_api'))
         self.btn_api.pack(side="left", padx=2)
+        add_tooltip(self.btn_api, "Gérer les clés API")
         
         try:
             self.api_status_menu = ApiKeyStatusMenu(self.winfo_toplevel(), task_queue=self.task_queue)
         except: self.api_status_menu = None
 
-        ctk.CTkButton(self.toolbar, text="🕒 Backups", width=90, fg_color=COLORS["BG_SECONDARY"], command=self.cb.get('open_backups')).pack(side="left", padx=2)
-        ctk.CTkButton(self.toolbar, text="🧠 RAG", width=70, command=self.cb.get('open_rag')).pack(side="left", padx=2)
-        ctk.CTkButton(self.toolbar, text="⏳ Queue", width=50, command=self.cb.get('open_queue')).pack(side="left", padx=2)
-        ctk.CTkButton(self.toolbar, text="❌ Fermer", width=60, fg_color=COLORS["ERROR"], command=self._close_current_tab).pack(side="left", padx=10)
+        btn_backups = ctk.CTkButton(self.toolbar, text="🕒 Backups", width=90, fg_color=COLORS["BG_SECONDARY"], command=self.cb.get('open_backups'))
+        btn_backups.pack(side="left", padx=2)
+        add_tooltip(btn_backups, "Gérer les sauvegardes")
+        
+        btn_rag = ctk.CTkButton(self.toolbar, text="🧠 RAG", width=70, command=self.cb.get('open_rag'))
+        btn_rag.pack(side="left", padx=2)
+        add_tooltip(btn_rag, "Gérer la base de connaissances (RAG)")
+        
+        btn_queue = ctk.CTkButton(self.toolbar, text="⏳ Queue", width=50, command=self.cb.get('open_queue'))
+        btn_queue.pack(side="left", padx=2)
+        add_tooltip(btn_queue, "Voir la file d'attente des tâches")
+        
+        btn_close = ctk.CTkButton(self.toolbar, text="❌ Fermer", width=60, fg_color=COLORS["ERROR"], command=self._close_current_tab)
+        btn_close.pack(side="left", padx=10)
+        add_tooltip(btn_close, "Fermer l'onglet actuel")
 
         self.cmd_menu = ctk.CTkOptionMenu(self.toolbar, values=list(QUICK_PROMPTS.keys()), command=self._on_quick_prompt, width=180)
         self.cmd_menu.set("✨ Prompts Rapides")
         self.cmd_menu.pack(side="right", padx=5)
+        add_tooltip(self.cmd_menu, "Commandes rapides disponibles")
 
     @trace_action(source="panels")
     def _setup_tabs(self):
@@ -88,12 +104,19 @@ class MainPanel(ctk.CTkFrame):
 
         self.btn_send = ctk.CTkButton(self.input_frame, text="Envoyer", width=80, command=self._on_send_press)
         self.btn_send.pack(side="right", padx=5, pady=5)
+        add_tooltip(self.btn_send, "Envoyer le message (Ctrl+Enter)")
         
-        ctk.CTkButton(self.input_frame, text="🎤", width=40, command=lambda: self.task_queue.put({'type': 'start_asr'})).pack(side="left", padx=5)
-        ctk.CTkButton(self.input_frame, text="🔊", width=40, command=lambda: self.task_queue.put({'type': 'start_tts'})).pack(side="left", padx=2)
+        btn_mic = ctk.CTkButton(self.input_frame, text="🎤", width=40, command=lambda: self.task_queue.put({'type': 'start_asr'}))
+        btn_mic.pack(side="left", padx=5)
+        add_tooltip(btn_mic, "Reconnaissance vocale")
+        
+        btn_speak = ctk.CTkButton(self.input_frame, text="🔊", width=40, command=lambda: self.task_queue.put({'type': 'start_tts'}))
+        btn_speak.pack(side="left", padx=2)
+        add_tooltip(btn_speak, "Synthèse vocale")
         
         self.input_txt = ctk.CTkTextbox(self.input_frame, height=60, font=("Arial", 11))
         self.input_txt.pack(side="left", fill="x", expand=True, padx=5, pady=5)
+        add_tooltip(self.input_txt, "Tapez votre message ici (Ctrl+Enter pour envoyer)")
         
         # BINDINGS HISTORIQUE (RESTAURÉS)
         self.input_txt.bind("<Return>", self._on_enter)
