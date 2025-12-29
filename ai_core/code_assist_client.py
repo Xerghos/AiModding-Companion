@@ -20,6 +20,9 @@ from ai_core.code_assist_converter import (
 )
 from ai_core.sessions import _save_codeassist_payload_log
 
+# Flag pour activer les logs détaillés du stream (désactivé par défaut)
+DEBUG_STREAM = os.environ.get("CODEASSIST_DEBUG_STREAM", "false").lower() == "true"
+
 
 def get_tools_from_mcp_server() -> Optional[List[Dict[str, Any]]]:
     """
@@ -475,36 +478,123 @@ class CodeAssistClient:
                 response.raise_for_status()
 
                 # Parser les chunks SSE
-                buffer = ""
+                line_count = 0
+                chunk_count = 0
                 for line in response.iter_lines():
                     if line:
                         try:
                             line_text = line.decode('utf-8')
-                            buffer += line_text + "\n"
-
+                            line_count += 1
+                            
+                            # Log chaque ligne brute (toujours, pour diagnostic)
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "STREAM_RAW",
+                                f"Ligne {line_count} reçue ({len(line_text)} chars): {line_text[:200]}"
+                            )
+                            
+                            # Log les lignes qui ne commencent pas par "data: " (pour identifier d'autres formats)
+                            if not line_text.startswith("data: "):
+                                if line_text.strip():
+                                    UnifiedLogger.write(
+                                        "AI_CORE",
+                                        "STREAM_RAW",
+                                        f"Ligne non-data ({line_count}): {line_text[:200]}"
+                                    )
+                                else:
+                                    UnifiedLogger.write(
+                                        "AI_CORE",
+                                        "STREAM_RAW",
+                                        f"Ligne vide ({line_count})"
+                                    )
+                            
                             # Parser les chunks SSE de CodeAssist
-                            # Format: "data: {...}\n\n"
-                            while "\n\n" in buffer:
-                                chunk_text, buffer = buffer.split("\n\n", 1)
-
-                                if chunk_text.startswith("data: "):
-                                    data_json = chunk_text[6:].strip()
-                                    if data_json:
-                                        try:
-                                            data = json.loads(data_json)
-                                            yield data
-                                        except json.JSONDecodeError as e:
+                            # Format: chaque ligne "data: {...}" est un chunk complet
+                            # CodeAssist envoie chaque chunk sur une ligne séparée, pas avec \n\n
+                            if line_text.startswith("data: "):
+                                data_json = line_text[6:].strip()
+                                if data_json:
+                                    try:
+                                        data = json.loads(data_json)
+                                        chunk_count += 1
+                                        
+                                        # Log succès parsing (toujours, mais limité)
+                                        UnifiedLogger.write(
+                                            "AI_CORE",
+                                            "STREAM_PARSE",
+                                            f"Chunk JSON {chunk_count} parsé avec succès"
+                                        )
+                                        
+                                        # Log structure du chunk (toujours)
+                                        if isinstance(data, dict):
+                                            keys = list(data.keys())
                                             UnifiedLogger.write(
                                                 "AI_CORE",
-                                                "WARNING",
-                                                f"Erreur parsing JSON chunk: {e}"
+                                                "STREAM_STRUCT",
+                                                f"Chunk {chunk_count} - Clés: {keys}"
                                             )
+                                        
+                                        # Log contenu complet (mode DEBUG seulement)
+                                        if DEBUG_STREAM:
+                                            try:
+                                                data_str = json.dumps(data, indent=2, ensure_ascii=False)
+                                                UnifiedLogger.write(
+                                                    "AI_CORE",
+                                                    "STREAM_PARSE",
+                                                    f"Chunk {chunk_count} complet:\n{data_str[:1000]}"
+                                                )
+                                            except Exception:
+                                                pass
+                                        
+                                        yield data
+                                    except json.JSONDecodeError as e:
+                                        UnifiedLogger.write(
+                                            "AI_CORE",
+                                            "STREAM_ERROR",
+                                            f"Erreur parsing JSON chunk {chunk_count + 1}: {e}"
+                                        )
+                                        UnifiedLogger.write(
+                                            "AI_CORE",
+                                            "STREAM_ERROR",
+                                            f"Ligne qui a échoué: {line_text[:500]}"
+                                        )
+                            else:
+                                # Ligne qui ne commence pas par "data: " - peut être un événement SSE différent
+                                # (ex: "event: ...", "id: ...", ligne vide, etc.)
+                                if line_text.strip() and not line_text.startswith("event:") and not line_text.startswith("id:"):
+                                    UnifiedLogger.write(
+                                        "AI_CORE",
+                                        "STREAM_RAW",
+                                        f"Ligne non-data ignorée ({line_count}): {line_text[:200]}"
+                                    )
                         except Exception as e:
                             UnifiedLogger.write(
                                 "AI_CORE",
-                                "WARNING",
-                                f"Erreur traitement chunk streaming: {e}"
+                                "STREAM_ERROR",
+                                f"Erreur traitement ligne {line_count}: {e}"
                             )
+                            if DEBUG_STREAM:
+                                import traceback
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "STREAM_ERROR",
+                                    f"Traceback: {traceback.format_exc()}"
+                                )
+                
+                # Log résumé du parsing SSE
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "STREAM_SUMMARY",
+                    f"Parsing SSE terminé: {line_count} lignes reçues, {chunk_count} chunks parsés"
+                )
+                
+                # Si aucun chunk n'a été parsé, logger un avertissement
+                if chunk_count == 0:
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "STREAM_ERROR",
+                        f"Aucun chunk parsé malgré {line_count} lignes reçues."
+                    )
 
                 UnifiedLogger.write(
                     "AI_CORE",
@@ -731,11 +821,34 @@ class CodeAssistClient:
             # Convertir les chunks au format LiteLLM
             def stream_generator():
                 full_text = ""
+                total_chunks = 0
+                chunks_with_text = 0
+                chunks_with_metrics = 0
+                
                 for chunk in chunks:
+                    total_chunks += 1
+                    
+                    # Log chunk brut (mode DEBUG seulement)
+                    if DEBUG_STREAM:
+                        try:
+                            chunk_str = json.dumps(chunk, indent=2, ensure_ascii=False)
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "STREAM_CHUNK_RAW",
+                                f"Chunk {total_chunks} brut:\n{chunk_str[:1000]}"
+                            )
+                        except Exception:
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "STREAM_CHUNK_RAW",
+                                f"Chunk {total_chunks} brut (non-serializable): {type(chunk)}"
+                            )
+                    
                     # DEBUG: Log la structure du chunk si usageMetadata est présent
                     if isinstance(chunk, dict):
                         # Vérifier usageMetadata dans le chunk original (avant conversion)
                         if "usageMetadata" in chunk:
+                            chunks_with_metrics += 1
                             usage = chunk["usageMetadata"]
                             prompt_tokens = usage.get("promptTokenCount", 0)
                             candidates_tokens = usage.get("candidatesTokenCount", 0)
@@ -743,11 +856,12 @@ class CodeAssistClient:
                             UnifiedLogger.write(
                                 "AI_CORE",
                                 "METRICS",
-                                f"📊 Usage (chunk direct): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
+                                f"Usage (chunk direct): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
                             )
                         # Vérifier aussi dans response si présent
                         if "response" in chunk and isinstance(chunk["response"], dict):
                             if "usageMetadata" in chunk["response"]:
+                                chunks_with_metrics += 1
                                 usage = chunk["response"]["usageMetadata"]
                                 prompt_tokens = usage.get("promptTokenCount", 0)
                                 candidates_tokens = usage.get("candidatesTokenCount", 0)
@@ -755,46 +869,138 @@ class CodeAssistClient:
                                 UnifiedLogger.write(
                                     "AI_CORE",
                                     "METRICS",
-                                    f"📊 Usage (response): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
+                                    f"Usage (response): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
                                 )
                     
                     # Convertir chaque chunk
                     gemini_chunk = from_generate_content_response(chunk)
                     
+                    # Log chunk converti (mode DEBUG seulement)
+                    if DEBUG_STREAM:
+                        try:
+                            gemini_str = json.dumps(gemini_chunk, indent=2, ensure_ascii=False)
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "STREAM_CHUNK_CONV",
+                                f"Chunk {total_chunks} converti:\n{gemini_str[:1000]}"
+                            )
+                        except Exception:
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "STREAM_CHUNK_CONV",
+                                f"Chunk {total_chunks} converti (non-serializable): {type(gemini_chunk)}"
+                            )
+                    
+                    # Log structure candidates (toujours)
+                    if "candidates" in gemini_chunk:
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "STREAM_CANDIDATES",
+                            f"Chunk {total_chunks} - Nombre de candidates: {len(gemini_chunk['candidates'])}"
+                        )
+                        if len(gemini_chunk['candidates']) > 0:
+                            candidate = gemini_chunk['candidates'][0]
+                            candidate_keys = list(candidate.keys()) if isinstance(candidate, dict) else []
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "STREAM_CANDIDATES",
+                                f"Chunk {total_chunks} - Clés candidate[0]: {candidate_keys}"
+                            )
+                    else:
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "STREAM_CANDIDATES",
+                            f"Chunk {total_chunks} - Aucun candidate présent"
+                        )
+                    
                     # Extraire le texte du chunk
                     if "candidates" in gemini_chunk and len(gemini_chunk["candidates"]) > 0:
                         candidate = gemini_chunk["candidates"][0]
-                        if "content" in candidate and "parts" in candidate["content"]:
-                            chunk_text = ""
-                            for part in candidate["content"]["parts"]:
-                                if "text" in part:
-                                    chunk_text += part["text"]
-                            
-                            if chunk_text:
-                                full_text += chunk_text
+                        
+                        # Log structure du candidate
+                        if DEBUG_STREAM:
+                            if isinstance(candidate, dict):
+                                candidate_keys = list(candidate.keys())
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "STREAM_CANDIDATES",
+                                    f"Chunk {total_chunks} - Structure candidate: {candidate_keys}"
+                                )
+                        
+                        if "content" in candidate:
+                            if isinstance(candidate["content"], dict) and "parts" in candidate["content"]:
+                                # Log nombre de parts
+                                parts_count = len(candidate["content"]["parts"])
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "STREAM_CANDIDATES",
+                                    f"Chunk {total_chunks} - Nombre de parts: {parts_count}"
+                                )
                                 
-                                # Créer un objet compatible avec le format LiteLLM
-                                class DeltaObject:
-                                    def __init__(self, content):
-                                        self.content = content
-                                        self.text = content
+                                chunk_text = ""
+                                for i, part in enumerate(candidate["content"]["parts"]):
+                                    if isinstance(part, dict) and "text" in part:
+                                        part_text = part["text"]
+                                        chunk_text += part_text
+                                        
+                                        if DEBUG_STREAM:
+                                            UnifiedLogger.write(
+                                                "AI_CORE",
+                                                "STREAM_CANDIDATES",
+                                                f"Chunk {total_chunks} - Part {i}: {len(part_text)} caractères"
+                                            )
                                 
-                                class ChoiceObject:
-                                    def __init__(self, delta):
-                                        self.delta = delta
-                                
-                                class ChunkObject:
-                                    def __init__(self, choice):
-                                        self.choices = [choice]
-                                
-                                delta = DeltaObject(chunk_text)
-                                choice = ChoiceObject(delta)
-                                chunk_obj = ChunkObject(choice)
-                                
-                                yield chunk_obj
+                                if chunk_text:
+                                    chunks_with_text += 1
+                                    full_text += chunk_text
+                                    
+                                    UnifiedLogger.write(
+                                        "AI_CORE",
+                                        "STREAM_CANDIDATES",
+                                        f"Chunk {total_chunks} - Texte extrait: {len(chunk_text)} caractères"
+                                    )
+                                    
+                                    # Créer un objet compatible avec le format LiteLLM
+                                    class DeltaObject:
+                                        def __init__(self, content):
+                                            self.content = content
+                                            self.text = content
+                                    
+                                    class ChoiceObject:
+                                        def __init__(self, delta):
+                                            self.delta = delta
+                                    
+                                    class ChunkObject:
+                                        def __init__(self, choice):
+                                            self.choices = [choice]
+                                    
+                                    delta = DeltaObject(chunk_text)
+                                    choice = ChoiceObject(delta)
+                                    chunk_obj = ChunkObject(choice)
+                                    
+                                    yield chunk_obj
+                                else:
+                                    UnifiedLogger.write(
+                                        "AI_CORE",
+                                        "STREAM_CANDIDATES",
+                                        f"Chunk {total_chunks} - Aucun texte extrait des parts"
+                                    )
+                            else:
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "STREAM_CANDIDATES",
+                                    f"Chunk {total_chunks} - candidate.content n'est pas un dict avec 'parts'"
+                                )
+                        else:
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "STREAM_CANDIDATES",
+                                f"Chunk {total_chunks} - candidate n'a pas de 'content'"
+                            )
                     
                     # LOGGING DES METRICS (Usage Metadata) - après conversion
                     if "usageMetadata" in gemini_chunk:
+                        chunks_with_metrics += 1
                         usage = gemini_chunk["usageMetadata"]
                         prompt_tokens = usage.get("promptTokenCount", 0)
                         candidates_tokens = usage.get("candidatesTokenCount", 0)
@@ -802,12 +1008,13 @@ class CodeAssistClient:
                         UnifiedLogger.write(
                             "AI_CORE",
                             "METRICS",
-                            f"📊 Usage (gemini_chunk): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
+                            f"Usage (gemini_chunk): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
                         )
                     # Vérifier aussi dans candidates[0] si présent
                     elif "candidates" in gemini_chunk and len(gemini_chunk["candidates"]) > 0:
                         candidate = gemini_chunk["candidates"][0]
-                        if "usageMetadata" in candidate:
+                        if isinstance(candidate, dict) and "usageMetadata" in candidate:
+                            chunks_with_metrics += 1
                             usage = candidate["usageMetadata"]
                             prompt_tokens = usage.get("promptTokenCount", 0)
                             candidates_tokens = usage.get("candidatesTokenCount", 0)
@@ -815,8 +1022,16 @@ class CodeAssistClient:
                             UnifiedLogger.write(
                                 "AI_CORE",
                                 "METRICS",
-                                f"📊 Usage (candidate): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
+                                f"Usage (candidate): Prompt={prompt_tokens}, Candidates={candidates_tokens}, Total={total_tokens}"
                             )
+                
+                # Résumé final du stream
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "STREAM_SUMMARY",
+                    f"Résumé stream: {total_chunks} chunks reçus, {chunks_with_text} avec texte, "
+                    f"{chunks_with_metrics} avec métriques, {len(full_text)} caractères totaux"
+                )
                 
                 # Dernier chunk avec le texte complet
                 if full_text:
