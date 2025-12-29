@@ -180,10 +180,11 @@ def to_generate_content_request(
     
     if all_text_parts:
         full_system_instruction = "\n\n".join(all_text_parts)
-        vertex_request["systemInstruction"] = {
-            "role": "system",
-            "parts": [{"text": full_system_instruction}]
-        }
+        # Utiliser OrderedDict pour garantir l'ordre exact des clés
+        vertex_request["systemInstruction"] = OrderedDict([
+            ("role", "system"),
+            ("parts", [OrderedDict([("text", full_system_instruction)])])
+        ])
     
     # 3. Outils avec toolConfig conditionnel (EN PREMIER - ordre critique pour API v1internal)
     # BLINDAGE ERREUR 500: toolConfig peut être requis pour éviter null pointer exceptions
@@ -191,17 +192,19 @@ def to_generate_content_request(
         vertex_request["tools"] = _convert_tools_to_gemini_format(tools)
         # Ajouter toolConfig pour lever l'ambiguïté du mode d'exécution
         # Mode AUTO: le modèle décide s'il doit appeler un outil ou générer du texte
-        vertex_request["toolConfig"] = {
-            "functionCallingConfig": {
-                "mode": "AUTO"
-            }
-        }
+        # Utiliser OrderedDict pour garantir l'ordre exact des clés
+        vertex_request["toolConfig"] = OrderedDict([
+            ("functionCallingConfig", OrderedDict([
+                ("mode", "AUTO")
+            ]))
+        ])
     
     # 4. generationConfig EN DERNIER (REQUIS - ordre critique pour API v1internal)
     # Le payload fonctionnel gemini-cli place generationConfig après tools/toolConfig
-    vertex_request["generationConfig"] = {
-        "temperature": float(temperature)  # Forcer float explicite
-    }
+    # Utiliser OrderedDict pour garantir l'ordre exact des clés
+    vertex_request["generationConfig"] = OrderedDict([
+        ("temperature", float(temperature))  # Forcer float explicite
+    ])
     
     # Optionnels (garder pour compatibilité mais généralement non utilisés par gemini-cli)
     if safety_settings:
@@ -212,13 +215,14 @@ def to_generate_content_request(
         vertex_request["cachedContent"] = cached_content
     
     # Construire la requête CodeAssist finale avec OrderedDict pour garantir l'ordre exact
+    # ORDRE CRITIQUE : model → project → user_prompt_id → request (comme gemini-cli)
     ca_request = OrderedDict()
     ca_request["model"] = model
-    ca_request["request"] = vertex_request
     if project_id:
         ca_request["project"] = project_id
     if user_prompt_id:
         ca_request["user_prompt_id"] = user_prompt_id
+    ca_request["request"] = vertex_request
     
     return ca_request
 
@@ -333,5 +337,6 @@ def _convert_tools_to_gemini_format(tools: List[Dict]) -> List[Dict[str, Any]]:
                 function_declarations.append(func_decl)
     
     if function_declarations:
-        return [{"functionDeclarations": function_declarations}]
+        # Utiliser OrderedDict pour garantir l'ordre exact des clés
+        return [OrderedDict([("functionDeclarations", function_declarations)])]
     return []
