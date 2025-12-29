@@ -2,14 +2,15 @@
 Convertisseur entre les formats Gemini API et CodeAssist.
 Base sur packages/core/src/code_assist/converter.ts de gemini-cli.
 
-CORRECTION FINALE: Aligné sur le payload gemini-cli qui FONCTIONNE:
-- contents: VIDE [] (gemini-cli met tout dans systemInstruction)
-- systemInstruction: contient TOUT (contexte + messages user/assistant)
-- PAS de generationConfig
-- toolConfig: OPTIONNEL (peut être requis pour éviter null pointer exceptions sur v1internal)
+CORRECTION FINALE: Aligné sur le payload gemini-cli capturé qui FONCTIONNE:
+- contents: REMPLI avec les messages user/assistant (format {"role": "user", "parts": [{"text": "..."}]})
+- systemInstruction: contient le contexte système avec role: "user" (pas "system")
+- user_prompt_id: AVANT request (model → project → user_prompt_id → request)
+- parametersJsonSchema: utilise "parametersJsonSchema" (pas "parameters") avec types en minuscules
+- toolConfig: ABSENT (pas nécessaire selon le payload capturé)
 
 BLINDAGE ERREUR 500:
-- Sanitizer de schéma: types en MAJUSCULES, suppression champs interdits
+- Sanitizer de schéma: types en minuscules pour parametersJsonSchema, suppression champs interdits
 - Détection arrays d'objets imbriqués (bug connu Google)
 """
 
@@ -26,18 +27,19 @@ import uuid
 FORBIDDEN_SCHEMA_FIELDS = {"title", "default", "examples", "additionalProperties", "$schema", "$id", "$ref"}
 
 
-def sanitize_schema_for_codeassist(schema: Any, _depth: int = 0) -> Any:
+def sanitize_schema_for_codeassist(schema: Any, _depth: int = 0, use_uppercase: bool = False) -> Any:
     """
     Sanitize récursivement un schéma JSON pour le rendre compatible avec l'API v1internal.
     
     Actions:
-    1. Convertir tous les types en MAJUSCULES (object -> OBJECT, string -> STRING)
+    1. Convertir les types en MAJUSCULES si use_uppercase=True (pour "parameters"), sinon garder minuscules (pour "parametersJsonSchema")
     2. Supprimer les champs interdits (title, default, examples, additionalProperties, etc.)
     3. Détecter et logger les arrays d'objets imbriqués (bug connu Google - peut causer erreur 500)
     
     Args:
         schema: Le schéma JSON à sanitizer (dict, list, ou valeur primitive)
         _depth: Profondeur de récursion (pour logging debug)
+        use_uppercase: Si True, convertit les types en MAJUSCULES (pour "parameters"), sinon garde minuscules (pour "parametersJsonSchema")
     
     Returns:
         Le schéma sanitizé compatible avec l'API CodeAssist v1internal
@@ -49,7 +51,7 @@ def sanitize_schema_for_codeassist(schema: Any, _depth: int = 0) -> Any:
     # Cas de base: pas un dict
     if not isinstance(schema, dict):
         if isinstance(schema, list):
-            return [sanitize_schema_for_codeassist(item, _depth + 1) for item in schema]
+            return [sanitize_schema_for_codeassist(item, _depth + 1, use_uppercase) for item in schema]
         return schema
     
     result = {}
@@ -64,31 +66,34 @@ def sanitize_schema_for_codeassist(schema: Any, _depth: int = 0) -> Any:
             result["enum"] = [value]
             continue
         
-        # 3. Convertir les types en MAJUSCULES
+        # 3. Convertir les types selon use_uppercase
         if key == "type":
             if isinstance(value, str):
-                result[key] = value.upper()
+                # Pour parametersJsonSchema, garder minuscules (comme dans le payload capturé)
+                # Pour parameters (legacy), convertir en majuscules
+                result[key] = value.upper() if use_uppercase else value.lower()
             elif isinstance(value, list):
                 # Type union (ex: ["string", "null"]) - prendre le premier non-null
                 non_null_types = [t for t in value if t != "null"]
                 if non_null_types:
-                    result[key] = non_null_types[0].upper()
+                    result[key] = non_null_types[0].upper() if use_uppercase else non_null_types[0].lower()
                 else:
-                    result[key] = "STRING"  # Fallback
+                    result[key] = "STRING" if use_uppercase else "string"  # Fallback
             else:
                 result[key] = value
             continue
         
         # 4. Traitement récursif des propriétés
         if key == "properties" and isinstance(value, dict):
-            result[key] = {k: sanitize_schema_for_codeassist(v, _depth + 1) for k, v in value.items()}
+            result[key] = {k: sanitize_schema_for_codeassist(v, _depth + 1, use_uppercase) for k, v in value.items()}
             continue
         
         # 5. Traitement récursif des items (pour les arrays)
         if key == "items" and isinstance(value, dict):
-            sanitized_items = sanitize_schema_for_codeassist(value, _depth + 1)
+            sanitized_items = sanitize_schema_for_codeassist(value, _depth + 1, use_uppercase)
             # DETECTION BUG: Array d'objets imbriqués (bug connu Google)
-            if sanitized_items.get("type") == "OBJECT":
+            item_type = sanitized_items.get("type", "").upper()
+            if item_type == "OBJECT":
                 # Logger un warning mais continuer (le bug peut être corrigé côté Google)
                 try:
                     from features.UnifiedLogger import UnifiedLogger
@@ -104,9 +109,9 @@ def sanitize_schema_for_codeassist(schema: Any, _depth: int = 0) -> Any:
         
         # 6. Traitement récursif des autres dicts
         if isinstance(value, dict):
-            result[key] = sanitize_schema_for_codeassist(value, _depth + 1)
+            result[key] = sanitize_schema_for_codeassist(value, _depth + 1, use_uppercase)
         elif isinstance(value, list):
-            result[key] = [sanitize_schema_for_codeassist(item, _depth + 1) if isinstance(item, dict) else item for item in value]
+            result[key] = [sanitize_schema_for_codeassist(item, _depth + 1, use_uppercase) if isinstance(item, dict) else item for item in value]
         else:
             result[key] = value
     
@@ -131,22 +136,34 @@ def to_generate_content_request(
     """
     Convertit les messages au format CodeAssist.
     
-    IMPORTANT: Aligné sur le payload gemini-cli qui fonctionne:
-    - contents: [] (VIDE)
-    - systemInstruction contient TOUT le contexte + messages
-    - Ordre des clés CRITIQUE pour API v1internal:
-      1. tools (si présent)
-      2. toolConfig (si tools présents)
-      3. generationConfig EN DERNIER (requis avec temperature)
-    - Sanitizer appliqué sur les outils (types MAJUSCULES, champs interdits supprimés)
+    IMPORTANT: Aligné sur le payload gemini-cli capturé qui fonctionne:
+    - contents: REMPLI avec les messages user/assistant (format {"role": "user", "parts": [{"text": "..."}]})
+    - systemInstruction: contient le contexte système avec role: "user" (pas "system")
+    - user_prompt_id: AVANT request (model → project → user_prompt_id → request)
+    - parametersJsonSchema: utilise "parametersJsonSchema" (pas "parameters") avec types en minuscules
+    - toolConfig: ABSENT (pas nécessaire selon le payload capturé)
     """
     if user_prompt_id is None:
-        user_prompt_id = str(uuid.uuid4())
+        # Format Gemini CLI: hex string de 14 caractères (ex: "c59ec6dbb5bc58")
+        import os
+        user_prompt_id = os.urandom(7).hex()
     
-    # 1. CONTENTS: VIDE (gemini-cli fait ainsi)
+    # 1. CONTENTS: REMPLI avec les messages user/assistant (comme gemini-cli)
     contents: List[Dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        # Ignorer les messages système (ils vont dans systemInstruction)
+        if role == "system":
+            continue
+        if content:
+            parts = _content_to_parts(content)
+            if parts:
+                # Convertir le rôle: assistant/model -> "model", user -> "user"
+                ca_role = "model" if role in ("assistant", "model") else "user"
+                contents.append({"role": ca_role, "parts": parts})
     
-    # 2. SYSTEM INSTRUCTION: contient TOUT (contexte + messages user/assistant)
+    # 2. SYSTEM INSTRUCTION: contient le contexte système uniquement
     all_text_parts = []
     
     # Ajouter l'instruction système si fournie
@@ -160,51 +177,42 @@ def to_generate_content_request(
         if role == "system" and content:
             all_text_parts.append(str(content))
     
-    # Ajouter les messages user/assistant à la fin (comme gemini-cli le fait)
-    # gemini-cli ajoute les messages de l'historique dans systemInstruction
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role == "system":
-            continue  # Déjà traité
-        if content:
-            # Format: ajouter le message avec préfixe pour indiquer le rôle
-            if role == "user":
-                all_text_parts.append(f"\nUser:\n{content}")
-            elif role in ("assistant", "model"):
-                all_text_parts.append(f"\nAssistant:\n{content}")
-    
     # Construire le payload request avec OrderedDict pour garantir l'ordre exact
     vertex_request = OrderedDict()
-    vertex_request["contents"] = contents  # VIDE!
+    vertex_request["contents"] = contents  # REMPLI!
     
     if all_text_parts:
         full_system_instruction = "\n\n".join(all_text_parts)
         # Utiliser OrderedDict pour garantir l'ordre exact des clés
+        # IMPORTANT: role doit être "user" (pas "system") selon le payload capturé
         vertex_request["systemInstruction"] = OrderedDict([
-            ("role", "system"),
+            ("role", "user"),  # CHANGÉ: "system" -> "user"
             ("parts", [OrderedDict([("text", full_system_instruction)])])
         ])
     
-    # 3. Outils avec toolConfig conditionnel (EN PREMIER - ordre critique pour API v1internal)
-    # BLINDAGE ERREUR 500: toolConfig peut être requis pour éviter null pointer exceptions
+    # 3. Outils (sans toolConfig - le payload capturé n'en a pas)
     if tools and len(tools) > 0:
         vertex_request["tools"] = _convert_tools_to_gemini_format(tools)
-        # Ajouter toolConfig pour lever l'ambiguïté du mode d'exécution
-        # Mode AUTO: le modèle décide s'il doit appeler un outil ou générer du texte
-        # Utiliser OrderedDict pour garantir l'ordre exact des clés
-        vertex_request["toolConfig"] = OrderedDict([
-            ("functionCallingConfig", OrderedDict([
-                ("mode", "AUTO")
-            ]))
-        ])
+        # NOTE: toolConfig retiré car absent du payload capturé gemini-cli
     
     # 4. generationConfig EN DERNIER (REQUIS - ordre critique pour API v1internal)
     # Le payload fonctionnel gemini-cli place generationConfig après tools/toolConfig
     # Utiliser OrderedDict pour garantir l'ordre exact des clés
-    vertex_request["generationConfig"] = OrderedDict([
+    gen_config = OrderedDict([
         ("temperature", float(temperature))  # Forcer float explicite
     ])
+
+    if max_tokens is not None:
+        gen_config["maxOutputTokens"] = int(max_tokens)
+    
+    if "top_p" in kwargs:
+        gen_config["topP"] = float(kwargs["top_p"])
+    if "top_k" in kwargs:
+        gen_config["topK"] = int(kwargs["top_k"])
+    if "thinking_config" in kwargs:
+        gen_config["thinkingConfig"] = kwargs["thinking_config"]
+    
+    vertex_request["generationConfig"] = gen_config
     
     # Optionnels (garder pour compatibilité mais généralement non utilisés par gemini-cli)
     if safety_settings:
@@ -215,15 +223,14 @@ def to_generate_content_request(
         vertex_request["cachedContent"] = cached_content
     
     # Construire la requête CodeAssist finale avec OrderedDict pour garantir l'ordre exact
-    # ORDRE CRITIQUE : model → project → request → user_prompt_id (comme gemini-cli)
-    # IMPORTANT: user_prompt_id DOIT être APRÈS request (analyse payload fonctionnel)
+    # ORDRE CRITIQUE : model → project → user_prompt_id → request (comme payload capturé gemini-cli)
     ca_request = OrderedDict()
     ca_request["model"] = model
     if project_id:
         ca_request["project"] = project_id
-    ca_request["request"] = vertex_request
     if user_prompt_id:
-        ca_request["user_prompt_id"] = user_prompt_id
+        ca_request["user_prompt_id"] = user_prompt_id  # AVANT request
+    ca_request["request"] = vertex_request
     
     return ca_request
 
@@ -310,31 +317,42 @@ def _convert_tools_to_gemini_format(tools: List[Dict]) -> List[Dict[str, Any]]:
                 func_decl = {
                     "name": func_def.get("name", ""),
                     "description": func_def.get("description", ""),
-                    "parameters": func_def.get("parameters", {})
+                    "parametersJsonSchema": func_def.get("parameters", func_def.get("parametersJsonSchema", {}))
                 }
             
             # Format Gemini: {"functionDeclarations": [...]}
             elif "functionDeclarations" in tool:
                 for decl in tool["functionDeclarations"]:
+                    # IMPORTANT: utiliser "parametersJsonSchema" (pas "parameters") avec types en minuscules
                     sanitized_decl = {
                         "name": decl.get("name", ""),
                         "description": decl.get("description", ""),
-                        "parameters": sanitize_schema_for_codeassist(decl.get("parameters", {}))
+                        "parametersJsonSchema": sanitize_schema_for_codeassist(
+                            decl.get("parameters", decl.get("parametersJsonSchema", {})),
+                            use_uppercase=False  # Types en minuscules pour parametersJsonSchema
+                        )
                     }
                     function_declarations.append(sanitized_decl)
                 continue
             
-            # Format direct: {"name": "...", "parameters": {...}}
-            elif "name" in tool and "parameters" in tool:
+            # Format direct: {"name": "...", "parameters": {...}} ou {"name": "...", "parametersJsonSchema": {...}}
+            elif "name" in tool and ("parameters" in tool or "parametersJsonSchema" in tool):
                 func_decl = {
                     "name": tool.get("name", ""),
                     "description": tool.get("description", ""),
-                    "parameters": tool.get("parameters", {})
+                    "parametersJsonSchema": tool.get("parametersJsonSchema", tool.get("parameters", {}))
                 }
             
             # Appliquer le sanitizer sur les paramètres
             if func_decl:
-                func_decl["parameters"] = sanitize_schema_for_codeassist(func_decl["parameters"])
+                # IMPORTANT: utiliser "parametersJsonSchema" avec types en minuscules
+                func_decl["parametersJsonSchema"] = sanitize_schema_for_codeassist(
+                    func_decl.get("parametersJsonSchema", {}),
+                    use_uppercase=False  # Types en minuscules pour parametersJsonSchema
+                )
+                # Supprimer "parameters" si présent (on utilise seulement parametersJsonSchema)
+                if "parameters" in func_decl:
+                    del func_decl["parameters"]
                 function_declarations.append(func_decl)
     
     if function_declarations:

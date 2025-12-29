@@ -141,9 +141,10 @@ class CodeAssistClient:
         # Pour utiliser le quota personnel (comme gemini-cli), on ne doit PAS définir project
         # Seulement utiliser project_id si explicitement fourni ET si use_personal_quota=False
         if use_personal_quota:
-            # Par défaut : utiliser quota personnel (pas de project_id)
+            # Par défaut : utiliser quota personnel (projet par défaut de Gemini CLI)
             # Même si project_id est fourni ou dans l'environnement, on l'ignore
-            self.project_id = None
+            # Utiliser le projet magique "main-keyword-qhv63" qui semble être requis par l'API v1internal
+            self.project_id = "main-keyword-qhv63"
         else:
             # Utilisation d'un projet GCP : utiliser project_id fourni ou depuis l'environnement
             if project_id:
