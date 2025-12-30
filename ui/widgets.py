@@ -23,25 +23,6 @@ except ImportError:
     HTMLLabel = None
     log.warning("tkhtmlview non disponible - l'affichage Markdown/HTML sera limité")
 
-# Import tkintermd pour widget Markdown collapsible
-# Note: tkintermd nécessite tkinterweb qui doit être installé
-try:
-    # Vérifier d'abord que tkinterweb est disponible
-    import tkinterweb
-    # Ensuite importer tkintermd
-    import tkintermd
-    from tkintermd.frame import TkintermdFrame
-    TKINTERMD_AVAILABLE = True
-    log.debug(f"tkintermd importé avec succès depuis {tkintermd.__file__ if hasattr(tkintermd, '__file__') else 'unknown'}")
-except ImportError as e:
-    TKINTERMD_AVAILABLE = False
-    TkintermdFrame = None
-    log.warning(f"tkintermd non disponible - le widget Markdown collapsible sera limité: {e}")
-except Exception as e:
-    TKINTERMD_AVAILABLE = False
-    TkintermdFrame = None
-    log.warning(f"tkintermd erreur d'import - le widget Markdown collapsible sera limité: {e}")
-
 # Import du convertisseur Markdown
 try:
     from ui.markdown_converter import markdown_to_html
@@ -969,30 +950,8 @@ class CollapsibleMarkdownWidget(ctk.CTkFrame):
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.content_frame.pack(fill="both", expand=True, padx=3, pady=3)
         
-        # Utiliser tkintermd si disponible
-        if TKINTERMD_AVAILABLE and is_markdown and TkintermdFrame is not None:
-            try:
-                # Créer un frame tkinter natif pour tkintermd
-                self.md_frame = tk.Frame(self.content_frame, bg=COLORS.get("BG_MAIN", "#1E1E1E"))
-                
-                # Calculer la hauteur approximative basée sur le nombre de lignes
-                lines = content.count('\n') + 1
-                # Environ 30px par ligne pour Markdown rendu, avec limites raisonnables
-                estimated_height = min(max(lines * 30, 200), 1000)  # Entre 200 et 1000px
-                self.md_frame.configure(height=estimated_height)
-                self.md_frame.pack(fill="both", expand=True, padx=5, pady=5)
-                
-                # Créer le widget tkintermd
-                self.md_widget = TkintermdFrame(self.md_frame)
-                self.md_widget.pack(fill="both", expand=True)
-                self.md_widget.set_markdown(content)
-            except Exception as e:
-                log.error(f"Erreur création widget tkintermd: {e}", exc_info=True)
-                # Fallback vers MarkdownViewer
-                self._create_fallback_viewer()
-        else:
-            # Fallback vers MarkdownViewer
-            self._create_fallback_viewer()
+        # Utiliser MarkdownViewer pour l'affichage
+        self._create_fallback_viewer()
         
         # Bouton collapse intégré en haut à droite (overlay style Cursor)
         self.btn_toggle = ctk.CTkButton(
@@ -1013,13 +972,11 @@ class CollapsibleMarkdownWidget(ctk.CTkFrame):
         # Bind double-clic pour toggle sur tout le widget
         self.bind("<Double-Button-1>", lambda e: self.toggle())
         self.content_frame.bind("<Double-Button-1>", lambda e: self.toggle())
-        if hasattr(self, 'md_frame'):
-            self.md_frame.bind("<Double-Button-1>", lambda e: self.toggle())
-            if hasattr(self.md_widget, 'bind'):
-                self.md_widget.bind("<Double-Button-1>", lambda e: self.toggle())
+        if hasattr(self, 'md_widget') and hasattr(self.md_widget, 'bind'):
+            self.md_widget.bind("<Double-Button-1>", lambda e: self.toggle())
     
     def _create_fallback_viewer(self):
-        """Crée un viewer de fallback si tkintermd n'est pas disponible."""
+        """Crée un viewer Markdown/HTML pour l'affichage."""
         self.md_widget = MarkdownViewer(
             self.content_frame,
             content=self.content,
@@ -1085,53 +1042,11 @@ class NonCollapsibleMarkdownWidget(ctk.CTkFrame):
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.content_frame.pack(fill="both", expand=True, padx=0, pady=0)
         
-        # Utiliser tkintermd si disponible
-        if TKINTERMD_AVAILABLE and is_markdown and TkintermdFrame is not None:
-            try:
-                # Créer un frame tkinter natif pour tkintermd
-                self.md_frame = tk.Frame(self.content_frame, bg=COLORS.get("BG_MAIN", "#1E1E1E"))
-                
-                # Calculer la hauteur approximative basée sur le nombre de lignes
-                lines = content.count('\n') + 1
-                # Environ 30px par ligne pour Markdown rendu, pas de limite maximale
-                estimated_height = max(lines * 30, 200)
-                self.md_frame.configure(height=estimated_height)
-                self.md_frame.pack(fill="both", expand=True, padx=5, pady=5)
-                
-                # Créer le widget tkintermd
-                self.md_widget = TkintermdFrame(self.md_frame)
-                self.md_widget.pack(fill="both", expand=True)
-                self.md_widget.set_markdown(content)
-                
-                # Masquer la scrollbar du tkintermd après création
-                self.after(200, self._hide_tkintermd_scrollbar)
-            except Exception as e:
-                log.error(f"Erreur création widget tkintermd: {e}", exc_info=True)
-                # Fallback vers MarkdownViewer
-                self._create_fallback_viewer()
-        else:
-            # Fallback vers MarkdownViewer
-            self._create_fallback_viewer()
-    
-    def _hide_tkintermd_scrollbar(self):
-        """Masque la scrollbar du widget tkintermd."""
-        try:
-            if hasattr(self, 'md_widget') and self.md_widget:
-                # Chercher la scrollbar dans les enfants du md_frame
-                for child in self.md_frame.winfo_children():
-                    if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
-                        child.place_forget()
-                        child.pack_forget()
-                        child.grid_forget()
-                        try:
-                            child.configure(width=0)
-                        except:
-                            pass
-        except Exception as e:
-            log.debug(f"Impossible de masquer la scrollbar tkintermd: {e}")
+        # Utiliser MarkdownViewer pour l'affichage
+        self._create_fallback_viewer()
     
     def _create_fallback_viewer(self):
-        """Crée un viewer de fallback si tkintermd n'est pas disponible."""
+        """Crée un viewer Markdown/HTML pour l'affichage."""
         self.md_widget = MarkdownViewer(
             self.content_frame,
             content=self.content,
