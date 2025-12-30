@@ -622,6 +622,10 @@ class Worker(threading.Thread):
                                 
                                 if is_thinking:
                                     log.info(f"🔍 Chunk thinking détecté: is_thinking={is_thinking}")
+                                    
+                                # DEBUG: Log le contenu pour vérifier si "Searching for" est dans le thinking
+                                if txt and "Searching for" in txt:
+                                    log.warning(f"⚠️ Texte 'Searching for' détecté - is_thinking={is_thinking}, sera routé vers: {'thinking' if is_thinking else 'content'}")
                             except Exception as e:
                                 log.error(f"Erreur détection is_thinking: {e}", exc_info=True)
                             
@@ -1027,21 +1031,12 @@ class Worker(threading.Thread):
                                         f"Ne le répète pas. Confirme juste la fin de l'opération."
                                     )
                                     
-                                    # Envoi en texte simple (plus de json.dumps sur le message entier)
-                                    ai_continuation = call_ai_robust(self.main_session, feedback_message, stream=False)
-                                    
-                                    if ai_continuation:
-                                        # On ignore les réponses vides ou redondantes
-                                        content_str = str(ai_continuation).strip()
-                                        if content_str and "[⚠️ Réponse vide]" not in content_str:
-                                            self._save_and_display(content_str)
-                                        
-                                        # Gestion du chaînage (Auto-Command)
-                                        cmd_match = re.search(r"(!native_tool\s*\{.*?\})", content_str, re.DOTALL)
-                                        if cmd_match:
-                                            next_cmd = cmd_match.group(1).strip()
-                                            log.info(f"🔄 Chaînage Auto-Command détecté : {next_cmd[:30]}...")
-                                            self.task_queue.put({'action': 'command', 'payload': {'command': next_cmd}})
+                                    # Envoi en texte simple avec stream=True pour continuer le flux naturel
+                                    # Cela permet à l'IA de continuer sa réponse après le tool call
+                                    log.info("🔄 Relance du stream après exécution du tool pour continuer la conversation...")
+                                    continuation_payload = {'message': feedback_message}
+                                    # Relancer le stream pour continuer la conversation
+                                    self.bg_executor.submit(self._handle_chat_stream, continuation_payload)
                                             
                                 except Exception as e:
                                     log.error(f"Erreur Feedback Loop IA: {e}")

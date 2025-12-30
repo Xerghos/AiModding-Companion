@@ -246,7 +246,7 @@ class MainPanel(ctk.CTkFrame):
             estimated_height = 50
         
         textbox = ctk.CTkTextbox(container, wrap="word", font=("Consolas", 11), height=estimated_height)
-        textbox.pack(fill="x", padx=5, pady=2)
+        textbox.pack(fill="x", padx=5, pady=0)
         textbox.configure(state="disabled")
         self._configure_chat_tags(textbox)
         return textbox

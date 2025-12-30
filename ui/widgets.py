@@ -693,9 +693,12 @@ class ThinkingWidget(ctk.CTkFrame):
         # Frame principal avec style subtil
         self.configure(fg_color=COLORS.get("BG_SECONDARY", "#252526"), corner_radius=5)
         
+        # Permettre au widget de s'adapter à son contenu
+        self.pack_propagate(True)
+        
         # Header collapsible (style Gemini)
         self.header = ctk.CTkFrame(self, fg_color="transparent", height=35)
-        self.header.pack(fill="x", padx=5, pady=5)
+        self.header.pack(fill="x", padx=5, pady=0)
         
         # Bouton expand/collapse
         self.btn_toggle = ctk.CTkButton(
@@ -732,7 +735,7 @@ class ThinkingWidget(ctk.CTkFrame):
             height=100,
             fg_color=COLORS.get("BG_WIDGET", "#2D2D30")
         )
-        self.thinking_textbox.pack(fill="both", expand=True, padx=5, pady=5)
+        self.thinking_textbox.pack(fill="both", expand=True, padx=5, pady=0)
         self.thinking_textbox.configure(state="disabled")
         
         # Insérer le contenu combiné
@@ -741,10 +744,8 @@ class ThinkingWidget(ctk.CTkFrame):
             self.thinking_textbox.insert("1.0", self.content)
             self.thinking_textbox.configure(state="disabled")
             
-            # Calculer la hauteur adaptative
-            lines = self.content.count('\n') + 1
-            estimated_height = min(max(lines * 18, 80), 400)
-            self.thinking_textbox.configure(height=estimated_height)
+            # Calculer la hauteur adaptative et ajuster après insertion
+            self.after(10, lambda: self._adjust_thinking_textbox_height())
         
         # Bind double-clic sur le header pour toggle
         self.header.bind("<Double-Button-1>", lambda e: self.toggle())
@@ -761,10 +762,20 @@ class ThinkingWidget(ctk.CTkFrame):
             self.thinking_textbox.delete("1.0", "end")
             self.thinking_textbox.insert("1.0", self.content)
             self.thinking_textbox.configure(state="disabled")
-            # Recalculer la hauteur
-            lines = self.content.count('\n') + 1
-            estimated_height = min(max(lines * 18, 80), 400)
-            self.thinking_textbox.configure(height=estimated_height)
+            # Recalculer la hauteur après insertion
+            self.after(10, lambda: self._adjust_thinking_textbox_height())
+    
+    def _adjust_thinking_textbox_height(self):
+        """Ajuste la hauteur de la textbox thinking pour qu'elle corresponde exactement au contenu."""
+        try:
+            self.thinking_textbox.update_idletasks()
+            line_count = int(self.thinking_textbox.index("end-1c").split('.')[0])
+            if line_count > 0:
+                estimated_height = min(max(line_count * 18, 80), 400)
+                self.thinking_textbox.configure(height=estimated_height)
+                self.thinking_textbox.update_idletasks()
+        except Exception as e:
+            log.debug(f"Erreur ajustement hauteur thinking textbox: {e}")
     
     def toggle(self):
         """Bascule entre collapsed et expanded."""
@@ -772,7 +783,7 @@ class ThinkingWidget(ctk.CTkFrame):
         
         if self.is_expanded:
             self.btn_toggle.configure(text="▼")
-            self.content_frame.pack(fill="both", expand=True, padx=5, pady=5)
+            self.content_frame.pack(fill="both", expand=True, padx=5, pady=0)
         else:
             self.btn_toggle.configure(text="▶")
             self.content_frame.pack_forget()
@@ -838,11 +849,17 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             except:
                 return "break"
         
-        # Bind sur le widget lui-même SANS add="+" pour remplacer le handler CustomTkinter
-        # Cela empêche CustomTkinter de traiter ces événements
-        self.bind("<MouseWheel>", safe_mousewheel_handler)
-        self.bind("<Button-4>", safe_mousewheel_handler)
-        self.bind("<Button-5>", safe_mousewheel_handler)
+        # Utiliser bind_class pour intercepter au niveau de la classe avant CustomTkinter
+        # Cela intercepte TOUS les événements de molette sur tous les CTkScrollableFrame
+        try:
+            self.bind_class("CTkScrollableFrame", "<MouseWheel>", safe_mousewheel_handler, add="+")
+            self.bind_class("CTkScrollableFrame", "<Button-4>", safe_mousewheel_handler, add="+")
+            self.bind_class("CTkScrollableFrame", "<Button-5>", safe_mousewheel_handler, add="+")
+        except:
+            # Fallback si bind_class ne fonctionne pas
+            self.bind("<MouseWheel>", safe_mousewheel_handler)
+            self.bind("<Button-4>", safe_mousewheel_handler)
+            self.bind("<Button-5>", safe_mousewheel_handler)
         
         # Aussi bind sur tous les enfants après création
         def bind_children():
@@ -952,6 +969,9 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         textbox.insert("1.0", text + "\n\n", tag)
         textbox.configure(state="disabled")
         
+        # Ajuster la hauteur après insertion pour être plus précis
+        self.after(10, lambda: self._adjust_textbox_height(textbox))
+        
         # Désactiver complètement le scroll avec la molette
         def disable_mousewheel():
             try:
@@ -977,7 +997,27 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         self.after(50, disable_mousewheel)
         
         self.widgets.append(textbox)
+        
+        # Ajuster la hauteur du container après ajout du widget
+        self.after(50, self._adjust_container_height)
+        
         return textbox
+    
+    def _adjust_textbox_height(self, textbox):
+        """Ajuste la hauteur d'une textbox pour qu'elle corresponde exactement au contenu."""
+        try:
+            textbox.update_idletasks()
+            # Obtenir le nombre de lignes réelles dans la textbox
+            line_count = int(textbox.index("end-1c").split('.')[0])
+            if line_count > 0:
+                # Calculer la hauteur nécessaire (environ 1.5x la taille de police par ligne)
+                font_size = APP_SETTINGS.get("system_settings", {}).get("font_size", 12)
+                line_height = max(int(font_size * 1.5), 18)
+                new_height = max(line_count * line_height, 50)
+                textbox.configure(height=new_height)
+                textbox.update_idletasks()
+        except Exception as e:
+            log.debug(f"Erreur ajustement hauteur textbox: {e}")
     
     def add_markdown_widget(self, content, is_markdown=True, on_open_in_tab=None):
         """Ajoute un widget Markdown non-collapsible au container pour la réponse finale."""
@@ -989,6 +1029,10 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         )
         md_widget.pack(fill="x", padx=5, pady=0)
         self.widgets.append(md_widget)
+        
+        # Ajuster la hauteur du container après ajout du widget
+        self.after(50, self._adjust_container_height)
+        
         return md_widget
 
 
@@ -1100,12 +1144,18 @@ class NonCollapsibleMarkdownWidget(ctk.CTkFrame):
         # Frame principal sans bordure (style simple)
         self.configure(fg_color="transparent", corner_radius=0)
         
+        # Permettre au widget de s'adapter à son contenu
+        self.pack_propagate(True)
+        
         # Container pour le contenu (toujours visible, taille adaptative)
         self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.content_frame.pack(fill="both", expand=True, padx=0, pady=0)
         
         # Utiliser MarkdownViewer pour l'affichage
         self._create_fallback_viewer()
+        
+        # Ajuster la hauteur après création
+        self.after(100, self._adjust_markdown_widget_height)
     
     def _create_fallback_viewer(self):
         """Crée un viewer Markdown/HTML pour l'affichage."""
@@ -1114,10 +1164,24 @@ class NonCollapsibleMarkdownWidget(ctk.CTkFrame):
             content=self.content,
             is_markdown=self.is_markdown
         )
-        self.md_widget.pack(fill="both", expand=True, padx=5, pady=5)
+        self.md_widget.pack(fill="both", expand=True, padx=5, pady=0)
         
         # Masquer la scrollbar du MarkdownViewer après création
         self.after(200, self._hide_markdown_viewer_scrollbar)
+    
+    def _adjust_markdown_widget_height(self):
+        """Ajuste la hauteur du widget markdown pour qu'il corresponde au contenu."""
+        try:
+            self.update_idletasks()
+            # Calculer approximativement la hauteur basée sur le nombre de lignes
+            lines = self.content.count('\n') + 1
+            # Estimer environ 25px par ligne pour le markdown
+            estimated_height = min(max(lines * 25, 150), 2000)
+            # Note: MarkdownViewer avec tkinterweb gère la taille automatiquement
+            # On peut juste s'assurer que le container s'adapte
+            self.update_idletasks()
+        except Exception as e:
+            log.debug(f"Erreur ajustement hauteur markdown widget: {e}")
     
     def _hide_markdown_viewer_scrollbar(self):
         """Masque la scrollbar du MarkdownViewer (tkinterweb gère le scroll automatiquement)."""
