@@ -277,7 +277,7 @@ class GroqSession:
             self.history.append({"role": "system", "content": self.system_instruction})
 
     @trace_action(source="sessions")
-    def send_message(self, message, stream=False, tool_config=None, rag_context=None):
+    def send_message(self, message, stream=False, tool_config=None, rag_context=None, shadow_history=None, session_id=None):
         self.current_key = self.key_mgr.get_key(self.model_name)
         if not self.current_key:
              raise FatalKeyError(f"Aucune clé Groq disponible pour {self.model_name}")
@@ -726,7 +726,7 @@ class DeepSeekSession(BaseSession):
         return messages
 
     @trace_action(source="sessions")
-    def send_message(self, message, stream=False, tool_config=None, rag_context=None):
+    def send_message(self, message, stream=False, tool_config=None, rag_context=None, shadow_history=None, session_id=None):
         self.current_key = self.key_mgr.get_key(self.model_name)
         if not self.current_key: 
             raise FatalKeyError(f"Aucune clé DeepSeek disponible pour {self.model_name}")
@@ -1046,7 +1046,7 @@ class GeminiSession:
         return False
 
     @trace_action(source="sessions")
-    def send_message(self, message, stream=False, tool_config=None, rag_context=None):
+    def send_message(self, message, stream=False, tool_config=None, rag_context=None, shadow_history=None, session_id=None):
         # OPTIMISATION: Retry dynamique basé sur le nombre de clés disponibles.
         max_retries = max(3, self.key_mgr.num_keys + 1)
         retry_count = 0
@@ -1902,7 +1902,7 @@ class GeminiCliSession(BaseSession):
         return prompt
 
     @trace_action(source="sessions")
-    def send_message(self, message, stream=False, tool_config=None, rag_context=None):
+    def send_message(self, message, stream=False, tool_config=None, rag_context=None, shadow_history=None, session_id=None):
         """
         Envoie un message via le CLI gemini.
         Args:
@@ -2597,7 +2597,7 @@ class GeminiCliSession(BaseSession):
         return ChatInterface(self)
 
 @trace_action(source="sessions")
-def call_ai_robust(session_or_agent, prompt, mode="fast", disposable=False, force_text=False, cache_name=None, stream=False, rag_context=None):
+def call_ai_robust(session_or_agent, prompt, mode="fast", disposable=False, force_text=False, cache_name=None, stream=False, rag_context=None, shadow_history=None, session_id=None):
     from .factory import SessionFactory
     try:
         session = session_or_agent.session if hasattr(session_or_agent, 'session') else session_or_agent
@@ -2615,7 +2615,15 @@ def call_ai_robust(session_or_agent, prompt, mode="fast", disposable=False, forc
 
         # [V5] Appel API Unifié 
         # Toutes les sessions (DeepSeek, Gemini, Groq) acceptent désormais rag_context
-        response = session.send_message(prompt, stream=stream, tool_config=tool_config, rag_context=rag_context)
+        # Shadow History et session_id pour l'enchaînement des tool calls
+        response = session.send_message(
+            prompt, 
+            stream=stream, 
+            tool_config=tool_config, 
+            rag_context=rag_context,
+            shadow_history=shadow_history,
+            session_id=session_id
+        )
         
         # Restauration historique si mode jetable
         if disposable and hasattr(session, 'chat'): 

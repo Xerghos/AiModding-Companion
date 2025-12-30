@@ -268,7 +268,9 @@ class LiteLLMSession(BaseSession):
         message: str,
         stream: bool = False,
         tool_config: Optional[Dict] = None,
-        rag_context: Optional[Dict] = None
+        rag_context: Optional[Dict] = None,
+        shadow_history: Optional[List[Dict]] = None,
+        session_id: Optional[str] = None,
     ) -> Any:
         """
         Envoie un message via LiteLLM.
@@ -424,7 +426,8 @@ class LiteLLMSession(BaseSession):
                 temperature=temperature,
                 max_tokens=max_tokens,  # None pour CodeAssist (OAuth), 8000 sinon
                 tools=native_tools if native_tools else None,
-                session_id=self.session_id # Transmission ID persistant
+                session_id=self.session_id,  # Transmission ID persistant
+                shadow_history=shadow_history  # Historique Shadow pour continuation après tool call
             )
             
             self.key_mgr.mark_success(self.current_key, self.model_name)

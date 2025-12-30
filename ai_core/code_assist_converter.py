@@ -174,7 +174,8 @@ def sanitize_schema_for_codeassist(schema: Any, _depth: int = 0, use_uppercase: 
 
 def to_generate_content_request(
     model: str,
-    messages: List[Dict[str, str]],
+    messages: Optional[List[Dict[str, str]]] = None,
+    shadow_history: Optional[List[Dict]] = None,
     user_prompt_id: Optional[str] = None,
     project_id: Optional[str] = None,
     session_id: Optional[str] = None,
@@ -203,19 +204,68 @@ def to_generate_content_request(
         user_prompt_id = os.urandom(7).hex()
     
     # 1. CONTENTS: REMPLI avec les messages user/assistant (comme gemini-cli)
+    # IMPORTANT: Si shadow_history est fourni, l'utiliser directement (format CodeAssist déjà correct)
+    # Sinon, construire contents à partir de messages
     contents: List[Dict[str, Any]] = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        # Ignorer les messages système (ils vont dans systemInstruction)
-        if role == "system":
-            continue
-        if content:
-            parts = _content_to_parts(content)
-            if parts:
-                # Convertir le rôle: assistant/model -> "model", user -> "user"
-                ca_role = "model" if role in ("assistant", "model") else "user"
-                contents.append({"role": ca_role, "parts": parts})
+    
+    if shadow_history is not None:
+        # Si shadow_history est fourni, l'utiliser directement pour contents
+        # shadow_history est déjà au format CodeAssist: [{"role": "user", "parts": [...]}, ...]
+        contents = shadow_history
+        # Log pour diagnostic
+        from features.UnifiedLogger import UnifiedLogger
+        UnifiedLogger.write(
+            "AI_CORE",
+            "DEBUG",
+            f"📝 to_generate_content_request: shadow_history utilisé directement ({len(shadow_history)} messages)"
+        )
+        # Log détaillé de chaque message
+        for idx, msg in enumerate(shadow_history):
+            role = msg.get("role", "unknown")
+            parts = msg.get("parts", [])
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"📝   Shadow History[{idx}]: role={role}, {len(parts)} parts"
+            )
+            for part_idx, part in enumerate(parts):
+                if "functionCall" in part:
+                    func_call = part["functionCall"]
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "DEBUG",
+                        f"📝     Part {part_idx} - functionCall: name={func_call.get('name')}, id={func_call.get('id')}"
+                    )
+                elif "functionResponse" in part:
+                    func_resp = part["functionResponse"]
+                    resp_content = func_resp.get("response", {}).get("content", "")
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "DEBUG",
+                        f"📝     Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, content_len={len(str(resp_content))}"
+                    )
+                elif "text" in part:
+                    text_content = part["text"]
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "DEBUG",
+                        f"📝     Part {part_idx} - text: len={len(str(text_content))}"
+                    )
+    else:
+        # Sinon, construire contents à partir de messages
+        if messages:
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                # Ignorer les messages système (ils vont dans systemInstruction)
+                if role == "system":
+                    continue
+                if content:
+                    parts = _content_to_parts(content)
+                    if parts:
+                        # Convertir le rôle: assistant/model -> "model", user -> "user"
+                        ca_role = "model" if role in ("assistant", "model") else "user"
+                        contents.append({"role": ca_role, "parts": parts})
     
     # 2. SYSTEM INSTRUCTION: contient le contexte système uniquement
     all_text_parts = []

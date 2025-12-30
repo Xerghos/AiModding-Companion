@@ -20,6 +20,26 @@ from ai_core.code_assist_converter import (
 )
 from ai_core.sessions import _save_codeassist_payload_log
 
+
+class QuotaExceededException(Exception):
+    """Exception levée quand le quota journalier est épuisé."""
+    pass
+
+
+class FunctionCallObject:
+    """
+    Objet pour transporter les métadonnées d'un functionCall détecté dans le stream.
+    Permet de préserver l'ID de corrélation et thoughtSignature pour l'injection.
+    """
+    def __init__(self, name, args, call_id=None, thought_signature=None):
+        self.name = name
+        self.args = args
+        self.id = call_id
+        self.thought_signature = thought_signature
+    
+    def __repr__(self):
+        return f"FunctionCallObject(name={self.name}, id={self.id})"
+
 # Flag pour activer les logs détaillés du stream (désactivé par défaut)
 DEBUG_STREAM = os.environ.get("CODEASSIST_DEBUG_STREAM", "false").lower() == "true"
 
@@ -358,6 +378,57 @@ class CodeAssistClient:
                         time.sleep(RETRY_DELAYS[attempt])
                         continue
 
+                # 429 -> Rate Limit ou Quota Exhausted : distinguer les deux cas
+                if status_code == 429:
+                    try:
+                        error_detail = e.response.json() if getattr(e, "response", None) is not None else {}
+                        error_message = str(error_detail.get("error", {}).get("message", "")).lower()
+                        
+                        # Détecter si c'est un quota épuisé (arrêt définitif)
+                        if "quota" in error_message or "exceeded" in error_message or "limit" in error_message:
+                            # Vérifier si c'est vraiment un quota épuisé (pas juste un rate limit)
+                            if "daily" in error_message or "quota" in error_message:
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "ERROR",
+                                    f"❌ Quota journalier épuisé (429) - Arrêt définitif"
+                                )
+                                raise QuotaExceededException(f"Quota journalier épuisé: {error_message}")
+                        
+                        # Sinon, c'est un rate limit (retry avec backoff exponentiel + jitter)
+                        import random
+                        base_delay = 1.0
+                        max_delay = 60.0
+                        delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
+                        
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "WARNING",
+                            f"⚠️ Rate Limit (429), retry {attempt + 1}/{MAX_RETRIES} après {delay:.2f}s"
+                        )
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(delay)
+                            continue
+                        else:
+                            # Après tous les retries, lever une exception
+                            raise Exception(f"Rate Limit persistant après {MAX_RETRIES} tentatives")
+                    except QuotaExceededException:
+                        raise
+                    except Exception as quota_err:
+                        # Si on ne peut pas distinguer, traiter comme rate limit
+                        import random
+                        base_delay = 1.0
+                        max_delay = 60.0
+                        delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "WARNING",
+                            f"⚠️ Rate Limit (429) - détection quota échouée, retry {attempt + 1}/{MAX_RETRIES} après {delay:.2f}s"
+                        )
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(delay)
+                        continue
+
                 # 500 -> erreurs serveur / session : retry simple
                 if status_code == 500:
                     UnifiedLogger.write(
@@ -619,6 +690,80 @@ class CodeAssistClient:
                 except Exception:
                     pass
 
+                # 400 -> Bad Request : log détaillé pour diagnostic
+                if status_code == 400:
+                    try:
+                        error_detail = e.response.json() if getattr(e, "response", None) is not None else {}
+                        error_message = error_detail.get("error", {}).get("message", "")
+                        error_code = error_detail.get("error", {}).get("code", "")
+                        error_status = error_detail.get("error", {}).get("status", "")
+                        
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "ERROR",
+                            f"❌ Erreur 400 Bad Request: {error_message} (code: {error_code}, status: {error_status})"
+                        )
+                        
+                        # Log détaillé de la structure du payload qui a causé l'erreur
+                        try:
+                            request_data = payload.get("request", {})
+                            contents = request_data.get("contents", [])
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "DEBUG",
+                                f"📋 Structure payload (400): {len(contents)} messages dans contents"
+                            )
+                            
+                            # Vérifier chaque message dans contents
+                            for idx, msg in enumerate(contents):
+                                role = msg.get("role", "unknown")
+                                parts = msg.get("parts", [])
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "DEBUG",
+                                    f"📋 Message {idx}: role={role}, {len(parts)} parts"
+                                )
+                                
+                                # Vérifier les functionCall et functionResponse
+                                for part_idx, part in enumerate(parts):
+                                    if "functionCall" in part:
+                                        func_call = part["functionCall"]
+                                        UnifiedLogger.write(
+                                            "AI_CORE",
+                                            "DEBUG",
+                                            f"📋 Part {part_idx} - functionCall: name={func_call.get('name')}, id={func_call.get('id')}, keys={list(func_call.keys())}"
+                                        )
+                                    if "functionResponse" in part:
+                                        func_resp = part["functionResponse"]
+                                        resp_content = func_resp.get("response", {}).get("content", "")
+                                        content_type = type(resp_content).__name__
+                                        content_len = len(str(resp_content))
+                                        UnifiedLogger.write(
+                                            "AI_CORE",
+                                            "DEBUG",
+                                            f"📋 Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, content_type={content_type}, content_len={content_len}"
+                                        )
+                                        # Log un extrait du contenu pour voir le format
+                                        if content_len > 0:
+                                            content_preview = str(resp_content)[:500]
+                                            UnifiedLogger.write(
+                                                "AI_CORE",
+                                                "DEBUG",
+                                                f"📋 functionResponse.content preview: {content_preview}..."
+                                            )
+                        except Exception as payload_err:
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "WARN",
+                                f"Erreur analyse payload (400): {payload_err}"
+                            )
+                    except Exception as err_detail:
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "WARN",
+                            f"Erreur extraction détails 400: {err_detail}"
+                        )
+
                 if status_code == 401:
                     UnifiedLogger.write(
                         "AI_CORE",
@@ -628,6 +773,57 @@ class CodeAssistClient:
                     self._creds = None
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_DELAYS[attempt])
+                        continue
+
+                # 429 -> Rate Limit ou Quota Exhausted : distinguer les deux cas
+                if status_code == 429:
+                    try:
+                        error_detail = e.response.json() if getattr(e, "response", None) is not None else {}
+                        error_message = str(error_detail.get("error", {}).get("message", "")).lower()
+                        
+                        # Détecter si c'est un quota épuisé (arrêt définitif)
+                        if "quota" in error_message or "exceeded" in error_message or "limit" in error_message:
+                            # Vérifier si c'est vraiment un quota épuisé (pas juste un rate limit)
+                            if "daily" in error_message or "quota" in error_message:
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "ERROR",
+                                    f"❌ Quota journalier épuisé (429) streaming - Arrêt définitif"
+                                )
+                                raise QuotaExceededException(f"Quota journalier épuisé: {error_message}")
+                        
+                        # Sinon, c'est un rate limit (retry avec backoff exponentiel + jitter)
+                        import random
+                        base_delay = 1.0
+                        max_delay = 60.0
+                        delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
+                        
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "WARNING",
+                            f"⚠️ Rate Limit (429) streaming, retry {attempt + 1}/{MAX_RETRIES} après {delay:.2f}s"
+                        )
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(delay)
+                            continue
+                        else:
+                            # Après tous les retries, lever une exception
+                            raise Exception(f"Rate Limit persistant après {MAX_RETRIES} tentatives")
+                    except QuotaExceededException:
+                        raise
+                    except Exception as quota_err:
+                        # Si on ne peut pas distinguer, traiter comme rate limit
+                        import random
+                        base_delay = 1.0
+                        max_delay = 60.0
+                        delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 1))
+                        UnifiedLogger.write(
+                            "AI_CORE",
+                            "WARNING",
+                            f"⚠️ Rate Limit (429) streaming - détection quota échouée, retry {attempt + 1}/{MAX_RETRIES} après {delay:.2f}s"
+                        )
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(delay)
                         continue
 
                 if status_code == 500:
@@ -664,6 +860,8 @@ class CodeAssistClient:
         max_tokens: Optional[int] = None,
         tools: Optional[List[Dict]] = None,
         system_instruction: Optional[str] = None,
+        shadow_history: Optional[List[Dict]] = None,
+        session_id: Optional[str] = None,
         **kwargs
     ) -> Any:
         """
@@ -788,6 +986,7 @@ class CodeAssistClient:
         ca_request = to_generate_content_request(
             model=model,
             messages=messages,
+            shadow_history=shadow_history,  # Passer shadow_history pour continuation après tool call
             user_prompt_id=user_prompt_id,
             project_id=self.project_id,
             session_id=self.session_id,
@@ -958,17 +1157,17 @@ class CodeAssistClient:
                                             )
                                         
                                         if "text" in part:
-                                            part_text = part["text"]
-                                            
+                                        part_text = part["text"]
+                                        
                                             if is_thinking:
                                                 # C'est du thinking → accumuler séparément
                                                 chunk_thinking += part_text
-                                                if DEBUG_STREAM:
-                                                    UnifiedLogger.write(
-                                                        "AI_CORE",
-                                                        "STREAM_CANDIDATES",
+                                        if DEBUG_STREAM:
+                                            UnifiedLogger.write(
+                                                "AI_CORE",
+                                                "STREAM_CANDIDATES",
                                                         f"Chunk {total_chunks} - Part {i} (thinking): {len(part_text)} caractères"
-                                                    )
+                                            )
                                             else:
                                                 # C'est la réponse finale
                                                 chunk_text += part_text
@@ -979,42 +1178,57 @@ class CodeAssistClient:
                                                         f"Chunk {total_chunks} - Part {i} (text): {len(part_text)} caractères"
                                                     )
                                         elif "functionCall" in part:
-                                            # L'IA veut appeler un outil - convertir en format !native_tool pour exécution
+                                            # L'IA veut appeler un outil - détecter directement sans conversion texte
                                             func_call = part["functionCall"]
                                             func_name = func_call.get("name", "unknown_tool")
                                             func_args = func_call.get("args", {})
                                             
-                                            # Convertir en format !native_tool pour que le worker puisse l'exécuter
-                                            import json
-                                            try:
-                                                args_json = json.dumps(func_args, ensure_ascii=False)
-                                                tool_command = f'!native_tool {{"name": "{func_name}", "args": {args_json}}}'
-                                                
-                                                # Ajouter au texte pour que le worker le détecte et l'exécute
-                                                chunk_text += f"\n{tool_command}\n"
-                                                
+                                            # Extraire l'ID de corrélation (id ou call_id)
+                                            # L'ID peut être dans func_call directement ou dans part
+                                            func_call_id = (
+                                                func_call.get("id") or 
+                                                func_call.get("call_id") or
+                                                part.get("id") or
+                                                part.get("call_id")
+                                            )
+                                            
+                                            # Extraire thoughtSignature si présent (peut être dans func_call ou part)
+                                            thought_sig = (
+                                                func_call.get("thoughtSignature") or
+                                                part.get("thoughtSignature")
+                                            )
+                                            
+                                            # Log détaillé pour diagnostic si l'ID est manquant
+                                            if not func_call_id:
                                                 UnifiedLogger.write(
                                                     "AI_CORE",
-                                                    "STREAM_CANDIDATES",
-                                                    f"Chunk {total_chunks} - FunctionCall converti en !native_tool: {func_name}"
+                                                    "WARNING",
+                                                    f"FunctionCall sans ID détecté pour {func_name}. "
+                                                    f"Clés disponibles dans func_call: {list(func_call.keys())}, "
+                                                    f"Clés disponibles dans part: {list(part.keys())}"
                                                 )
-                                            except Exception as e:
-                                                # Fallback: afficher comme texte si conversion échoue
-                                                func_call_text = f"\n[🔧 L'IA souhaite utiliser l'outil '{func_name}'"
-                                                if func_args:
-                                                    try:
-                                                        args_str = json.dumps(func_args, ensure_ascii=False, indent=2)
-                                                        func_call_text += f" avec les paramètres:\n{args_str}"
-                                                    except:
-                                                        func_call_text += f" avec des paramètres"
-                                                func_call_text += "]\n"
-                                                chunk_text += func_call_text
-                                                
-                                                UnifiedLogger.write(
-                                                    "AI_CORE",
-                                                    "STREAM_CANDIDATES",
-                                                    f"Chunk {total_chunks} - FunctionCall conversion échouée: {e}, affiché comme texte"
-                                                )
+                                            
+                                            # Créer un objet FunctionCallObject pour transporter les métadonnées
+                                            func_call_obj = FunctionCallObject(
+                                                name=func_name,
+                                                args=func_args,
+                                                call_id=func_call_id,
+                                                thought_signature=thought_sig
+                                            )
+                                            
+                                            UnifiedLogger.write(
+                                                "AI_CORE",
+                                                "STREAM_CANDIDATES",
+                                                f"Chunk {total_chunks} - FunctionCall détecté: {func_name}, id={func_call_id}, thoughtSignature={'présent' if thought_sig else 'absent'}"
+                                            )
+                                            
+                                            # Yielder l'objet directement au lieu de convertir en texte
+                                            # Le worker détectera cet objet et gérera l'exécution
+                                            yield func_call_obj
+                                            
+                                            # Ne pas ajouter au chunk_text, le functionCall est géré séparément
+                                            # Sortir de la boucle des parts car on a trouvé un functionCall
+                                            break
                                 
                                 # Envoyer le thinking séparément si présent (avec marqueur)
                                 if chunk_thinking:

@@ -222,11 +222,11 @@ class MainPanel(ctk.CTkFrame):
             viewer.pack(fill="both", expand=True)
         else:
             # Comportement actuel avec TextEditorWithLineNumbers pour les autres fichiers
-            editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
-            editor.pack(fill="both", expand=True)
-            editor.insert("1.0", content)
-            # Note: CTkCodeBox gère déjà le syntax highlighting automatiquement
-            # On n'a plus besoin d'appeler apply_highlighting_to_editor
+        editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
+        editor.pack(fill="both", expand=True)
+        editor.insert("1.0", content)
+        # Note: CTkCodeBox gère déjà le syntax highlighting automatiquement
+        # On n'a plus besoin d'appeler apply_highlighting_to_editor
         
         self.tab_view.set(filename)
 
@@ -250,7 +250,7 @@ class MainPanel(ctk.CTkFrame):
         textbox.configure(state="disabled")
         self._configure_chat_tags(textbox)
         return textbox
-    
+
     @trace_action(source="panels")
     def log_chat(self, text, tag, target="Chat Principal"):
         # Nettoyer les séquences \n\n échappées

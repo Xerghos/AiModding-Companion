@@ -70,6 +70,7 @@ def codeassist_completion(**kwargs) -> Any:
     # Seulement utiliser si explicitement fourni (pour utilisation projet GCP)
     project_id = kwargs.get("project_id")  # None par défaut = quota personnel
     session_id = kwargs.get("session_id")
+    shadow_history = kwargs.get("shadow_history")  # Historique Shadow pour continuation après tool call
     
     UnifiedLogger.write(
         "AI_CORE",
@@ -96,10 +97,11 @@ def codeassist_completion(**kwargs) -> Any:
             max_tokens=max_tokens,
             tools=tools,
             system_instruction=system_instruction,
+            shadow_history=shadow_history,  # Passer shadow_history explicitement
             **{k: v for k, v in kwargs.items() if k not in [
                 "model", "messages", "stream", "temperature", 
                 "max_tokens", "tools", "system_instruction", 
-                "project_id", "session_id"
+                "project_id", "session_id", "shadow_history"
             ]}
         )
         
@@ -115,10 +117,11 @@ def codeassist_completion(**kwargs) -> Any:
             max_tokens=max_tokens,
             tools=tools,
             system_instruction=system_instruction,
+            shadow_history=shadow_history,  # Passer shadow_history explicitement
             **{k: v for k, v in kwargs.items() if k not in [
                 "model", "messages", "stream", "temperature", 
                 "max_tokens", "tools", "system_instruction", 
-                "project_id", "session_id"
+                "project_id", "session_id", "shadow_history"
             ]}
         )
         
@@ -234,7 +237,17 @@ def _convert_stream_to_litellm(stream_generator: Generator) -> Generator:
     import logging
     log_convert = logging.getLogger("ai_core.litellm_codeassist_provider")
     
+    # Importer FunctionCallObject pour détection
+    from ai_core.code_assist_client import FunctionCallObject
+    
     for chunk in stream_generator:
+        # Vérifier si c'est un FunctionCallObject directement yieldé
+        if isinstance(chunk, FunctionCallObject):
+            # Yielder le FunctionCallObject tel quel pour que le worker le détecte
+            log_convert.info(f"🔄 _convert_stream: FunctionCallObject détecté: {chunk.name}, id={chunk.id}")
+            yield chunk
+            continue
+        
         # Extraire le contenu du chunk et le marqueur is_thinking
         chunk_content = ""
         is_thinking = False

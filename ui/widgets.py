@@ -800,6 +800,9 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.widgets = []  # Liste des widgets ajoutés
         
+        # Monkey-patch CustomTkinter pour éviter l'erreur 'str' object has no attribute 'master'
+        self._patch_customtkinter_mousewheel()
+        
         # Intercepter les événements de molette AVANT CustomTkinter pour éviter les erreurs
         # Utiliser bind_class pour intercepter au niveau de la classe
         self._intercept_mousewheel_events()
@@ -810,6 +813,66 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         self.after(200, self._hide_scrollbar)
         # Réessayer après un délai plus long au cas où
         self.after(500, self._hide_scrollbar)
+    
+    def _patch_customtkinter_mousewheel(self):
+        """Monkey-patch CustomTkinter pour éviter l'erreur 'str' object has no attribute 'master'."""
+        try:
+            import customtkinter.windows.widgets.ctk_scrollable_frame as ctk_sf
+            
+            # Sauvegarder la méthode originale si pas déjà patchée
+            if not hasattr(ctk_sf.CTkScrollableFrame, '_check_if_master_is_canvas_original'):
+                ctk_sf.CTkScrollableFrame._check_if_master_is_canvas_original = ctk_sf.CTkScrollableFrame.check_if_master_is_canvas
+                
+                def safe_check_if_master_is_canvas(self, widget):
+                    """Version sécurisée qui gère les widgets invalides."""
+                    try:
+                        # Vérifier si widget est invalide (chaîne, None, ou sans master)
+                        if widget is None:
+                            return False
+                        if isinstance(widget, str):
+                            return False
+                        if not hasattr(widget, 'master'):
+                            return False
+                        # Appeler la méthode originale
+                        return ctk_sf.CTkScrollableFrame._check_if_master_is_canvas_original(self, widget)
+                    except (AttributeError, TypeError, ValueError):
+                        return False
+                
+                # Remplacer la méthode
+                ctk_sf.CTkScrollableFrame.check_if_master_is_canvas = safe_check_if_master_is_canvas
+            
+            # Aussi patcher _mouse_wheel_all pour intercepter avant le traitement
+            if not hasattr(ctk_sf.CTkScrollableFrame, '_mouse_wheel_all_original'):
+                ctk_sf.CTkScrollableFrame._mouse_wheel_all_original = ctk_sf.CTkScrollableFrame._mouse_wheel_all
+                
+                def safe_mouse_wheel_all(self, event):
+                    """Version sécurisée de _mouse_wheel_all qui vérifie event.widget."""
+                    try:
+                        # Vérifier si event.widget est invalide avant de continuer
+                        if not hasattr(event, 'widget'):
+                            return
+                        
+                        widget = event.widget
+                        # Vérifier si widget est une chaîne ou None
+                        if widget is None:
+                            return
+                        if isinstance(widget, str):
+                            return
+                        if not hasattr(widget, 'master'):
+                            return
+                        
+                        # Widget valide, appeler la méthode originale
+                        return ctk_sf.CTkScrollableFrame._mouse_wheel_all_original(self, event)
+                    except (AttributeError, TypeError, ValueError):
+                        # Erreur, ne pas traiter
+                        return
+                
+                # Remplacer la méthode
+                ctk_sf.CTkScrollableFrame._mouse_wheel_all = safe_mouse_wheel_all
+        except Exception as e:
+            # Si le patch échoue, on continue sans
+            import logging
+            logging.getLogger("ui.widgets").debug(f"Échec patch CustomTkinter: {e}")
     
     def _intercept_mousewheel_events(self):
         """Intercepte les événements de molette pour éviter les erreurs CustomTkinter et gère le scroll."""
@@ -849,6 +912,27 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             except:
                 return "break"
         
+        # Intercepter au niveau de la fenêtre racine AVANT CustomTkinter (priorité maximale)
+        def bind_at_root():
+            try:
+                root = self.winfo_toplevel()
+                if root:
+                    # Bind au niveau du root pour intercepter TOUS les événements avant CustomTkinter
+                    root.bind_class("CTkScrollableFrame", "<MouseWheel>", safe_mousewheel_handler, add="+")
+                    root.bind_class("CTkScrollableFrame", "<Button-4>", safe_mousewheel_handler, add="+")
+                    root.bind_class("CTkScrollableFrame", "<Button-5>", safe_mousewheel_handler, add="+")
+            except:
+                pass
+        
+        # Essayer immédiatement et après délais
+        try:
+            bind_at_root()
+        except:
+            pass
+        self.after(10, bind_at_root)
+        self.after(100, bind_at_root)
+        self.after(500, bind_at_root)
+        
         # Utiliser bind_class pour intercepter au niveau de la classe avant CustomTkinter
         # Cela intercepte TOUS les événements de molette sur tous les CTkScrollableFrame
         try:
@@ -857,24 +941,60 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             self.bind_class("CTkScrollableFrame", "<Button-5>", safe_mousewheel_handler, add="+")
         except:
             # Fallback si bind_class ne fonctionne pas
-            self.bind("<MouseWheel>", safe_mousewheel_handler)
-            self.bind("<Button-4>", safe_mousewheel_handler)
-            self.bind("<Button-5>", safe_mousewheel_handler)
+            self.bind("<MouseWheel>", safe_mousewheel_handler, add="+")
+            self.bind("<Button-4>", safe_mousewheel_handler, add="+")
+            self.bind("<Button-5>", safe_mousewheel_handler, add="+")
         
         # Aussi bind sur tous les enfants après création
         def bind_children():
             try:
                 for child in self.winfo_children():
                     if hasattr(child, 'bind'):
-                        child.bind("<MouseWheel>", safe_mousewheel_handler)
-                        child.bind("<Button-4>", safe_mousewheel_handler)
-                        child.bind("<Button-5>", safe_mousewheel_handler)
+                        child.bind("<MouseWheel>", safe_mousewheel_handler, add="+")
+                        child.bind("<Button-4>", safe_mousewheel_handler, add="+")
+                        child.bind("<Button-5>", safe_mousewheel_handler, add="+")
             except:
                 pass
         
         # Bind les enfants après un court délai
         self.after(50, bind_children)
         self.after(200, bind_children)
+        self.after(500, bind_children)
+        
+        # Bind récursif sur tous les descendants pour être exhaustif
+        def bind_all_descendants():
+            try:
+                def bind_recursive(widget):
+                    try:
+                        if hasattr(widget, 'bind'):
+                            widget.bind("<MouseWheel>", safe_mousewheel_handler, add="+")
+                            widget.bind("<Button-4>", safe_mousewheel_handler, add="+")
+                            widget.bind("<Button-5>", safe_mousewheel_handler, add="+")
+                        for child in widget.winfo_children():
+                            bind_recursive(child)
+                    except:
+                        pass
+                
+                bind_recursive(self)
+            except:
+                pass
+        
+        self.after(1000, bind_all_descendants)
+    
+    def _adjust_container_height(self):
+        """Ajuste la hauteur du container pour qu'elle corresponde exactement au contenu."""
+        try:
+            self.update_idletasks()
+            total_height = 0
+            for widget in self.widgets:
+                if widget.winfo_viewable():
+                    widget.update_idletasks()
+                    total_height += widget.winfo_reqheight()
+            # Le pack_propagate(True) devrait gérer ça, mais on force le recalcul
+            if total_height > 0:
+                self.update_idletasks()
+        except Exception as e:
+            log.debug(f"Erreur ajustement hauteur container: {e}")
     
     def _hide_scrollbar(self):
         """Masque la scrollbar du CTkScrollableFrame tout en gardant le scroll fonctionnel."""

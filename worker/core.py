@@ -5,6 +5,8 @@ import traceback
 import os
 import json
 import re
+import uuid
+from enum import Enum
 import features.audio as audio_manager
 from concurrent.futures import ThreadPoolExecutor
 
@@ -66,6 +68,27 @@ except ImportError as e:
 log = get_logger("worker.core")
 FULL_CHAT_HISTORY_FILE = "full_chat_history.json"
 
+
+class AgentState(Enum):
+    """États de la machine à états finis pour la boucle agentique."""
+    IDLE = "idle"
+    GENERATING = "generating"
+    TOOL_DETECTED = "tool_detected"
+    EXECUTING = "executing"
+    INJECTING = "injecting"
+    RECURSING = "recursing"
+
+
+class CircuitBreakerException(Exception):
+    """Exception levée quand le Circuit Breaker détecte une boucle infinie."""
+    pass
+
+
+class QuotaExceededException(Exception):
+    """Exception levée quand le quota journalier est épuisé."""
+    pass
+
+
 class Worker(threading.Thread):
     """
     Worker Thread Principal (V24 - Architecture Modulaire & Stabilisée).
@@ -91,6 +114,16 @@ class Worker(threading.Thread):
         
         # [NOUVEAU] Timer pour l'automaintenance
         self.last_arch_update = time.time()
+        
+        # [NOUVEAU] Shadow History et Session ID pour l'enchaînement des tool calls
+        self._ui_history = []  # Historique pour l'affichage utilisateur
+        self._shadow_history = []  # Historique exact envoyé à l'API (vérité terrain)
+        self._current_session_id = None  # Session ID stable pour toute la conversation
+        
+        # [NOUVEAU] Circuit Breaker pour éviter les boucles infinies
+        self._tool_call_count = 0
+        self._max_tool_calls = 15
+        self._recent_tool_calls = []  # Derniers 3 appels pour détection de répétition
         
         # Init Config interne
         self._refresh_config()
@@ -514,6 +547,241 @@ class Worker(threading.Thread):
             })
             return None
 
+    @trace_action(source="core")
+    def _check_circuit_breaker(self, tool_name):
+        """
+        Vérifie le Circuit Breaker pour éviter les boucles infinies.
+        
+        Returns:
+            True si on peut continuer, False si on doit arrêter
+        """
+        # Vérifier le nombre total d'appels
+        if self._tool_call_count >= self._max_tool_calls:
+            log.warning(f"🛑 Circuit Breaker activé: Limite d'itérations atteinte ({self._max_tool_calls})")
+            raise CircuitBreakerException(f"Limite d'itérations atteinte ({self._max_tool_calls})")
+        
+        # Vérifier les répétitions (même outil appelé 3 fois de suite)
+        self._recent_tool_calls.append(tool_name)
+        if len(self._recent_tool_calls) > 3:
+            self._recent_tool_calls.pop(0)
+        
+        if len(self._recent_tool_calls) == 3:
+            if all(t == tool_name for t in self._recent_tool_calls):
+                log.warning(f"🛑 Circuit Breaker activé: Boucle détectée : même outil '{tool_name}' appelé 3 fois de suite")
+                raise CircuitBreakerException(f"Boucle détectée : même outil '{tool_name}' appelé 3 fois de suite")
+        
+        return True
+
+    @trace_action(source="core")
+    def _execute_tool_call(self, function_call_object):
+        """
+        Exécute un tool call détecté dans le stream.
+        
+        Args:
+            function_call_object: Instance de FunctionCallObject avec name, args, id, thought_signature
+        """
+        try:
+            # Vérifier le Circuit Breaker
+            self._check_circuit_breaker(function_call_object.name)
+            
+            # Incrémenter le compteur
+            self._tool_call_count += 1
+            
+            log.info(f"🔧 Exécution tool call: {function_call_object.name} (id={function_call_object.id}, count={self._tool_call_count})")
+            
+            # Changer l'état
+            self.agent_state = AgentState.EXECUTING
+            
+            # Importer le dispatcher
+            from features.ai_helper import execute_native_tool
+            
+            # Exécuter le tool via le dispatcher
+            session = self.get_main_session()
+            tool_result = execute_native_tool(
+                name=function_call_object.name,
+                args=function_call_object.args or {},
+                session=session,
+                action_log_path="action_log.json",
+                result_queue=self.response_queue,
+                task_queue=self.task_queue
+            )
+            
+            # Afficher seulement un indicateur visuel (éviter la duplication)
+            # Le résultat complet sera dans le functionResponse injecté dans le Shadow History
+            if tool_result:
+                self._save_and_display(f"⚡ Outil '{function_call_object.name}' exécuté avec succès")
+            
+            # Formater le functionResponse selon le format CodeAssist/Gemini
+            # D'après la documentation Gemini officielle, le champ doit être "content" (pas "result")
+            MAX_RESULT_LENGTH = 50000  # Limite raisonnable (section 10.1 du document CodeAssist)
+            
+            # Convertir le résultat en string
+            tool_result_str = str(tool_result) if tool_result else "Aucun résultat"
+            
+            # Tronquer intelligemment si nécessaire (section 10.1 : préserver début et fin)
+            if len(tool_result_str) > MAX_RESULT_LENGTH:
+                # Préserver le début et la fin pour garder le contexte
+                half_length = MAX_RESULT_LENGTH // 2
+                truncated_result = (
+                    tool_result_str[:half_length] + 
+                    f"\n\n[... {len(tool_result_str) - MAX_RESULT_LENGTH} caractères tronqués ...]\n\n" +
+                    tool_result_str[-half_length:]
+                )
+                tool_result_str = truncated_result
+                log.warning(f"⚠️ Résultat tool call tronqué: {len(str(tool_result))} -> {MAX_RESULT_LENGTH} caractères")
+            
+            # Encapsuler dans un objet JSON si c'est du texte brut (section 8.1 du document CodeAssist)
+            # Le document recommande {"output": "..."} pour du texte brut
+            # Mais selon le document Gemini, on peut aussi utiliser directement "content" avec le texte
+            # On va utiliser le format recommandé par Gemini : {"content": "..."}
+            function_response = {
+                "name": function_call_object.name,
+                "response": {
+                    "content": tool_result_str  # ✅ "content" au lieu de "result" (document Gemini ligne 364)
+                }
+            }
+            
+            # Si un ID de corrélation existe, l'ajouter (CRITIQUE - section 7.2 du document CodeAssist)
+            if function_call_object.id:
+                function_response["id"] = function_call_object.id
+            else:
+                # Si l'ID est None, générer un UUID complet (pas un ID temporaire avec préfixe)
+                # L'API CodeAssist rejette les IDs avec préfixe "temp_" (erreur 400)
+                # Utiliser un UUID complet pour éviter le rejet par l'API
+                generated_id = str(uuid.uuid4())
+                log.warning(f"⚠️ FunctionCall sans ID détecté pour {function_call_object.name}. Génération d'un UUID: {generated_id}")
+                function_response["id"] = generated_id
+            
+            # Injecter dans le Shadow History et continuer le stream
+            self._inject_function_response(function_call_object, function_response)
+            
+        except CircuitBreakerException as e:
+            log.error(f"🛑 Circuit Breaker: {e}")
+            self.response_queue.put({
+                'type': 'error',
+                'text': f"🛑 Circuit Breaker activé: {e}"
+            })
+            self.agent_state = AgentState.IDLE
+            self.response_queue.put({'type': 'ui_stream_end'})
+        except Exception as e:
+            log.error(f"Erreur exécution tool call: {e}\n{traceback.format_exc()}")
+            self.response_queue.put({
+                'type': 'error',
+                'text': f"Erreur exécution tool '{function_call_object.name}': {e}"
+            })
+            self.agent_state = AgentState.IDLE
+            self.response_queue.put({'type': 'ui_stream_end'})
+
+    @trace_action(source="core")
+    def _inject_function_response(self, function_call, function_response):
+        """
+        Injecte le functionCall et functionResponse dans le Shadow History.
+        
+        Args:
+            function_call: FunctionCallObject avec les métadonnées
+            function_response: Dict formaté selon CodeAssist avec name, response, id
+        """
+        try:
+            # Formater le functionCall selon le format CodeAssist
+            # IMPORTANT: thoughtSignature ne doit PAS être dans functionCall lors de l'injection
+            # L'API CodeAssist rejette thoughtSignature dans functionCall (erreur 400)
+            # thoughtSignature est utilisé uniquement lors de la génération initiale, pas lors de l'injection
+            function_call_dict = {
+                "functionCall": {
+                    "name": function_call.name,
+                    "args": function_call.args or {}
+                }
+            }
+            
+            # Ajouter l'ID de corrélation si présent (CRITIQUE pour éviter les boucles)
+            # L'ID peut être dans function_call.id ou dans function_response["id"] (ID temporaire)
+            if function_call.id:
+                function_call_dict["functionCall"]["id"] = function_call.id
+            elif "id" in function_response:
+                # Si l'ID est None dans function_call, utiliser l'ID temporaire généré dans function_response
+                function_call_dict["functionCall"]["id"] = function_response["id"]
+                log.info(f"📝 ID temporaire utilisé pour functionCall: {function_response['id']}")
+            # Si aucun ID n'est disponible, ne pas en ajouter (l'API générera peut-être une erreur, mais on essaie)
+            
+            # NOTE: thoughtSignature est stockée mais non injectée dans l'historique
+            # L'API CodeAssist ne l'accepte pas dans functionCall lors de l'injection
+            # Elle est préservée dans function_call.thought_signature pour référence future si nécessaire
+            
+            # Ajouter au Shadow History (format CodeAssist: role="model", parts=[functionCall])
+            self._shadow_history.append({
+                "role": "model",
+                "parts": [function_call_dict]
+            })
+            
+            # Ajouter le functionResponse (format CodeAssist: role="function", parts=[functionResponse])
+            self._shadow_history.append({
+                "role": "function",
+                "parts": [{"functionResponse": function_response}]
+            })
+            
+            log.info(f"📝 Shadow History mis à jour: {len(self._shadow_history)} messages")
+            
+            # Log détaillé pour diagnostic
+            log.info(f"📝 FunctionCall injecté: name={function_call.name}, id={function_call_dict.get('functionCall', {}).get('id')}")
+            log.info(f"📝 FunctionResponse injecté: name={function_response.get('name')}, id={function_response.get('id')}, content_type={type(function_response.get('response', {}).get('content')).__name__}, content_len={len(str(function_response.get('response', {}).get('content', '')))}")
+            
+            # Changer l'état et continuer le stream
+            self.agent_state = AgentState.INJECTING
+            self._continue_stream_after_tool()
+            
+        except Exception as e:
+            log.error(f"Erreur injection function response: {e}\n{traceback.format_exc()}")
+            self.agent_state = AgentState.IDLE
+            self.response_queue.put({'type': 'ui_stream_end'})
+
+    @trace_action(source="core")
+    def _continue_stream_after_tool(self):
+        """
+        Continue le stream après l'exécution d'un tool call en utilisant le même session_id.
+        """
+        try:
+            log.info(f"▶️ Reprise du stream après tool call avec session_id: {self._current_session_id}")
+            log.info(f"📝 Shadow History à envoyer: {len(self._shadow_history)} messages")
+            
+            # Log détaillé de chaque message dans shadow_history
+            for idx, msg in enumerate(self._shadow_history):
+                role = msg.get("role", "unknown")
+                parts = msg.get("parts", [])
+                log.info(f"📝 Shadow History[{idx}]: role={role}, {len(parts)} parts")
+                for part_idx, part in enumerate(parts):
+                    if "functionCall" in part:
+                        func_call = part["functionCall"]
+                        log.info(f"📝   Part {part_idx} - functionCall: name={func_call.get('name')}, id={func_call.get('id')}")
+                    elif "functionResponse" in part:
+                        func_resp = part["functionResponse"]
+                        resp_content = func_resp.get("response", {}).get("content", "")
+                        log.info(f"📝   Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, content_len={len(str(resp_content))}")
+                    elif "text" in part:
+                        text_content = part["text"]
+                        log.info(f"📝   Part {part_idx} - text: len={len(str(text_content))}")
+            
+            # Changer l'état
+            self.agent_state = AgentState.RECURSING
+            
+            # Préparer le payload de continuation
+            continuation_payload = {
+                "message": "",  # Pas de nouveau message, on continue avec le Shadow History
+                "shadow_history": self._shadow_history,
+                "is_continuation": True
+            }
+            
+            # Délai court pour éviter les rate limits
+            import time
+            time.sleep(0.5)
+            
+            # Relancer le stream avec le même session_id et le Shadow History
+            self.bg_executor.submit(self._handle_chat_stream, continuation_payload)
+            
+        except Exception as e:
+            log.error(f"Erreur continuation stream: {e}\n{traceback.format_exc()}")
+            self.agent_state = AgentState.IDLE
+            self.response_queue.put({'type': 'ui_stream_end'})
+
     # --- HANDLERS DIRECTS ---
 
     @trace_action(source="core")
@@ -549,33 +817,73 @@ class Worker(threading.Thread):
 
     @trace_action(source="core")
     def _handle_chat_stream(self, payload):
-        """Gère le flux de discussion avec le support RAG V5 Atomique."""
+        """Gère le flux de discussion avec le support RAG V5 Atomique et la boucle agentique."""
         try:
             self.bg_task_desc = f"🤖 Génération réponse..."
             self.abort_current_stream = False
             self.response_queue.put({'type': 'ui_stream_start'})
             
+            # Initialiser l'état de l'agent
+            self.agent_state = AgentState.GENERATING
+            
+            # Générer un session_id stable si c'est le début d'une nouvelle conversation
+            if not self._current_session_id:
+                self._current_session_id = str(uuid.uuid4())
+                log.info(f"🆔 Nouveau session_id généré: {self._current_session_id}")
+                # Réinitialiser le Shadow History pour une nouvelle conversation
+                self._shadow_history = []
+                self._tool_call_count = 0
+                self._recent_tool_calls = []
+            
             session = self.get_main_session()
             user_msg = payload.get("message", "")
+            
+            # Si c'est une continuation après tool call, utiliser shadow_history
+            shadow_history = payload.get("shadow_history")
+            is_continuation = payload.get("is_continuation", False)
+            
+            # Si c'est un nouveau message (pas une continuation), ajouter au Shadow History
+            if not is_continuation and user_msg and not shadow_history:
+                self._shadow_history.append({
+                    "role": "user",
+                    "parts": [{"text": user_msg}]
+                })
             
             # Récupération du contexte RAG (Document + Mémoire LTM)
             rag = self._retrieve_rag_context(user_msg)
             
             # [CORRECTION V5] On ne fusionne PLUS le RAG dans le prompt.
             # On le passe comme argument séparé pour injection dans le Bloc 4.
-            prompt = user_msg
+            prompt = user_msg if not is_continuation else ""
             
-            # Appel Robuste avec passage du RAG Context
-            response_gen = call_ai_robust(session, prompt, stream=True, rag_context=rag)
+            # Appel Robuste avec passage du RAG Context et shadow_history si continuation
+            response_gen = call_ai_robust(
+                session, 
+                prompt, 
+                stream=True, 
+                rag_context=rag,
+                shadow_history=shadow_history,
+                session_id=self._current_session_id
+            )
             
             full_text = ""
             has_received_content = False
+            detected_function_call = None
             
             if response_gen:
                 try:
                     for chunk in response_gen:
                         if self.abort_current_stream:
                             self.response_queue.put({'type': 'ui_stream_chunk', 'text': "\n[INTERROMPU]"})
+                            break
+                        
+                        # Détecter si c'est un FunctionCallObject (détection directe)
+                        from ai_core.code_assist_client import FunctionCallObject
+                        if isinstance(chunk, FunctionCallObject):
+                            detected_function_call = chunk
+                            self.agent_state = AgentState.TOOL_DETECTED
+                            log.info(f"🔧 FunctionCall détecté dans le stream: {chunk.name}, id={chunk.id}")
+                            # Sortir de la boucle pour exécuter le tool
                             break
                         
                         # LOG INCONDITIONNEL pour confirmer que le code est exécuté
@@ -652,7 +960,7 @@ class Worker(threading.Thread):
                                 self.response_queue.put({'type': 'ui_stream_thinking', 'text': txt})
                             else:
                                 log.info(f"🟢 Routing content chunk: {len(txt)} chars, is_thinking={is_thinking}")
-                                self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
+                            self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
                 except StopIteration:
                     # Itérateur terminé normalement
                     pass
@@ -666,48 +974,26 @@ class Worker(threading.Thread):
                 log.warning("⚠️ Réponse IA vide reçue (générateur None ou vide).")
                 self.response_queue.put({'type': 'ui_stream_chunk', 'text': "\n[⚠️ Aucune réponse reçue de l'IA]"})
             
-            self.response_queue.put({'type': 'ui_stream_end'})
+            # Si un functionCall a été détecté, ne pas envoyer ui_stream_end immédiatement
+            if self.agent_state == AgentState.TOOL_DETECTED and detected_function_call:
+                log.info("⏸️ Stream suspendu pour exécution du tool")
+                # Exécuter le tool call
+                self._execute_tool_call(detected_function_call)
+            else:
+                # Stream normal terminé
+                self.response_queue.put({'type': 'ui_stream_end'})
             
+            # Fallback : Détection !native_tool dans le texte (pour compatibilité)
             if not self.abort_current_stream:
-                # 1. Détection !native_tool standard (JSON Strict) - Reconstruit par Session
                 native_match = re.search(r"(!native_tool\s*\{.*?\})", full_text, re.DOTALL)
-                
-                # 2. Détection Hallucination (Backup)
-                memory_match = re.search(r"\[TOOL_CALL:\s*(\w+)\((.*?)\)\]", full_text, re.DOTALL)
-                
-                cmd_to_execute = None
-
                 if native_match:
                     raw_cmd = native_match.group(1).strip()
-                    if '"name": "..."' in raw_cmd or "'name': '...'" in raw_cmd:
-                        log.warning("🛑 Tentative d'exécution d'un placeholder '...' bloquée.")
-                    else:
-                        cmd_to_execute = raw_cmd
+                    if '"name": "..."' not in raw_cmd and "'name': '...'" not in raw_cmd:
+                        log.info(f"🔧 Outil détecté (fallback texte) : {raw_cmd[:50]}...")
+                        self.task_queue.put({'action': 'command', 'payload': {'command': raw_cmd}})
                 
-                elif memory_match:
-                    tool_name = memory_match.group(1)
-                    if "..." in tool_name:
-                        log.warning(f"🛑 Tentative d'exécution outil invalide '{tool_name}' bloquée.")
-                    else:
-                        tool_args_raw = memory_match.group(2).strip()
-                        if tool_args_raw.startswith("{") and tool_args_raw.endswith("}"):
-                            tool_args = tool_args_raw
-                        elif not tool_args_raw:
-                            tool_args = "{}"
-                        else:
-                            tool_args_fixed = re.sub(r"(^|,\s*)(\w+)\s*=", r'\1"\2": ', tool_args_raw)
-                            tool_args = f"{{{tool_args_fixed}}}"
-                        
-                        reconstructed_cmd = f'!native_tool {{"name": "{tool_name}", "args": {tool_args}}}'
-                        cmd_to_execute = reconstructed_cmd
-                
-                if cmd_to_execute:
-                    log.info(f"🔧 Outil détecté : {cmd_to_execute[:50]}...")
-                    self.task_queue.put({'action': 'command', 'payload': {'command': cmd_to_execute}})
-                
-                elif not full_text.strip() and not has_received_content:
+                if not full_text.strip() and not has_received_content:
                     log.warning("⚠️ Réponse IA vide reçue (aucun contenu dans le stream).")
-                    # Envoyer un message d'erreur à l'UI
                     self.response_queue.put({'type': 'ui_update', 'widget': 'message', 'text': "⚠️ Réponse IA vide. Vérifiez les logs pour plus de détails."})
 
         except Exception as e:
