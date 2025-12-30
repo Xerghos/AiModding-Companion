@@ -1033,25 +1033,8 @@ class CodeAssistClient:
                     f"{chunks_with_metrics} avec métriques, {len(full_text)} caractères totaux"
                 )
                 
-                # Dernier chunk avec le texte complet
-                if full_text:
-                    class DeltaObject:
-                        def __init__(self, content):
-                            self.content = content
-                            self.text = content
-                    
-                    class ChoiceObject:
-                        def __init__(self, delta):
-                            self.delta = delta
-                    
-                    class ChunkObject:
-                        def __init__(self, choice):
-                            self.choices = [choice]
-                    
-                    delta = DeltaObject(full_text)
-                    choice = ChoiceObject(delta)
-                    chunk_obj = ChunkObject(choice)
-                    yield chunk_obj
+                # NOTE: On ne renvoie plus le texte complet à la fin car il a déjà été envoyé chunk par chunk
+                # Cela évite la duplication du texte dans le chat
             
             return stream_generator()
         else:

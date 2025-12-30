@@ -61,6 +61,7 @@ class GeminiApp:
         self.status_var = tk.StringVar(value="Initialisation...")
         self.is_working = False
         self.is_streaming = False
+        self._stream_prefix_added = False  # Flag pour gérer le préfixe du premier chunk
         self.windows = {} 
         self.prompt_history = []
         self.history_index = -1
@@ -477,17 +478,33 @@ class GeminiApp:
                     self._stop_animation()
                     self._log_chat(self.chat1_txt, f"🤖 {res['text']}", "gemini")
                 
+                elif msg_type == 'ui_stream_start':
+                    # Réinitialiser le flag pour le nouveau stream
+                    self._stream_prefix_added = False
+                    self.is_streaming = True
+                
                 elif msg_type == 'ui_stream_chunk':
                     # [CORRECTION] Insertion directe sans saut de ligne forcé pour le streaming fluide
                     self.chat1_txt.configure(state="normal")
-                    self.chat1_txt.insert("end", res['text'], "gemini")
+                    # Ajouter le préfixe "🤖 " seulement au premier chunk
+                    text = res['text']
+                    if not hasattr(self, '_stream_prefix_added') or not self._stream_prefix_added:
+                        text = f"🤖 {text}"
+                        self._stream_prefix_added = True
+                    self.chat1_txt.insert("end", text, "gemini")
                     self.chat1_txt.configure(state="disabled")
                     self.chat1_txt.see("end")
                 
                 elif msg_type == 'ui_stream_end':
                     self._stop_animation() 
-                    # [CORRECTION] On ajoute juste le saut de ligne final (via l'argument vide, _log_chat mettra \n\n)
-                    self._log_chat(self.chat1_txt, "", "gemini")
+                    # Réinitialiser le flag pour le prochain stream
+                    self._stream_prefix_added = False
+                    self.is_streaming = False
+                    # [CORRECTION] On ajoute juste le saut de ligne final directement (pas besoin de _log_chat qui ajouterait \n\n)
+                    self.chat1_txt.configure(state="normal")
+                    self.chat1_txt.insert("end", "\n\n", "gemini")
+                    self.chat1_txt.configure(state="disabled")
+                    self.chat1_txt.see("end")
                     
                 elif msg_type == 'ui_update':
                     if res.get('widget') == 'status': self.status_var.set(res['text'])
