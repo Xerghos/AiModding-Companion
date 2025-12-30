@@ -6,6 +6,12 @@ import time
 import re # Nécessaire pour la recherche/remplacement
 import os
 
+# Import pour récupérer la taille de police depuis les settings
+try:
+    from config.settings import APP_SETTINGS
+except ImportError:
+    APP_SETTINGS = {}
+
 log = logging.getLogger("ui.widgets")
 
 # Import tkhtmlview pour affichage HTML
@@ -18,13 +24,23 @@ except ImportError:
     log.warning("tkhtmlview non disponible - l'affichage Markdown/HTML sera limité")
 
 # Import tkintermd pour widget Markdown collapsible
+# Note: tkintermd nécessite tkinterweb qui doit être installé
 try:
+    # Vérifier d'abord que tkinterweb est disponible
+    import tkinterweb
+    # Ensuite importer tkintermd
+    import tkintermd
     from tkintermd.frame import TkintermdFrame
     TKINTERMD_AVAILABLE = True
-except ImportError:
+    log.debug(f"tkintermd importé avec succès depuis {tkintermd.__file__ if hasattr(tkintermd, '__file__') else 'unknown'}")
+except ImportError as e:
     TKINTERMD_AVAILABLE = False
     TkintermdFrame = None
-    log.warning("tkintermd non disponible - le widget Markdown collapsible sera limité")
+    log.warning(f"tkintermd non disponible - le widget Markdown collapsible sera limité: {e}")
+except Exception as e:
+    TKINTERMD_AVAILABLE = False
+    TkintermdFrame = None
+    log.warning(f"tkintermd erreur d'import - le widget Markdown collapsible sera limité: {e}")
 
 # Import du convertisseur Markdown
 try:
@@ -862,19 +878,80 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             log.debug(f"Impossible de masquer la scrollbar: {e}")
     
     def add_textbox(self, text, tag="gemini", height=None):
-        """Ajoute une textbox au container. Hauteur adaptative pour affichage en grand."""
+        """Ajoute une textbox au container. Hauteur adaptative, pas de scrollbar visible."""
+        # Récupérer la taille de police depuis les settings
+        font_size = APP_SETTINGS.get("system_settings", {}).get("font_size", 12)
+        
         if height is None:
             # Calculer la hauteur adaptative basée sur le contenu
             lines = text.count('\n') + 1
             avg_chars_per_line = 80
             wrapped_lines = sum(len(line) // avg_chars_per_line + 1 for line in text.split('\n'))
             total_lines = max(lines, wrapped_lines)
-            # Pas de limite maximale stricte, mais minimum raisonnable
-            height = max(total_lines * 22, 50)
+            # Calculer la hauteur en fonction de la taille de police
+            line_height = max(int(font_size * 1.5), 18)  # Environ 1.5x la taille de police
+            height = max(total_lines * line_height, 50)
         
-        textbox = ctk.CTkTextbox(self, wrap="word", font=("Consolas", 12), height=height)
+        # Créer la textbox avec la taille de police configurée
+        textbox = ctk.CTkTextbox(
+            self, 
+            wrap="word", 
+            font=("Consolas", font_size), 
+            height=height
+        )
         textbox.pack(fill="x", padx=5, pady=2)
         textbox.configure(state="disabled")
+        
+        # Désactiver IMMÉDIATEMENT le scroll et masquer la scrollbar
+        def disable_scroll_immediate():
+            try:
+                # Forcer la mise à jour pour que le widget soit complètement créé
+                self.update_idletasks()
+                
+                # Accéder au widget Text interne de CTkTextbox
+                if hasattr(textbox, '_textbox'):
+                    text_widget = textbox._textbox
+                    # Désactiver le scroll sur le widget Text IMMÉDIATEMENT
+                    text_widget.configure(yscrollcommand=lambda *args: None)
+                    text_widget.configure(xscrollcommand=lambda *args: None)
+                    
+                    # Empêcher la recréation de la scrollbar en bindant les événements de configuration
+                    def prevent_scrollbar(event=None):
+                        text_widget.configure(yscrollcommand=lambda *args: None)
+                        text_widget.configure(xscrollcommand=lambda *args: None)
+                        hide_all_scrollbars()
+                    
+                    text_widget.bind('<Configure>', prevent_scrollbar, add='+')
+                
+                # Fonction pour masquer toutes les scrollbars
+                def hide_all_scrollbars():
+                    def hide_scrollbars_recursive(widget):
+                        """Cherche récursivement toutes les scrollbars dans le widget."""
+                        for child in widget.winfo_children():
+                            # Vérifier si c'est une scrollbar
+                            if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
+                                child.place_forget()
+                                child.pack_forget()
+                                child.grid_forget()
+                                try:
+                                    child.configure(width=0, height=0)
+                                except:
+                                    pass
+                            # Chercher récursivement dans les enfants
+                            hide_scrollbars_recursive(child)
+                    
+                    hide_scrollbars_recursive(textbox)
+                
+                hide_all_scrollbars()
+            except Exception as e:
+                log.debug(f"Erreur désactivation scroll: {e}")
+        
+        # Désactiver IMMÉDIATEMENT (0ms) puis avec des délais pour s'assurer
+        disable_scroll_immediate()  # Exécution immédiate
+        self.after(1, disable_scroll_immediate)  # 1ms après
+        self.after(10, disable_scroll_immediate)  # 10ms après
+        self.after(50, disable_scroll_immediate)  # 50ms après
+        self.after(100, disable_scroll_immediate)  # 100ms après
         
         # Configurer les tags (nécessite une référence à la fonction de configuration)
         # On laisse ça à l'appelant pour l'instant
@@ -887,8 +964,8 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         return textbox
     
     def add_markdown_widget(self, content, is_markdown=True, on_open_in_tab=None):
-        """Ajoute un widget Markdown au container."""
-        md_widget = CollapsibleMarkdownWidget(
+        """Ajoute un widget Markdown non-collapsible au container pour la réponse finale."""
+        md_widget = NonCollapsibleMarkdownWidget(
             self,
             content=content,
             is_markdown=is_markdown,
@@ -1015,6 +1092,102 @@ class CollapsibleMarkdownWidget(ctk.CTkFrame):
         """Ouvre le contenu dans un onglet séparé."""
         if self.on_open_in_tab:
             self.on_open_in_tab(self.content, self.is_markdown)
+
+
+class NonCollapsibleMarkdownWidget(ctk.CTkFrame):
+    """
+    Widget Markdown non-collapsible pour la réponse finale.
+    Taille adaptative au contenu, scrollbar masquée mais fonctionnelle.
+    """
+    def __init__(self, master, content, is_markdown=True, on_open_in_tab=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.content = content
+        self.is_markdown = is_markdown
+        self.on_open_in_tab = on_open_in_tab
+        
+        # Frame principal sans bordure (style simple)
+        self.configure(fg_color="transparent", corner_radius=0)
+        
+        # Container pour le contenu (toujours visible, taille adaptative)
+        self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.content_frame.pack(fill="both", expand=True, padx=0, pady=0)
+        
+        # Utiliser tkintermd si disponible
+        if TKINTERMD_AVAILABLE and is_markdown and TkintermdFrame is not None:
+            try:
+                # Créer un frame tkinter natif pour tkintermd
+                self.md_frame = tk.Frame(self.content_frame, bg=COLORS.get("BG_MAIN", "#1E1E1E"))
+                
+                # Calculer la hauteur approximative basée sur le nombre de lignes
+                lines = content.count('\n') + 1
+                # Environ 30px par ligne pour Markdown rendu, pas de limite maximale
+                estimated_height = max(lines * 30, 200)
+                self.md_frame.configure(height=estimated_height)
+                self.md_frame.pack(fill="both", expand=True, padx=5, pady=5)
+                
+                # Créer le widget tkintermd
+                self.md_widget = TkintermdFrame(self.md_frame)
+                self.md_widget.pack(fill="both", expand=True)
+                self.md_widget.set_markdown(content)
+                
+                # Masquer la scrollbar du tkintermd après création
+                self.after(200, self._hide_tkintermd_scrollbar)
+            except Exception as e:
+                log.error(f"Erreur création widget tkintermd: {e}", exc_info=True)
+                # Fallback vers MarkdownViewer
+                self._create_fallback_viewer()
+        else:
+            # Fallback vers MarkdownViewer
+            self._create_fallback_viewer()
+    
+    def _hide_tkintermd_scrollbar(self):
+        """Masque la scrollbar du widget tkintermd."""
+        try:
+            if hasattr(self, 'md_widget') and self.md_widget:
+                # Chercher la scrollbar dans les enfants du md_frame
+                for child in self.md_frame.winfo_children():
+                    if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
+                        child.place_forget()
+                        child.pack_forget()
+                        child.grid_forget()
+                        try:
+                            child.configure(width=0)
+                        except:
+                            pass
+        except Exception as e:
+            log.debug(f"Impossible de masquer la scrollbar tkintermd: {e}")
+    
+    def _create_fallback_viewer(self):
+        """Crée un viewer de fallback si tkintermd n'est pas disponible."""
+        self.md_widget = MarkdownViewer(
+            self.content_frame,
+            content=self.content,
+            is_markdown=self.is_markdown
+        )
+        self.md_widget.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Masquer la scrollbar du MarkdownViewer après création
+        self.after(200, self._hide_markdown_viewer_scrollbar)
+    
+    def _hide_markdown_viewer_scrollbar(self):
+        """Masque la scrollbar du MarkdownViewer."""
+        try:
+            if hasattr(self, 'md_widget') and hasattr(self.md_widget, 'canvas'):
+                # MarkdownViewer utilise un Canvas avec scrollbar
+                canvas = self.md_widget.canvas
+                # Chercher la scrollbar dans les enfants du canvas
+                for child in canvas.winfo_children():
+                    if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
+                        child.place_forget()
+                        child.pack_forget()
+                        child.grid_forget()
+                        try:
+                            child.configure(width=0)
+                        except:
+                            pass
+        except Exception as e:
+            log.debug(f"Impossible de masquer la scrollbar MarkdownViewer: {e}")
+
 
 class ApiKeyStatusMenu(ctk.CTkButton):
     """

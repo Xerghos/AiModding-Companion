@@ -502,7 +502,10 @@ class GeminiApp:
         syntax_highlighter.configure_tags(widget)
     
     def _create_message_textbox(self, container, tag="gemini", content=""):
-        """Crée une nouvelle textbox pour un message avec hauteur adaptative."""
+        """Crée une nouvelle textbox pour un message avec hauteur adaptative. Pas de scrollbar visible."""
+        # Récupérer la taille de police depuis les settings
+        font_size = APP_SETTINGS.get("system_settings", {}).get("font_size", 12)
+        
         # Calculer la hauteur approximative basée sur le contenu
         if content:
             # Compter les lignes réelles (avec wrap approximatif)
@@ -511,15 +514,74 @@ class GeminiApp:
             avg_chars_per_line = 80
             wrapped_lines = sum(len(line) // avg_chars_per_line + 1 for line in content.split('\n'))
             total_lines = max(lines, wrapped_lines)
-            # Environ 22px par ligne (hauteur de ligne + espacement), minimum 50px, maximum 500px
-            estimated_height = min(max(total_lines * 22, 50), 500)
+            # Calculer la hauteur en fonction de la taille de police
+            line_height = max(int(font_size * 1.5), 18)  # Environ 1.5x la taille de police
+            estimated_height = max(total_lines * line_height, 50)
         else:
             estimated_height = 50
         
-        textbox = ctk.CTkTextbox(container, wrap="word", font=("Consolas", 12), height=estimated_height)
+        # Créer la textbox avec la taille de police configurée
+        textbox = ctk.CTkTextbox(
+            container, 
+            wrap="word", 
+            font=("Consolas", font_size), 
+            height=estimated_height
+        )
         textbox.pack(fill="x", padx=5, pady=2)
         textbox.configure(state="disabled")
         self._configure_chat_tags(textbox)
+        
+        # Désactiver IMMÉDIATEMENT le scroll et masquer la scrollbar
+        def disable_scroll_immediate():
+            try:
+                # Forcer la mise à jour pour que le widget soit complètement créé
+                container.update_idletasks()
+                
+                # Accéder au widget Text interne de CTkTextbox
+                if hasattr(textbox, '_textbox'):
+                    text_widget = textbox._textbox
+                    # Désactiver le scroll sur le widget Text IMMÉDIATEMENT
+                    text_widget.configure(yscrollcommand=lambda *args: None)
+                    text_widget.configure(xscrollcommand=lambda *args: None)
+                    
+                    # Empêcher la recréation de la scrollbar en bindant les événements de configuration
+                    def prevent_scrollbar(event=None):
+                        text_widget.configure(yscrollcommand=lambda *args: None)
+                        text_widget.configure(xscrollcommand=lambda *args: None)
+                        hide_all_scrollbars()
+                    
+                    text_widget.bind('<Configure>', prevent_scrollbar, add='+')
+                
+                # Fonction pour masquer toutes les scrollbars
+                def hide_all_scrollbars():
+                    def hide_scrollbars_recursive(widget):
+                        """Cherche récursivement toutes les scrollbars dans le widget."""
+                        for child in widget.winfo_children():
+                            # Vérifier si c'est une scrollbar
+                            if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
+                                child.place_forget()
+                                child.pack_forget()
+                                child.grid_forget()
+                                try:
+                                    child.configure(width=0, height=0)
+                                except:
+                                    pass
+                            # Chercher récursivement dans les enfants
+                            hide_scrollbars_recursive(child)
+                    
+                    hide_scrollbars_recursive(textbox)
+                
+                hide_all_scrollbars()
+            except Exception as e:
+                log.debug(f"Erreur désactivation scroll: {e}")
+        
+        # Désactiver IMMÉDIATEMENT (0ms) puis avec des délais pour s'assurer
+        disable_scroll_immediate()  # Exécution immédiate
+        container.after(1, disable_scroll_immediate)  # 1ms après
+        container.after(10, disable_scroll_immediate)  # 10ms après
+        container.after(50, disable_scroll_immediate)  # 50ms après
+        container.after(100, disable_scroll_immediate)  # 100ms après
+        
         return textbox
     
     def _log_chat(self, widget, text, tag):
