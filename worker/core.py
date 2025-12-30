@@ -578,9 +578,58 @@ class Worker(threading.Thread):
                             self.response_queue.put({'type': 'ui_stream_chunk', 'text': "\n[INTERROMPU]"})
                             break
                         
-                        # Gérer différents formats de chunks
+                        # LOG INCONDITIONNEL pour confirmer que le code est exécuté
+                        chunk_type = type(chunk).__name__
+                        log.info(f"🔍 CHUNK RECU: type={chunk_type}, hasattr(choices)={hasattr(chunk, 'choices')}")
+                        
+                        # Détecter si c'est du thinking
+                        is_thinking = False
                         txt = None
-                        if hasattr(chunk, 'text'):
+                        
+                        # Gérer différents formats de chunks
+                        if hasattr(chunk, 'choices') and chunk.choices:
+                            delta = chunk.choices[0].delta
+                            
+                            # DEBUG: Log pour comprendre la structure de l'objet (TOUJOURS affiché)
+                            delta_type = type(delta).__name__
+                            delta_attrs = [x for x in dir(delta) if not x.startswith('_')]
+                            has_is_thinking = hasattr(delta, 'is_thinking')
+                            is_thinking_value = getattr(delta, 'is_thinking', None) if has_is_thinking else None
+                            
+                            # Vérifier aussi reasoning_content (format LiteLLM selon la doc)
+                            has_reasoning_content = hasattr(delta, 'reasoning_content')
+                            reasoning_content_value = getattr(delta, 'reasoning_content', None) if has_reasoning_content else None
+                            
+                            log.info(f"🔍 DEBUG delta: type={delta_type}, hasattr(is_thinking)={has_is_thinking}, value={is_thinking_value}, hasattr(reasoning_content)={has_reasoning_content}, reasoning_content={reasoning_content_value is not None if reasoning_content_value else False}, attrs={delta_attrs[:10]}")
+                            
+                            # Vérifier le marqueur is_thinking (plusieurs méthodes pour être sûr)
+                            try:
+                                # Méthode 1: hasattr + getattr pour is_thinking
+                                if has_is_thinking:
+                                    is_thinking = is_thinking_value is True
+                                    log.info(f"🔍 Méthode 1: hasattr(is_thinking)=True, is_thinking={is_thinking}, value={is_thinking_value}")
+                                # Méthode 2: Vérifier reasoning_content (format LiteLLM)
+                                elif has_reasoning_content and reasoning_content_value:
+                                    is_thinking = True
+                                    log.info(f"🔍 Méthode 2: reasoning_content détecté, is_thinking={is_thinking}")
+                                # Méthode 3: __dict__
+                                elif hasattr(delta, '__dict__') and 'is_thinking' in delta.__dict__:
+                                    is_thinking = delta.__dict__['is_thinking'] is True
+                                    log.info(f"🔍 Méthode 3: __dict__, is_thinking={is_thinking}")
+                                # Méthode 4: Vérifier le type de l'objet delta
+                                else:
+                                    log.info(f"🔍 Méthode 4: delta type={delta_type}, hasattr(is_thinking)={has_is_thinking}, hasattr(reasoning_content)={has_reasoning_content}, dir={delta_attrs[:5]}")
+                                
+                                if is_thinking:
+                                    log.info(f"🔍 Chunk thinking détecté: is_thinking={is_thinking}")
+                            except Exception as e:
+                                log.error(f"Erreur détection is_thinking: {e}", exc_info=True)
+                            
+                            if hasattr(delta, 'text'):
+                                txt = delta.text
+                            elif hasattr(delta, 'content'):
+                                txt = delta.content
+                        elif hasattr(chunk, 'text'):
                             txt = chunk.text
                         elif isinstance(chunk, str):
                             txt = chunk
@@ -591,7 +640,15 @@ class Worker(threading.Thread):
                         if txt and txt.strip():
                             full_text += txt
                             has_received_content = True
-                            self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
+                            
+                            # Envoyer dans la queue appropriée selon le type
+                            # Log pour vérifier le routage
+                            if is_thinking:
+                                log.info(f"🔵 Routing thinking chunk: {len(txt)} chars, is_thinking={is_thinking}")
+                                self.response_queue.put({'type': 'ui_stream_thinking', 'text': txt})
+                            else:
+                                log.info(f"🟢 Routing content chunk: {len(txt)} chars, is_thinking={is_thinking}")
+                                self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
                 except StopIteration:
                     # Itérateur terminé normalement
                     pass

@@ -198,6 +198,7 @@ def _convert_response_to_litellm(response: Any, model: str) -> Any:
 def _convert_stream_to_litellm(stream_generator: Generator) -> Generator:
     """
     Convertit un générateur CodeAssist (streaming) en format LiteLLM.
+    Préserve l'attribut is_thinking pour distinguer thinking et réponse finale.
     
     Args:
         stream_generator: Générateur de CodeAssistClient
@@ -206,9 +207,17 @@ def _convert_stream_to_litellm(stream_generator: Generator) -> Generator:
         Objets compatibles LiteLLM avec choices[0].delta.content
     """
     class DeltaObject:
-        def __init__(self, content):
+        def __init__(self, content, is_thinking=False):
             self.content = content
+            self.text = content  # Compatibilité avec worker/core.py
             self.role = "assistant"
+            self.is_thinking = is_thinking  # Préserver le marqueur thinking
+            # Selon la doc, LiteLLM utilise reasoning_content au lieu de thought
+            # On ajoute aussi reasoning_content pour compatibilité LiteLLM
+            if is_thinking:
+                self.reasoning_content = content  # Format LiteLLM
+            else:
+                self.reasoning_content = None
     
     class ChoiceObject:
         def __init__(self, delta):
@@ -222,21 +231,42 @@ def _convert_stream_to_litellm(stream_generator: Generator) -> Generator:
             self.model = None
             self.id = None
     
+    import logging
+    log_convert = logging.getLogger("ai_core.litellm_codeassist_provider")
+    
     for chunk in stream_generator:
-        # Extraire le contenu du chunk
+        # Extraire le contenu du chunk et le marqueur is_thinking
         chunk_content = ""
+        is_thinking = False
         
         if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
             choice_obj = chunk.choices[0]
             if hasattr(choice_obj, 'delta'):
                 delta = choice_obj.delta
+                
+                # DEBUG: Log pour comprendre la structure
+                delta_type = type(delta).__name__
+                has_is_thinking_attr = hasattr(delta, 'is_thinking')
+                is_thinking_value = getattr(delta, 'is_thinking', None) if has_is_thinking_attr else None
+                log_convert.info(f"🔄 _convert_stream: delta type={delta_type}, hasattr(is_thinking)={has_is_thinking_attr}, value={is_thinking_value}")
+                
+                # Vérifier si c'est du thinking
+                if has_is_thinking_attr:
+                    is_thinking = is_thinking_value is True
+                    log_convert.info(f"🔄 _convert_stream: is_thinking détecté via hasattr: {is_thinking}")
+                elif hasattr(delta, '__dict__') and 'is_thinking' in delta.__dict__:
+                    is_thinking = delta.__dict__['is_thinking'] is True
+                    log_convert.info(f"🔄 _convert_stream: is_thinking détecté via __dict__: {is_thinking}")
+                
                 if hasattr(delta, 'content'):
                     chunk_content = delta.content
                 elif hasattr(delta, 'text'):
                     chunk_content = delta.text
         
         if chunk_content:
-            delta = DeltaObject(chunk_content)
+            # Préserver le marqueur is_thinking lors de la création du nouveau DeltaObject
+            log_convert.info(f"🔄 _convert_stream: Création DeltaObject avec is_thinking={is_thinking}, content_len={len(chunk_content)}")
+            delta = DeltaObject(chunk_content, is_thinking=is_thinking)
             choice = ChoiceObject(delta)
             stream_chunk = StreamChunk(choice)
             yield stream_chunk

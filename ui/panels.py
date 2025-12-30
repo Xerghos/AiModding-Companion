@@ -1,10 +1,14 @@
 import customtkinter as ctk
 import tkinter as tk
 import os
+import logging
 import ui.syntax as syntax_highlighter
-from ui.widgets import TextEditorWithLineNumbers, COLORS, ApiKeyStatusMenu, ReasoningModeSwitch, add_tooltip
+from ui.widgets import TextEditorWithLineNumbers, MarkdownViewer, _is_markdown_content, _is_thinking_content, _parse_mixed_content, _group_thinking_and_response, ThinkingWidget, ResponseContainer, CollapsibleMarkdownWidget, COLORS, ApiKeyStatusMenu, ReasoningModeSwitch, add_tooltip
+from ui.windows.markdown_viewer import MarkdownViewerWindow
 from ui.icons import IconProvider
 from features.Decorators import trace_action
+
+log = logging.getLogger("ui.panels")
 
 QUICK_PROMPTS = {
     "Audit Qualité": "Analyse la qualité et la sécurité de ce code : ",
@@ -82,15 +86,29 @@ class MainPanel(ctk.CTkFrame):
         self.tab_view = ctk.CTkTabview(self)
         self.tab_view.grid(row=1, column=0, sticky="nsew")
         
+        # Chat Principal - Approche hybride avec affichage mixte
         self.tab_view.add("Chat Principal")
-        self.chat1_txt = ctk.CTkTextbox(self.tab_view.tab("Chat Principal"), state="disabled", wrap="word", font=("Consolas", 11))
-        self.chat1_txt.pack(fill="both", expand=True)
-        self._configure_chat_tags(self.chat1_txt)
+        chat1_container = ctk.CTkFrame(self.tab_view.tab("Chat Principal"), fg_color="transparent")
+        chat1_container.pack(fill="both", expand=True)
+        
+        # ScrollableFrame principal qui contiendra toutes les textboxes et widgets
+        self.chat1_scroll = ctk.CTkScrollableFrame(chat1_container, fg_color="transparent")
+        self.chat1_scroll.pack(fill="both", expand=True)
+        
+        # Container pour widgets Markdown (sera ajouté dynamiquement)
+        self.chat1_widgets_container = self.chat1_scroll
 
+        # Chat Secondaire - Approche hybride avec affichage mixte
         self.tab_view.add("Chat Secondaire")
-        self.chat2_txt = ctk.CTkTextbox(self.tab_view.tab("Chat Secondaire"), state="disabled", wrap="word", font=("Consolas", 11))
-        self.chat2_txt.pack(fill="both", expand=True)
-        self._configure_chat_tags(self.chat2_txt)
+        chat2_container = ctk.CTkFrame(self.tab_view.tab("Chat Secondaire"), fg_color="transparent")
+        chat2_container.pack(fill="both", expand=True)
+        
+        # ScrollableFrame principal qui contiendra toutes les textboxes et widgets
+        self.chat2_scroll = ctk.CTkScrollableFrame(chat2_container, fg_color="transparent")
+        self.chat2_scroll.pack(fill="both", expand=True)
+        
+        # Container pour widgets Markdown (sera ajouté dynamiquement)
+        self.chat2_widgets_container = self.chat2_scroll
 
     @trace_action(source="panels")
     def _setup_input_area(self):
@@ -191,20 +209,122 @@ class MainPanel(ctk.CTkFrame):
                 with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
             except Exception as e: content = f"Erreur: {e}"
 
-        editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
-        editor.pack(fill="both", expand=True)
-        editor.insert("1.0", content)
-        # Note: CTkCodeBox gère déjà le syntax highlighting automatiquement
-        # On n'a plus besoin d'appeler apply_highlighting_to_editor
+        # Détection Markdown/HTML
+        ext = filename.split('.')[-1].lower() if '.' in filename else ""
+        
+        if ext in ['md', 'html', 'htm']:
+            # Utiliser MarkdownViewer pour les fichiers Markdown/HTML
+            viewer = MarkdownViewer(
+                self.tab_view.tab(filename),
+                content=content,
+                is_markdown=(ext == 'md')
+            )
+            viewer.pack(fill="both", expand=True)
+        else:
+            # Comportement actuel avec TextEditorWithLineNumbers pour les autres fichiers
+            editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
+            editor.pack(fill="both", expand=True)
+            editor.insert("1.0", content)
+            # Note: CTkCodeBox gère déjà le syntax highlighting automatiquement
+            # On n'a plus besoin d'appeler apply_highlighting_to_editor
+        
         self.tab_view.set(filename)
 
+    def _create_message_textbox(self, container, tag="gemini", content=""):
+        """Crée une nouvelle textbox pour un message avec hauteur adaptative."""
+        # Calculer la hauteur approximative basée sur le contenu
+        if content:
+            # Compter les lignes réelles (avec wrap approximatif)
+            lines = content.count('\n') + 1
+            # Estimer les lignes avec wrap (environ 80 caractères par ligne)
+            avg_chars_per_line = 80
+            wrapped_lines = sum(len(line) // avg_chars_per_line + 1 for line in content.split('\n'))
+            total_lines = max(lines, wrapped_lines)
+            # Environ 20px par ligne (hauteur de ligne + espacement), minimum 50px, maximum 500px
+            estimated_height = min(max(total_lines * 20, 50), 500)
+        else:
+            estimated_height = 50
+        
+        textbox = ctk.CTkTextbox(container, wrap="word", font=("Consolas", 11), height=estimated_height)
+        textbox.pack(fill="x", padx=5, pady=2)
+        textbox.configure(state="disabled")
+        self._configure_chat_tags(textbox)
+        return textbox
+    
     @trace_action(source="panels")
     def log_chat(self, text, tag, target="Chat Principal"):
-        widget = self.chat2_txt if target == "Chat Secondaire" else self.chat1_txt
-        widget.configure(state="normal")
-        widget.insert("end", text + "\n\n", tag)
-        widget.configure(state="disabled")
-        widget.see("end")
+        # Nettoyer les séquences \n\n échappées
+        text = text.replace('\\n\\n', '\n\n').replace('\\n', '\n')
+        
+        # Déterminer quel container utiliser
+        if target == "Chat Secondaire":
+            widgets_container = self.chat2_widgets_container
+            scroll_container = self.chat2_scroll
+        else:
+            widgets_container = self.chat1_widgets_container
+            scroll_container = self.chat1_scroll
+        
+        # Séparer thinking et réponse finale
+        thinking_content, response_parts = _group_thinking_and_response(text)
+        
+        # Afficher le thinking (un seul widget regroupé, collapsed par défaut)
+        if thinking_content:
+            thinking_widget = ThinkingWidget(
+                widgets_container,
+                content=thinking_content
+            )
+            thinking_widget.pack(fill="x", padx=5, pady=2)
+        
+        # Créer le ResponseContainer pour la réponse finale
+        if response_parts:
+            response_container = ResponseContainer(widgets_container)
+            response_container.pack(fill="both", expand=True, padx=5, pady=2)
+            
+            # Ajouter tous les éléments de la réponse au container
+            for part_type, part_content in response_parts:
+                if part_type == 'text' and part_content.strip():
+                    # Ajouter une textbox
+                    textbox = response_container.add_textbox(part_content, tag)
+                    self._configure_chat_tags(textbox)
+                elif part_type == 'markdown':
+                    # Ajouter un widget Markdown
+                    response_container.add_markdown_widget(
+                        content=part_content,
+                        is_markdown=True,
+                        on_open_in_tab=self._open_markdown_in_tab
+                    )
+        elif not thinking_content:
+            # Si pas de thinking et pas de réponse structurée, afficher le texte simple
+            textbox = self._create_message_textbox(widgets_container, tag, text)
+            textbox.configure(state="normal")
+            textbox.insert("1.0", text + "\n\n", tag)
+            textbox.configure(state="disabled")
+        
+        # Scroll vers le bas
+        def scroll_to_bottom():
+            try:
+                if hasattr(scroll_container, '_parent_canvas'):
+                    canvas = scroll_container._parent_canvas
+                    canvas.update_idletasks()
+                    canvas.yview_moveto(1.0)
+            except:
+                pass
+        scroll_container.after(100, scroll_to_bottom)
+    
+    def _open_markdown_in_tab(self, content, is_markdown):
+        """Ouvre le contenu Markdown dans un onglet séparé."""
+        import time
+        tab_name = f"Markdown_{int(time.time())}"
+        
+        self.tab_view.add(tab_name)
+        
+        viewer = MarkdownViewer(
+            self.tab_view.tab(tab_name),
+            content=content,
+            is_markdown=is_markdown
+        )
+        viewer.pack(fill="both", expand=True)
+        self.tab_view.set(tab_name)
 
     @trace_action(source="panels")
     def _configure_chat_tags(self, widget):

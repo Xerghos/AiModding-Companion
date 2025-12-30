@@ -938,18 +938,97 @@ class CodeAssistClient:
                                 )
                                 
                                 chunk_text = ""
+                                chunk_thinking = ""
+                                
                                 for i, part in enumerate(candidate["content"]["parts"]):
-                                    if isinstance(part, dict) and "text" in part:
-                                        part_text = part["text"]
-                                        chunk_text += part_text
+                                    if isinstance(part, dict):
+                                        # Vérifier si c'est du thinking (thought: true) ou de la réponse finale
+                                        # Le champ 'thought' peut être un booléen directement dans la part
+                                        # IMPORTANT: Si 'thought' n'est pas présent ou est False, c'est de la réponse finale
+                                        thought_value = part.get("thought", False)
+                                        is_thinking = (thought_value is True) or (thought_value == True)
                                         
-                                        if DEBUG_STREAM:
+                                        # Debug: log la structure de la part pour vérifier
+                                        if DEBUG_STREAM and i == 0:
+                                            part_keys = list(part.keys())
                                             UnifiedLogger.write(
                                                 "AI_CORE",
                                                 "STREAM_CANDIDATES",
-                                                f"Chunk {total_chunks} - Part {i}: {len(part_text)} caractères"
+                                                f"Chunk {total_chunks} - Part {i} keys: {part_keys}, thought={part.get('thought', 'NOT_FOUND')}"
                                             )
+                                        
+                                        if "text" in part:
+                                            part_text = part["text"]
+                                            
+                                            if is_thinking:
+                                                # C'est du thinking → accumuler séparément
+                                                chunk_thinking += part_text
+                                                if DEBUG_STREAM:
+                                                    UnifiedLogger.write(
+                                                        "AI_CORE",
+                                                        "STREAM_CANDIDATES",
+                                                        f"Chunk {total_chunks} - Part {i} (thinking): {len(part_text)} caractères"
+                                                    )
+                                            else:
+                                                # C'est la réponse finale
+                                                chunk_text += part_text
+                                                if DEBUG_STREAM:
+                                                    UnifiedLogger.write(
+                                                        "AI_CORE",
+                                                        "STREAM_CANDIDATES",
+                                                        f"Chunk {total_chunks} - Part {i} (text): {len(part_text)} caractères"
+                                                    )
                                 
+                                # Envoyer le thinking séparément si présent (avec marqueur)
+                                if chunk_thinking:
+                                    chunks_with_text += 1
+                                    full_text += chunk_thinking  # Garder pour l'historique complet
+                                    
+                                    UnifiedLogger.write(
+                                        "AI_CORE",
+                                        "STREAM_CANDIDATES",
+                                        f"Chunk {total_chunks} - Thinking extrait: {len(chunk_thinking)} caractères"
+                                    )
+                                    
+                                    # Créer un objet marqué comme thinking pour identification
+                                    class ThinkingDeltaObject:
+                                        def __init__(self, content):
+                                            self.content = content
+                                            self.text = content
+                                            self.is_thinking = True  # Marqueur pour identification
+                                        
+                                        def __repr__(self):
+                                            return f"ThinkingDeltaObject(is_thinking={self.is_thinking}, text_len={len(self.text)})"
+                                    
+                                    class ThinkingChoiceObject:
+                                        def __init__(self, delta):
+                                            self.delta = delta
+                                    
+                                    class ThinkingChunkObject:
+                                        def __init__(self, choice):
+                                            self.choices = [choice]
+                                    
+                                    thinking_delta = ThinkingDeltaObject(chunk_thinking)
+                                    thinking_choice = ThinkingChoiceObject(thinking_delta)
+                                    thinking_chunk = ThinkingChunkObject(thinking_choice)
+                                    
+                                    # TOUJOURS logger pour vérifier que l'objet est créé correctement
+                                    UnifiedLogger.write(
+                                        "AI_CORE",
+                                        "STREAM_CANDIDATES",
+                                        f"Chunk {total_chunks} - Thinking chunk créé: is_thinking={thinking_delta.is_thinking}, type={type(thinking_delta).__name__}, hasattr={hasattr(thinking_delta, 'is_thinking')}"
+                                    )
+                                    
+                                    # Vérifier aussi la structure complète
+                                    UnifiedLogger.write(
+                                        "AI_CORE",
+                                        "STREAM_CANDIDATES",
+                                        f"Chunk {total_chunks} - Thinking chunk structure: choices[0].delta.type={type(thinking_chunk.choices[0].delta).__name__}, delta.is_thinking={getattr(thinking_chunk.choices[0].delta, 'is_thinking', 'NOT_FOUND')}"
+                                    )
+                                    
+                                    yield thinking_chunk
+                                
+                                # Envoyer le texte normal si présent
                                 if chunk_text:
                                     chunks_with_text += 1
                                     full_text += chunk_text

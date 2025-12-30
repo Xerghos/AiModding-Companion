@@ -4,6 +4,35 @@ from tkinter import ttk
 import logging
 import time
 import re # Nécessaire pour la recherche/remplacement
+import os
+
+log = logging.getLogger("ui.widgets")
+
+# Import tkhtmlview pour affichage HTML
+try:
+    from tkhtmlview import HTMLLabel
+    TKHTMLVIEW_AVAILABLE = True
+except ImportError:
+    TKHTMLVIEW_AVAILABLE = False
+    HTMLLabel = None
+    log.warning("tkhtmlview non disponible - l'affichage Markdown/HTML sera limité")
+
+# Import tkintermd pour widget Markdown collapsible
+try:
+    from tkintermd.frame import TkintermdFrame
+    TKINTERMD_AVAILABLE = True
+except ImportError:
+    TKINTERMD_AVAILABLE = False
+    TkintermdFrame = None
+    log.warning("tkintermd non disponible - le widget Markdown collapsible sera limité")
+
+# Import du convertisseur Markdown
+try:
+    from ui.markdown_converter import markdown_to_html
+    MARKDOWN_CONVERTER_AVAILABLE = True
+except ImportError:
+    MARKDOWN_CONVERTER_AVAILABLE = False
+    log.warning("Module markdown_converter non disponible")
 
 # Import CTkMessagebox pour remplacer messagebox tkinter
 try:
@@ -33,8 +62,6 @@ def add_tooltip(widget, message, delay=0.5):
     """
     if CTKTOOLTIP_AVAILABLE and CTkToolTip:
         CTkToolTip(widget, message=message, delay=delay)
-
-log = logging.getLogger("ui.widgets")
 
 # Import CTkCodeBox
 from features.CTkCodeBox import CTkCodeBox
@@ -315,6 +342,679 @@ class TextEditorWithLineNumbers(ctk.CTkFrame):
     def tag_config(self):
         """Proxy vers tag_config."""
         return self.text_area.tag_config
+
+
+def _is_thinking_content(text):
+    """
+    Détecte si un texte est un message de "thinking" (pensées internes de l'IA).
+    
+    Args:
+        text: Texte à analyser
+    
+    Returns:
+        True si c'est un message de thinking, False sinon
+    """
+    if not text or len(text.strip()) < 10:
+        return False
+    
+    # Patterns typiques des messages de thinking
+    thinking_patterns = [
+        r'^\*\*Assessing\s+',      # **Assessing the...
+        r'^\*\*Processing\s+',      # **Processing the...
+        r'^\*\*Crafting\s+',        # **Crafting the...
+        r'^\*\*Constructing\s+',    # **Constructing the...
+        r'^\*\*Developing\s+',      # **Developing the...
+        r"^I'm analyzing",          # I'm analyzing...
+        r"^I've taken in",          # I've taken in...
+        r"^I've crafted",           # I've crafted...
+        r"^I registered",           # I registered...
+        r"^My focus is now",        # My focus is now...
+        r"^I'm considering",        # I'm considering...
+        r"^Now, I'm",               # Now, I'm...
+        r"^I'm focusing",           # I'm focusing...
+        r"^I'm ready to",           # I'm ready to...
+        r"^Protocol V4",            # Protocol V4...
+        r"^My structure is",        # My structure is...
+        r"^Ma structure est",        # Ma structure est... (français)
+        r"^Je suis",                # Je suis... (français)
+        r"^J'ai",                   # J'ai... (français)
+    ]
+    
+    # Vérifier si le texte commence par un pattern de thinking
+    for pattern in thinking_patterns:
+        if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+            return True
+    
+    # Vérifier aussi si le texte contient plusieurs phrases de thinking
+    thinking_phrases = [
+        "I'm analyzing",
+        "I've taken in",
+        "I registered",
+        "My focus is",
+        "I'm considering",
+        "Protocol V4",
+        "tools are ready",
+        "file system",
+        "RAG are primed",
+    ]
+    
+    phrase_count = sum(1 for phrase in thinking_phrases if phrase.lower() in text.lower())
+    if phrase_count >= 2:
+        return True
+    
+    return False
+
+
+def _is_markdown_content(text):
+    """
+    Détecte si un texte contient du Markdown.
+    Exclut les messages de thinking pour éviter les faux positifs.
+    
+    Args:
+        text: Texte à analyser
+    
+    Returns:
+        True si Markdown détecté, False sinon
+    """
+    if not text or len(text.strip()) < 10:
+        return False
+    
+    # Ne pas considérer comme Markdown si c'est UNIQUEMENT du thinking
+    # Mais si le texte contient à la fois du thinking ET du contenu normal, c'est OK
+    # On vérifie seulement si le texte ENTIER est du thinking (sans éléments Markdown)
+    is_only_thinking = _is_thinking_content(text)
+    has_markdown_elements = any(
+        re.search(pattern, text, re.MULTILINE) 
+        for pattern in [r'\*\*[^*]+\*\*', r'`[^`]+`', r'^#{1,6}\s', r'^\s*[-*+]\s', r'^\s*\d+\.\s']
+    )
+    
+    # Si c'est uniquement du thinking sans éléments Markdown, ne pas considérer comme Markdown
+    if is_only_thinking and not has_markdown_elements:
+        return False
+    
+    markdown_patterns = [
+        r'\*\*[^*]+\*\*',      # Bold **text**
+        r'\*[^*]+\*',          # Italic *text*
+        r'^#{1,6}\s',          # Headings # Title
+        r'```[\s\S]*?```',     # Code blocks ```
+        r'`[^`]+`',            # Inline code `code`
+        r'^\s*[-*+]\s',        # Lists - item
+        r'^\s*\d+\.\s',        # Numbered lists 1. item
+        r'\[.*?\]\(.*?\)',     # Links [text](url)
+        r'^\s*>\s',            # Blockquotes > text
+        r'^\s*\|.*\|',         # Tables | col1 | col2 |
+    ]
+    
+    matches = sum(1 for pattern in markdown_patterns if re.search(pattern, text, re.MULTILINE))
+    return matches >= 2  # Au moins 2 patterns différents
+
+
+def _parse_mixed_content(text):
+    """
+    Parse un texte mixte et sépare les parties Thinking, Markdown et texte simple.
+    
+    Args:
+        text: Texte à parser
+    
+    Returns:
+        Liste de tuples (type, content) où type est 'thinking', 'text' ou 'markdown'
+    """
+    if not text:
+        return []
+    
+    # D'abord, détecter si le texte entier est du thinking
+    if _is_thinking_content(text):
+        return [('thinking', text)]
+    
+    parts = []
+    
+    # Séparer le texte en blocs potentiels (séparés par des sauts de ligne multiples)
+    blocks = re.split(r'\n\n+', text)
+    
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        
+        # Détecter le type de bloc
+        if _is_thinking_content(block):
+            parts.append(('thinking', block))
+        elif _is_markdown_content(block):
+            parts.append(('markdown', block))
+        else:
+            # Vérifier s'il y a des blocs de code dans le texte
+            code_block_pattern = r'```[\s\S]*?```'
+            code_blocks = list(re.finditer(code_block_pattern, block))
+            
+            if code_blocks:
+                # Séparer autour des blocs de code
+                last_pos = 0
+                for match in code_blocks:
+                    # Texte avant le bloc
+                    before_text = block[last_pos:match.start()].strip()
+                    if before_text:
+                        if _is_thinking_content(before_text):
+                            parts.append(('thinking', before_text))
+                        elif _is_markdown_content(before_text):
+                            parts.append(('markdown', before_text))
+                        else:
+                            parts.append(('text', before_text))
+                    
+                    # Le bloc de code lui-même
+                    code_block = match.group(0)
+                    parts.append(('markdown', code_block))
+                    
+                    last_pos = match.end()
+                
+                # Texte après le dernier bloc
+                after_text = block[last_pos:].strip()
+                if after_text:
+                    if _is_thinking_content(after_text):
+                        parts.append(('thinking', after_text))
+                    elif _is_markdown_content(after_text):
+                        parts.append(('markdown', after_text))
+                    else:
+                        parts.append(('text', after_text))
+            else:
+                # Pas de blocs de code, c'est du texte simple
+                parts.append(('text', block))
+    
+    # Si aucune partie n'a été créée, retourner le texte entier comme texte
+    if not parts:
+        return [('text', text)]
+    
+    return parts
+
+
+def _group_thinking_and_response(text):
+    """
+    Sépare le texte en deux groupes : thinking (tous regroupés) et réponse finale (texte + markdown).
+    
+    Args:
+        text: Texte complet à analyser
+    
+    Returns:
+        Tuple (thinking_content, response_parts) où:
+        - thinking_content: str ou None (tous les thinking regroupés)
+        - response_parts: Liste de tuples (type, content) pour la réponse finale
+    """
+    if not text:
+        return None, []
+    
+    # Parser le contenu mixte
+    parts = _parse_mixed_content(text)
+    
+    # Séparer thinking et réponse
+    thinking_parts = [p[1] for p in parts if p[0] == 'thinking']
+    response_parts = [p for p in parts if p[0] != 'thinking']
+    
+    # Regrouper tous les thinking en un seul bloc
+    thinking_content = None
+    if thinking_parts:
+        # Joindre tous les thinking avec un séparateur
+        thinking_content = "\n\n---\n\n".join(thinking_parts)
+    
+    return thinking_content, response_parts
+
+
+class MarkdownViewer(ctk.CTkFrame):
+    """
+    Widget pour afficher du Markdown/HTML avec tkhtmlview.
+    """
+    def __init__(self, master, content=None, is_markdown=True, **kwargs):
+        super().__init__(master, **kwargs)
+        self.pack_propagate(False)
+        self.is_markdown = is_markdown
+        
+        if not TKHTMLVIEW_AVAILABLE:
+            # Fallback vers un label d'erreur
+            error_label = ctk.CTkLabel(
+                self,
+                text="tkhtmlview n'est pas disponible.\nVeuillez installer: pip install tkhtmlview",
+                text_color=COLORS["ERROR"],
+                font=("Arial", 12)
+            )
+            error_label.pack(fill="both", expand=True, padx=20, pady=20)
+            return
+        
+        # Créer un Canvas avec scrollbar pour le scroll
+        self.canvas = tk.Canvas(
+            self,
+            bg=COLORS.get("BG_MAIN", "#1E1E1E"),
+            highlightthickness=0
+        )
+        
+        # Scrollbar verticale
+        scrollbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas, bg=COLORS.get("BG_MAIN", "#1E1E1E"))
+        
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack canvas et scrollbar
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Créer HTMLLabel dans le frame scrollable
+        self.html_label = HTMLLabel(
+            self.scrollable_frame,
+            html="",
+            background=COLORS.get("BG_MAIN", "#1E1E1E")
+        )
+        self.html_label.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Bind mousewheel pour le scroll
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        
+        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        # Définir le contenu si fourni
+        if content:
+            self.set_content(content, is_markdown)
+    
+    def set_content(self, content, is_markdown=None):
+        """
+        Définit le contenu à afficher.
+        
+        Args:
+            content: Texte Markdown ou HTML
+            is_markdown: Si True, convertir Markdown en HTML. Si None, utilise self.is_markdown
+        """
+        if not TKHTMLVIEW_AVAILABLE:
+            return
+        
+        if is_markdown is None:
+            is_markdown = self.is_markdown
+        
+        try:
+            if is_markdown and MARKDOWN_CONVERTER_AVAILABLE:
+                # Convertir Markdown en HTML
+                html_content = markdown_to_html(content, theme="dark")
+            else:
+                # Utiliser directement comme HTML
+                html_content = content
+            
+            # [CORRECTION] HTMLLabel ne supporte pas bien les balises <style> dans le body
+            # Il faut extraire le contenu du body seulement et appliquer les styles différemment
+            if '<style>' in html_content or '<body>' in html_content:
+                import re
+                # Extraire le contenu du body
+                body_match = re.search(r'<body[^>]*>(.*?)</body>', html_content, re.DOTALL | re.IGNORECASE)
+                if body_match:
+                    body_content = body_match.group(1)
+                    # Extraire le CSS et créer un wrapper avec style inline
+                    style_match = re.search(r'<style[^>]*>(.*?)</style>', html_content, re.DOTALL | re.IGNORECASE)
+                    if style_match:
+                        # Créer un wrapper div avec les styles de base appliqués
+                        html_content = f'''<div style="background-color: #1E1E1E; color: #CCCCCC; font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; padding: 20px; margin: 0;">
+{body_content}
+</div>'''
+                    else:
+                        html_content = body_content
+                else:
+                    # Si pas de body, essayer d'extraire juste le contenu sans les balises head/style
+                    html_content = re.sub(r'<head>.*?</head>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+                    html_content = re.sub(r'<style>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+            
+            # Mettre à jour HTMLLabel
+            self.html_label.set_html(html_content)
+            
+            # Mettre à jour le scrollregion après le rendu
+            self.after(100, lambda: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+            
+        except Exception as e:
+            log.error(f"Erreur lors de l'affichage du contenu: {e}")
+            error_html = f"<p style='color: #F44336;'>Erreur: {str(e)}</p>"
+            self.html_label.set_html(error_html)
+
+
+class ThinkingWidget(ctk.CTkFrame):
+    """
+    Widget pour afficher les messages de thinking (pensées internes), style Gemini.
+    Header collapsible avec contenu texte. Peut accepter un seul contenu ou une liste de contenus.
+    """
+    def __init__(self, master, content=None, thinking_blocks=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.is_expanded = False  # Par défaut collapsed
+        
+        # Accepter soit content (string) soit thinking_blocks (list)
+        if thinking_blocks is not None:
+            self.thinking_blocks = thinking_blocks if isinstance(thinking_blocks, list) else [thinking_blocks]
+        elif content is not None:
+            self.thinking_blocks = [content]
+        else:
+            self.thinking_blocks = []
+        
+        # Combiner tous les thinking en un seul texte
+        self.content = "\n\n---\n\n".join(self.thinking_blocks) if self.thinking_blocks else ""
+        
+        # Frame principal avec style subtil
+        self.configure(fg_color=COLORS.get("BG_SECONDARY", "#252526"), corner_radius=5)
+        
+        # Header collapsible (style Gemini)
+        self.header = ctk.CTkFrame(self, fg_color="transparent", height=35)
+        self.header.pack(fill="x", padx=5, pady=5)
+        
+        # Bouton expand/collapse
+        self.btn_toggle = ctk.CTkButton(
+            self.header,
+            text="▶",
+            width=20,
+            height=20,
+            command=self.toggle,
+            fg_color="transparent",
+            hover_color=COLORS.get("BG_WIDGET", "#2D2D30"),
+            corner_radius=10,
+            font=("Arial", 8)
+        )
+        self.btn_toggle.pack(side="left", padx=5)
+        
+        # Label "Thinking" ou "Pensées"
+        self.title_label = ctk.CTkLabel(
+            self.header,
+            text="💭 Pensées",
+            font=("Arial", 10, "bold"),
+            text_color=COLORS.get("FG_SECONDARY", "#858585")
+        )
+        self.title_label.pack(side="left", padx=5)
+        
+        # Container pour le contenu (initialement caché)
+        self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
+        # Ne pas pack initialement
+        
+        # Textbox scrollable pour le contenu thinking
+        self.thinking_textbox = ctk.CTkTextbox(
+            self.content_frame,
+            wrap="word",
+            font=("Consolas", 10),
+            height=100,
+            fg_color=COLORS.get("BG_WIDGET", "#2D2D30")
+        )
+        self.thinking_textbox.pack(fill="both", expand=True, padx=5, pady=5)
+        self.thinking_textbox.configure(state="disabled")
+        
+        # Insérer le contenu combiné
+        if self.content:
+            self.thinking_textbox.configure(state="normal")
+            self.thinking_textbox.insert("1.0", self.content)
+            self.thinking_textbox.configure(state="disabled")
+            
+            # Calculer la hauteur adaptative
+            lines = self.content.count('\n') + 1
+            estimated_height = min(max(lines * 18, 80), 400)
+            self.thinking_textbox.configure(height=estimated_height)
+        
+        # Bind double-clic sur le header pour toggle
+        self.header.bind("<Double-Button-1>", lambda e: self.toggle())
+        self.title_label.bind("<Double-Button-1>", lambda e: self.toggle())
+    
+    def add_thinking_block(self, content):
+        """Ajoute un bloc de thinking au widget."""
+        if content:
+            self.thinking_blocks.append(content)
+            # Recombiner le contenu
+            self.content = "\n\n---\n\n".join(self.thinking_blocks)
+            # Mettre à jour la textbox
+            self.thinking_textbox.configure(state="normal")
+            self.thinking_textbox.delete("1.0", "end")
+            self.thinking_textbox.insert("1.0", self.content)
+            self.thinking_textbox.configure(state="disabled")
+            # Recalculer la hauteur
+            lines = self.content.count('\n') + 1
+            estimated_height = min(max(lines * 18, 80), 400)
+            self.thinking_textbox.configure(height=estimated_height)
+    
+    def toggle(self):
+        """Bascule entre collapsed et expanded."""
+        self.is_expanded = not self.is_expanded
+        
+        if self.is_expanded:
+            self.btn_toggle.configure(text="▼")
+            self.content_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        else:
+            self.btn_toggle.configure(text="▶")
+            self.content_frame.pack_forget()
+
+
+class ResponseContainer(ctk.CTkScrollableFrame):
+    """
+    Container scrollable pour regrouper toutes les textboxes et widgets md de la réponse finale.
+    Permet le scroll indépendant de la réponse finale.
+    Scrollbar masquée mais fonctionnelle pour les longues réponses.
+    """
+    def __init__(self, master, **kwargs):
+        # Ne pas limiter la hauteur, affichage en grand
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.widgets = []  # Liste des widgets ajoutés
+        
+        # Masquer la scrollbar mais garder le scroll fonctionnel
+        # CTkScrollableFrame crée un canvas parent avec une scrollbar
+        # On accède au canvas parent après que le widget soit créé et packé
+        self.after(200, self._hide_scrollbar)
+        # Réessayer après un délai plus long au cas où
+        self.after(500, self._hide_scrollbar)
+    
+    def _hide_scrollbar(self):
+        """Masque la scrollbar du CTkScrollableFrame tout en gardant le scroll fonctionnel."""
+        try:
+            # Accéder au canvas parent qui contient la scrollbar
+            if hasattr(self, '_parent_canvas'):
+                canvas = self._parent_canvas
+                # Dans CustomTkinter, la scrollbar est généralement dans le même parent que le canvas
+                parent = canvas.master
+                
+                # Chercher la scrollbar dans les enfants du parent du canvas
+                for child in parent.winfo_children():
+                    # La scrollbar peut être un CTkScrollbar ou un Scrollbar tkinter
+                    if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
+                        # Masquer complètement la scrollbar
+                        child.place_forget()
+                        child.pack_forget()
+                        child.grid_forget()
+                        try:
+                            child.configure(width=0)  # Largeur à 0
+                        except:
+                            pass
+                        break
+                
+                # Aussi chercher dans les enfants directs du canvas
+                for child in canvas.winfo_children():
+                    if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
+                        child.place_forget()
+                        child.pack_forget()
+                        child.grid_forget()
+                        try:
+                            child.configure(width=0)
+                        except:
+                            pass
+                        break
+                
+                # S'assurer que le scroll avec la molette fonctionne
+                def on_mousewheel(event):
+                    try:
+                        if hasattr(self, '_parent_canvas'):
+                            canvas = self._parent_canvas
+                            # Scroll avec la molette (Windows/Linux)
+                            if event.delta:
+                                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                            # Scroll avec la molette (Linux avec Button-4/5)
+                            elif event.num == 4:
+                                canvas.yview_scroll(-1, "units")
+                            elif event.num == 5:
+                                canvas.yview_scroll(1, "units")
+                    except Exception:
+                        pass
+                
+                # Bind la molette sur le canvas et le container
+                canvas.bind("<MouseWheel>", on_mousewheel)
+                canvas.bind("<Button-4>", on_mousewheel)
+                canvas.bind("<Button-5>", on_mousewheel)
+                self.bind("<MouseWheel>", on_mousewheel)
+                self.bind("<Button-4>", on_mousewheel)
+                self.bind("<Button-5>", on_mousewheel)
+        except Exception as e:
+            log.debug(f"Impossible de masquer la scrollbar: {e}")
+    
+    def add_textbox(self, text, tag="gemini", height=None):
+        """Ajoute une textbox au container. Hauteur adaptative pour affichage en grand."""
+        if height is None:
+            # Calculer la hauteur adaptative basée sur le contenu
+            lines = text.count('\n') + 1
+            avg_chars_per_line = 80
+            wrapped_lines = sum(len(line) // avg_chars_per_line + 1 for line in text.split('\n'))
+            total_lines = max(lines, wrapped_lines)
+            # Pas de limite maximale stricte, mais minimum raisonnable
+            height = max(total_lines * 22, 50)
+        
+        textbox = ctk.CTkTextbox(self, wrap="word", font=("Consolas", 12), height=height)
+        textbox.pack(fill="x", padx=5, pady=2)
+        textbox.configure(state="disabled")
+        
+        # Configurer les tags (nécessite une référence à la fonction de configuration)
+        # On laisse ça à l'appelant pour l'instant
+        
+        textbox.configure(state="normal")
+        textbox.insert("1.0", text + "\n\n", tag)
+        textbox.configure(state="disabled")
+        
+        self.widgets.append(textbox)
+        return textbox
+    
+    def add_markdown_widget(self, content, is_markdown=True, on_open_in_tab=None):
+        """Ajoute un widget Markdown au container."""
+        md_widget = CollapsibleMarkdownWidget(
+            self,
+            content=content,
+            is_markdown=is_markdown,
+            on_open_in_tab=on_open_in_tab
+        )
+        md_widget.pack(fill="x", padx=5, pady=2)
+        self.widgets.append(md_widget)
+        return md_widget
+
+
+class CollapsibleMarkdownWidget(ctk.CTkFrame):
+    """
+    Widget Markdown collapsible pour le chat, style Cursor.
+    Affichage direct du contenu avec bouton collapse intégré.
+    """
+    def __init__(self, master, content, is_markdown=True, on_open_in_tab=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.content = content
+        self.is_markdown = is_markdown
+        self.on_open_in_tab = on_open_in_tab
+        self.is_expanded = True  # Par défaut expanded
+        self._preview_label = None
+        
+        # Frame principal avec bordure subtile (style Cursor)
+        self.configure(fg_color=COLORS.get("BG_SECONDARY", "#252526"), corner_radius=5, border_width=1, border_color=COLORS.get("BG_WIDGET", "#2D2D30"))
+        
+        # Container pour le contenu (toujours visible, taille adaptative)
+        self.content_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.content_frame.pack(fill="both", expand=True, padx=3, pady=3)
+        
+        # Utiliser tkintermd si disponible
+        if TKINTERMD_AVAILABLE and is_markdown and TkintermdFrame is not None:
+            try:
+                # Créer un frame tkinter natif pour tkintermd
+                self.md_frame = tk.Frame(self.content_frame, bg=COLORS.get("BG_MAIN", "#1E1E1E"))
+                
+                # Calculer la hauteur approximative basée sur le nombre de lignes
+                lines = content.count('\n') + 1
+                # Environ 30px par ligne pour Markdown rendu, avec limites raisonnables
+                estimated_height = min(max(lines * 30, 200), 1000)  # Entre 200 et 1000px
+                self.md_frame.configure(height=estimated_height)
+                self.md_frame.pack(fill="both", expand=True, padx=5, pady=5)
+                
+                # Créer le widget tkintermd
+                self.md_widget = TkintermdFrame(self.md_frame)
+                self.md_widget.pack(fill="both", expand=True)
+                self.md_widget.set_markdown(content)
+            except Exception as e:
+                log.error(f"Erreur création widget tkintermd: {e}", exc_info=True)
+                # Fallback vers MarkdownViewer
+                self._create_fallback_viewer()
+        else:
+            # Fallback vers MarkdownViewer
+            self._create_fallback_viewer()
+        
+        # Bouton collapse intégré en haut à droite (overlay style Cursor)
+        self.btn_toggle = ctk.CTkButton(
+            self,
+            text="▼",
+            width=24,
+            height=24,
+            command=self.toggle,
+            fg_color=COLORS.get("BG_WIDGET", "#2D2D30"),
+            hover_color=COLORS.get("ACCENT", "#007ACC"),
+            corner_radius=12,
+            font=("Arial", 9),
+            text_color=COLORS.get("FG_PRIMARY", "#CCCCCC")
+        )
+        # Positionner le bouton en overlay (top-right)
+        self.btn_toggle.place(relx=1.0, rely=0.0, anchor="ne", x=-8, y=8)
+        
+        # Bind double-clic pour toggle sur tout le widget
+        self.bind("<Double-Button-1>", lambda e: self.toggle())
+        self.content_frame.bind("<Double-Button-1>", lambda e: self.toggle())
+        if hasattr(self, 'md_frame'):
+            self.md_frame.bind("<Double-Button-1>", lambda e: self.toggle())
+            if hasattr(self.md_widget, 'bind'):
+                self.md_widget.bind("<Double-Button-1>", lambda e: self.toggle())
+    
+    def _create_fallback_viewer(self):
+        """Crée un viewer de fallback si tkintermd n'est pas disponible."""
+        self.md_widget = MarkdownViewer(
+            self.content_frame,
+            content=self.content,
+            is_markdown=self.is_markdown
+        )
+        self.md_widget.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Calculer la hauteur approximative
+        lines = self.content.count('\n') + 1
+        estimated_height = min(max(lines * 25, 150), 800)
+        # Note: MarkdownViewer utilise un Canvas, on ne peut pas directement set height
+        # La hauteur sera gérée par le contenu
+    
+    def toggle(self):
+        """Bascule entre collapsed et expanded."""
+        self.is_expanded = not self.is_expanded
+        
+        if self.is_expanded:
+            self.btn_toggle.configure(text="▼")
+            # Afficher le contenu complet
+            if self._preview_label:
+                self._preview_label.pack_forget()
+            self.content_frame.pack(fill="both", expand=True, padx=3, pady=3)
+        else:
+            self.btn_toggle.configure(text="▶")
+            # En mode collapsed, cacher le contenu et afficher un aperçu
+            self.content_frame.pack_forget()
+            # Créer un label avec aperçu si pas déjà créé
+            if not self._preview_label:
+                preview_text = self.content.split('\n')[0][:80] + "..." if len(self.content.split('\n')[0]) > 80 else self.content.split('\n')[0]
+                self._preview_label = ctk.CTkLabel(
+                    self,
+                    text=preview_text,
+                    font=("Consolas", 10),
+                    text_color=COLORS.get("FG_SECONDARY", "#858585"),
+                    anchor="w",
+                    justify="left",
+                    wraplength=400
+                )
+            self._preview_label.pack(fill="x", padx=15, pady=15)
+    
+    def _open_in_tab(self):
+        """Ouvre le contenu dans un onglet séparé."""
+        if self.on_open_in_tab:
+            self.on_open_in_tab(self.content, self.is_markdown)
 
 class ApiKeyStatusMenu(ctk.CTkButton):
     """

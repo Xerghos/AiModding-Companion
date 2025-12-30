@@ -22,12 +22,13 @@ import features.audio as audio_manager
 import ui.syntax as syntax_highlighter
 
 # --- Imports UI Components ---
-from ui.widgets import TextEditorWithLineNumbers, COLORS, ApiKeyStatusMenu, ReasoningModeSwitch, show_messagebox, add_tooltip
+from ui.widgets import TextEditorWithLineNumbers, MarkdownViewer, _is_markdown_content, _is_thinking_content, _parse_mixed_content, _group_thinking_and_response, ThinkingWidget, ResponseContainer, CollapsibleMarkdownWidget, COLORS, ApiKeyStatusMenu, ReasoningModeSwitch, show_messagebox, add_tooltip
 from ui.windows import (
     SettingsWindow, DbManagerWindow, 
     WaitingListWindow, BackupManagerWindow,
     ApiKeyManager
 )
+from ui.windows.markdown_viewer import MarkdownViewerWindow
 from features.UnifiedLogger import UnifiedLogger
 from features.Decorators import trace_action
 
@@ -127,18 +128,31 @@ class GeminiApp:
         self.tab_view = ctk.CTkTabview(self.main_area)
         self.tab_view.grid(row=1, column=0, sticky="nsew")
         
+        # Chat Principal - Approche hybride avec affichage mixte
         self.tab_view.add("Chat Principal")
-        self.chat1_txt = ctk.CTkTextbox(self.tab_view.tab("Chat Principal"), wrap="word", font=("Consolas", 12))
-        self.chat1_txt.pack(fill="both", expand=True)
-        self.chat1_txt.configure(state="disabled")
+        chat1_container = ctk.CTkFrame(self.tab_view.tab("Chat Principal"), fg_color="transparent")
+        chat1_container.pack(fill="both", expand=True)
         
+        # ScrollableFrame principal qui contiendra toutes les textboxes et widgets
+        self.chat1_scroll = ctk.CTkScrollableFrame(chat1_container, fg_color="transparent")
+        self.chat1_scroll.pack(fill="both", expand=True)
+        
+        # Container pour widgets Markdown (sera ajouté dynamiquement)
+        self.chat1_widgets_container = self.chat1_scroll
+        
+        # Chat Secondaire - Approche hybride avec affichage mixte
         self.tab_view.add("Chat Secondaire")
-        self.chat2_txt = ctk.CTkTextbox(self.tab_view.tab("Chat Secondaire"), wrap="word", font=("Consolas", 12))
-        self.chat2_txt.pack(fill="both", expand=True)
-        self.chat2_txt.configure(state="disabled")
+        chat2_container = ctk.CTkFrame(self.tab_view.tab("Chat Secondaire"), fg_color="transparent")
+        chat2_container.pack(fill="both", expand=True)
         
-        self._configure_chat_tags(self.chat1_txt)
-        self._configure_chat_tags(self.chat2_txt)
+        # ScrollableFrame principal qui contiendra toutes les textboxes et widgets
+        self.chat2_scroll = ctk.CTkScrollableFrame(chat2_container, fg_color="transparent")
+        self.chat2_scroll.pack(fill="both", expand=True)
+        
+        # Container pour widgets Markdown (sera ajouté dynamiquement)
+        self.chat2_widgets_container = self.chat2_scroll
+        
+        # Les tags seront configurés lors de la création des textboxes dynamiques
 
         # C. Input Zone (Bas)
         self.input_frame = ctk.CTkFrame(self.main_area, height=100)
@@ -372,8 +386,30 @@ class GeminiApp:
         self.input_txt.delete("1.0", "end")
         
         target = self.tab_view.get()
-        widget = self.chat2_txt if target == "Chat Secondaire" else self.chat1_txt
-        self._log_chat(widget, f"Vous: {msg}", "user")
+        # Déterminer le container approprié
+        if target == "Chat Secondaire":
+            scroll_container = self.chat2_scroll
+            widgets_container = self.chat2_widgets_container
+        else:
+            scroll_container = self.chat1_scroll
+            widgets_container = self.chat1_widgets_container
+        
+        # Créer une nouvelle textbox pour le message utilisateur
+        textbox = self._create_message_textbox(widgets_container, "user")
+        textbox.configure(state="normal")
+        textbox.insert("1.0", f"Vous: {msg}\n\n", "user")
+        textbox.configure(state="disabled")
+        
+        # Scroll vers le bas
+        def scroll_to_bottom():
+            try:
+                if hasattr(scroll_container, '_parent_canvas'):
+                    canvas = scroll_container._parent_canvas
+                    canvas.update_idletasks()
+                    canvas.yview_moveto(1.0)
+            except:
+                pass
+        scroll_container.after(100, scroll_to_bottom)
         
         task_type = 'secondary_user_prompt' if target == "Chat Secondaire" else 'user_prompt'
         
@@ -431,11 +467,24 @@ class GeminiApp:
             with open(path, 'r', encoding='utf-8') as f: content = f.read()
         except: content = "Erreur lecture."
         
-        editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
-        editor.pack(fill="both", expand=True)
-        editor.insert("1.0", content)
-        # Note: CTkCodeBox gère déjà le syntax highlighting automatiquement
-        # On n'a plus besoin d'appeler apply_highlighting_to_editor
+        # Détection Markdown/HTML
+        ext = filename.split('.')[-1].lower() if '.' in filename else ""
+        
+        if ext in ['md', 'html', 'htm']:
+            # Utiliser MarkdownViewer pour les fichiers Markdown/HTML
+            viewer = MarkdownViewer(
+                self.tab_view.tab(filename),
+                content=content,
+                is_markdown=(ext == 'md')
+            )
+            viewer.pack(fill="both", expand=True)
+        else:
+            # Comportement actuel avec TextEditorWithLineNumbers pour les autres fichiers
+            editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
+            editor.pack(fill="both", expand=True)
+            editor.insert("1.0", content)
+            # Note: CTkCodeBox gère déjà le syntax highlighting automatiquement
+            # On n'a plus besoin d'appeler apply_highlighting_to_editor
         
         self.tab_view.set(filename)
         self.current_file_path = path
@@ -451,20 +500,126 @@ class GeminiApp:
         widget.tag_config("info", foreground=COLORS["INFO"])
         widget.tag_config("error", foreground=COLORS["ERROR"])
         syntax_highlighter.configure_tags(widget)
-
+    
+    def _create_message_textbox(self, container, tag="gemini", content=""):
+        """Crée une nouvelle textbox pour un message avec hauteur adaptative."""
+        # Calculer la hauteur approximative basée sur le contenu
+        if content:
+            # Compter les lignes réelles (avec wrap approximatif)
+            lines = content.count('\n') + 1
+            # Estimer les lignes avec wrap (environ 80 caractères par ligne)
+            avg_chars_per_line = 80
+            wrapped_lines = sum(len(line) // avg_chars_per_line + 1 for line in content.split('\n'))
+            total_lines = max(lines, wrapped_lines)
+            # Environ 22px par ligne (hauteur de ligne + espacement), minimum 50px, maximum 500px
+            estimated_height = min(max(total_lines * 22, 50), 500)
+        else:
+            estimated_height = 50
+        
+        textbox = ctk.CTkTextbox(container, wrap="word", font=("Consolas", 12), height=estimated_height)
+        textbox.pack(fill="x", padx=5, pady=2)
+        textbox.configure(state="disabled")
+        self._configure_chat_tags(textbox)
+        return textbox
+    
     def _log_chat(self, widget, text, tag):
-        widget.configure(state="normal")
-        widget.insert("end", text + "\n\n", tag)
-        widget.configure(state="disabled")
-        widget.see("end")
+        # Nettoyer les séquences \n\n échappées
+        text = text.replace('\\n\\n', '\n\n').replace('\\n', '\n')
+        
+        # Déterminer quel container utiliser (chat1 par défaut si widget est None)
+        if widget is None or (hasattr(self, 'chat1_scroll') and not hasattr(self, 'chat1_txt')):
+            scroll_container = self.chat1_scroll
+            widgets_container = self.chat1_widgets_container
+        elif hasattr(widget, 'master') and widget.master == self.chat2_scroll:
+            scroll_container = self.chat2_scroll
+            widgets_container = self.chat2_widgets_container
+        else:
+            scroll_container = self.chat1_scroll
+            widgets_container = self.chat1_widgets_container
+        
+        # Séparer thinking et réponse finale
+        thinking_content, response_parts = _group_thinking_and_response(text)
+        
+        # Afficher le thinking (un seul widget regroupé, collapsed par défaut)
+        if thinking_content:
+            thinking_widget = ThinkingWidget(
+                widgets_container,
+                content=thinking_content
+            )
+            thinking_widget.pack(fill="x", padx=5, pady=2)
+        
+        # Créer le ResponseContainer pour la réponse finale
+        if response_parts:
+            response_container = ResponseContainer(widgets_container)
+            response_container.pack(fill="both", expand=True, padx=5, pady=2)
+            
+            # Ajouter tous les éléments de la réponse au container
+            for part_type, part_content in response_parts:
+                if part_type == 'text' and part_content.strip():
+                    # Ajouter une textbox
+                    textbox = response_container.add_textbox(part_content, tag)
+                    self._configure_chat_tags(textbox)
+                elif part_type == 'markdown':
+                    # Ajouter un widget Markdown
+                    response_container.add_markdown_widget(
+                        content=part_content,
+                        is_markdown=True,
+                        on_open_in_tab=self._open_markdown_in_tab
+                    )
+        elif not thinking_content:
+            # Si pas de thinking et pas de réponse structurée, afficher le texte simple
+            textbox = self._create_message_textbox(widgets_container, tag, text)
+            textbox.configure(state="normal")
+            textbox.insert("1.0", text + "\n\n", tag)
+            textbox.configure(state="disabled")
+        
+        # Scroll vers le bas
+        def scroll_to_bottom():
+            try:
+                if hasattr(scroll_container, '_parent_canvas'):
+                    canvas = scroll_container._parent_canvas
+                    canvas.update_idletasks()
+                    canvas.yview_moveto(1.0)
+            except:
+                pass
+        scroll_container.after(100, scroll_to_bottom)
+    
+    def _open_markdown_in_tab(self, content, is_markdown):
+        """Ouvre le contenu Markdown dans un onglet séparé."""
+        import time
+        tab_name = f"Markdown_{int(time.time())}"
+        
+        self.tab_view.add(tab_name)
+        
+        viewer = MarkdownViewer(
+            self.tab_view.tab(tab_name),
+            content=content,
+            is_markdown=is_markdown
+        )
+        viewer.pack(fill="both", expand=True)
+        self.tab_view.set(tab_name)
 
     def _get_last_response(self):
-        return self.chat1_txt.get("end-5l", "end")
+        # Récupérer le dernier message depuis le container
+        try:
+            # Chercher la dernière textbox dans le container
+            children = self.chat1_widgets_container.winfo_children()
+            for child in reversed(children):
+                if isinstance(child, ctk.CTkTextbox):
+                    content = child.get("1.0", "end")
+                    if content.strip():
+                        return content
+        except:
+            pass
+        return ""
 
     def _clear_chat(self):
-        self.chat1_txt.configure(state="normal")
-        self.chat1_txt.delete("1.0", "end")
-        self.chat1_txt.configure(state="disabled")
+        # Supprimer tous les widgets du container
+        try:
+            for widget in self.chat1_widgets_container.winfo_children():
+                widget.destroy()
+        except:
+            pass
         task_queue.put({'type': 'reset_memory'})
         self.status_var.set("🧹 Chat et Mémoire effacés.")
 
@@ -476,43 +631,130 @@ class GeminiApp:
 
                 if msg_type == 'chat_response':
                     self._stop_animation()
-                    self._log_chat(self.chat1_txt, f"🤖 {res['text']}", "gemini")
+                    # Utiliser le container directement (pas de widget spécifique)
+                    self._log_chat(None, f"🤖 {res['text']}", "gemini")
                 
                 elif msg_type == 'ui_stream_start':
-                    # Réinitialiser le flag pour le nouveau stream
+                    # Réinitialiser les buffers pour le nouveau stream
                     self._stream_prefix_added = False
                     self.is_streaming = True
+                    self._stream_buffer = ""  # Buffer pour accumuler la réponse finale
+                    self._thinking_buffer = ""  # Buffer pour accumuler les thinking
+                    self._current_stream_textbox = None  # Pas de textbox pendant le stream
+                
+                elif msg_type == 'ui_stream_thinking':
+                    # Accumuler les thinking séparément
+                    if not hasattr(self, '_thinking_buffer'):
+                        self._thinking_buffer = ""
+                    text = res['text'].replace('\\n\\n', '\n\n').replace('\\n', '\n')
+                    self._thinking_buffer += text
+                    log.info(f"🔵 THINKING accumulé: {len(text)} chars, total: {len(self._thinking_buffer)} chars")
                 
                 elif msg_type == 'ui_stream_chunk':
-                    # [CORRECTION] Insertion directe sans saut de ligne forcé pour le streaming fluide
-                    self.chat1_txt.configure(state="normal")
-                    # Ajouter le préfixe "🤖 " seulement au premier chunk
+                    # Accumuler le contenu de la réponse finale dans le buffer (ne pas afficher pendant le stream)
                     text = res['text']
-                    if not hasattr(self, '_stream_prefix_added') or not self._stream_prefix_added:
-                        text = f"🤖 {text}"
-                        self._stream_prefix_added = True
-                    self.chat1_txt.insert("end", text, "gemini")
-                    self.chat1_txt.configure(state="disabled")
-                    self.chat1_txt.see("end")
+                    text = text.replace('\\n\\n', '\n\n').replace('\\n', '\n')
+                    self._stream_buffer += text
+                    log.info(f"🟢 CONTENU accumulé: {len(text)} chars, total: {len(self._stream_buffer)} chars")
                 
                 elif msg_type == 'ui_stream_end':
                     self._stop_animation() 
                     # Réinitialiser le flag pour le prochain stream
                     self._stream_prefix_added = False
                     self.is_streaming = False
-                    # [CORRECTION] On ajoute juste le saut de ligne final directement (pas besoin de _log_chat qui ajouterait \n\n)
-                    self.chat1_txt.configure(state="normal")
-                    self.chat1_txt.insert("end", "\n\n", "gemini")
-                    self.chat1_txt.configure(state="disabled")
-                    self.chat1_txt.see("end")
+                    
+                    # Afficher le thinking séparément si présent (détecté nativement via champ 'thought')
+                    # IMPORTANT: Ne créer le ThinkingWidget que si _thinking_buffer contient vraiment du contenu
+                    thinking_buffer_content = getattr(self, '_thinking_buffer', None)
+                    if thinking_buffer_content and thinking_buffer_content.strip():
+                        try:
+                            thinking_content = thinking_buffer_content.replace('\\n\\n', '\n\n').replace('\\n', '\n')
+                            log.info(f"🔵 Displaying thinking widget: {len(thinking_content)} chars")
+                            thinking_widget = ThinkingWidget(
+                                self.chat1_widgets_container,
+                                content=thinking_content
+                            )
+                            thinking_widget.pack(fill="x", padx=5, pady=2)
+                            if hasattr(self, '_thinking_buffer'):
+                                del self._thinking_buffer
+                        except Exception as e:
+                            log.error(f"Erreur affichage thinking: {e}", exc_info=True)
+                            if hasattr(self, '_thinking_buffer'):
+                                del self._thinking_buffer
+                    elif hasattr(self, '_thinking_buffer'):
+                        # Buffer vide ou None, nettoyer
+                        log.debug("Thinking buffer is empty, skipping thinking widget")
+                        del self._thinking_buffer
+                    
+                    # Traiter la réponse finale (sans thinking, déjà séparé)
+                    # IMPORTANT: Vérifier que _stream_buffer contient bien du contenu (pas vide)
+                    stream_buffer_content = getattr(self, '_stream_buffer', None)
+                    if stream_buffer_content and stream_buffer_content.strip():
+                        try:
+                            # Nettoyer le buffer
+                            streamed_text = stream_buffer_content.replace('\\n\\n', '\n\n').replace('\\n', '\n')
+                            log.info(f"🟢 Displaying response container: {len(streamed_text)} chars, preview: {streamed_text[:200]}")
+                            
+                            # IMPORTANT: Le thinking a déjà été séparé, donc on ne doit PAS utiliser _parse_mixed_content
+                            # qui pourrait détecter incorrectement le texte comme du thinking.
+                            # On parse seulement pour détecter Markdown vs texte simple.
+                            
+                            # Vérifier si c'est du Markdown
+                            is_markdown = _is_markdown_content(streamed_text)
+                            log.info(f"📝 Markdown détecté: {is_markdown}")
+                            
+                            # Créer le ResponseContainer pour la réponse finale
+                            # Pas de hauteur limitée, affichage en grand, scrollbar masquée
+                            response_container = ResponseContainer(self.chat1_widgets_container)
+                            response_container.pack(fill="both", expand=True, padx=5, pady=2)
+                            
+                            if is_markdown:
+                                # Ajouter un widget Markdown
+                                response_container.add_markdown_widget(
+                                    content=streamed_text,
+                                    is_markdown=True,
+                                    on_open_in_tab=self._open_markdown_in_tab
+                                )
+                            else:
+                                # Ajouter une textbox pour le texte simple
+                                textbox = response_container.add_textbox(streamed_text, "gemini")
+                                self._configure_chat_tags(textbox)
+                            
+                            # Nettoyer le buffer
+                            if hasattr(self, '_stream_buffer'):
+                                del self._stream_buffer
+                        except Exception as e:
+                            log.error(f"Erreur traitement stream: {e}", exc_info=True)
+                            # En cas d'erreur, afficher le contenu brut
+                            if hasattr(self, '_stream_buffer') and self._stream_buffer:
+                                textbox = self._create_message_textbox(self.chat1_widgets_container, "gemini", self._stream_buffer)
+                                textbox.configure(state="normal")
+                                textbox.insert("1.0", f"🤖 {self._stream_buffer}\n\n", "gemini")
+                                textbox.configure(state="disabled")
+                                del self._stream_buffer
+                    elif hasattr(self, '_stream_buffer'):
+                        # Buffer vide ou None, nettoyer
+                        log.debug("Stream buffer is empty, skipping response container")
+                        del self._stream_buffer
+                    
+                    # Scroll vers le bas
+                    def scroll_to_bottom():
+                        try:
+                            if hasattr(self.chat1_scroll, '_parent_canvas'):
+                                canvas = self.chat1_scroll._parent_canvas
+                                canvas.update_idletasks()
+                                canvas.yview_moveto(1.0)
+                        except:
+                            pass
+                    self.chat1_scroll.after(100, scroll_to_bottom)
                     
                 elif msg_type == 'ui_update':
                     if res.get('widget') == 'status': self.status_var.set(res['text'])
-                    elif res.get('widget') == 'message': self._log_chat(self.chat1_txt, f"ℹ️ {res['text']}", "info")
+                    elif res.get('widget') == 'message': self._log_chat(None, f"ℹ️ {res['text']}", "info")
                 
                 elif msg_type == 'error':
                     self._stop_animation()
-                    self._log_chat(self.chat1_txt, f"❌ {res['text']}", "error")
+                    self._log_chat(None, f"❌ {res['text']}", "error")
                 
                 elif msg_type == 'init_done':
                     self.status_var.set(f"Prêt ({res.get('key_name')})")
@@ -563,7 +805,7 @@ class GeminiApp:
         if not self.current_file_path: return
         prompt = QUICK_PROMPTS.get(choice, "")
         task_queue.put({"type": "analyze_file", "file_path": self.current_file_path, "prompt": prompt})
-        self._log_chat(self.chat1_txt, f"Action: {choice} sur {os.path.basename(self.current_file_path)}", "info")
+        self._log_chat(None, f"Action: {choice} sur {os.path.basename(self.current_file_path)}", "info")
 
     # --- GESTION HISTORIQUE COMMANDES ---
 

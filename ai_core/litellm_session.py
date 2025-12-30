@@ -438,15 +438,17 @@ class LiteLLMSession(BaseSession):
                     
                     try:
                         for chunk in response:
-                            # Extraction contenu
+                            # IMPORTANT: Yield le chunk complet pour préserver is_thinking/reasoning_content
+                            # Ne pas extraire seulement le contenu texte, car on perd les métadonnées
+                            
+                            # Extraction contenu pour l'historique seulement
                             if hasattr(chunk, 'choices') and chunk.choices:
                                 delta = chunk.choices[0].delta
                                 
-                                # Contenu texte
+                                # Contenu texte (pour l'historique)
                                 content = getattr(delta, 'content', '') or getattr(delta, 'text', '')
                                 if content:
                                     full_response_text += content
-                                    yield content
                                 
                                 # Tool calls (si présents)
                                 if hasattr(delta, 'tool_calls') and delta.tool_calls:
@@ -456,6 +458,9 @@ class LiteLLMSession(BaseSession):
                             # Métriques usage
                             if hasattr(chunk, 'usage'):
                                 usage_data = self.proxy.extract_usage_metadata(chunk)
+                            
+                            # Yield le chunk complet pour préserver les métadonnées (is_thinking, reasoning_content, etc.)
+                            yield chunk
                     
                     except Exception as e:
                         UnifiedLogger.write("AI_CORE", "ERROR", f"LiteLLM Stream Interrompu: {e}")
