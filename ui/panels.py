@@ -273,12 +273,12 @@ class MainPanel(ctk.CTkFrame):
                 widgets_container,
                 content=thinking_content
             )
-            thinking_widget.pack(fill="x", padx=5, pady=2)
+            thinking_widget.pack(fill="x", padx=5, pady=0)
         
         # Créer le ResponseContainer pour la réponse finale
         if response_parts:
             response_container = ResponseContainer(widgets_container)
-            response_container.pack(fill="both", expand=True, padx=5, pady=2)
+            response_container.pack(fill="both", expand=True, padx=5, pady=0)
             
             # Ajouter tous les éléments de la réponse au container
             for part_type, part_content in response_parts:

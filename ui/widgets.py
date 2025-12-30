@@ -14,14 +14,14 @@ except ImportError:
 
 log = logging.getLogger("ui.widgets")
 
-# Import tkhtmlview pour affichage HTML
+# Import tkinterweb pour affichage HTML (remplace tkhtmlview)
 try:
-    from tkhtmlview import HTMLLabel
-    TKHTMLVIEW_AVAILABLE = True
+    from tkinterweb import HtmlFrame
+    TKINTERWEB_AVAILABLE = True
 except ImportError:
-    TKHTMLVIEW_AVAILABLE = False
-    HTMLLabel = None
-    log.warning("tkhtmlview non disponible - l'affichage Markdown/HTML sera limité")
+    TKINTERWEB_AVAILABLE = False
+    HtmlFrame = None
+    log.warning("tkinterweb non disponible - l'affichage Markdown/HTML sera limité")
 
 # Import du convertisseur Markdown
 try:
@@ -556,60 +556,38 @@ def _group_thinking_and_response(text):
 
 class MarkdownViewer(ctk.CTkFrame):
     """
-    Widget pour afficher du Markdown/HTML avec tkhtmlview.
+    Widget pour afficher du Markdown/HTML avec tkinterweb.
     """
     def __init__(self, master, content=None, is_markdown=True, **kwargs):
         super().__init__(master, **kwargs)
         self.pack_propagate(False)
         self.is_markdown = is_markdown
         
-        if not TKHTMLVIEW_AVAILABLE:
+        if not TKINTERWEB_AVAILABLE:
             # Fallback vers un label d'erreur
             error_label = ctk.CTkLabel(
                 self,
-                text="tkhtmlview n'est pas disponible.\nVeuillez installer: pip install tkhtmlview",
+                text="tkinterweb n'est pas disponible.\nVeuillez installer: pip install tkinterweb",
                 text_color=COLORS["ERROR"],
                 font=("Arial", 12)
             )
             error_label.pack(fill="both", expand=True, padx=20, pady=20)
             return
         
-        # Créer un Canvas avec scrollbar pour le scroll
-        self.canvas = tk.Canvas(
+        # Créer HtmlFrame directement (gère le scroll automatiquement)
+        # HtmlFrame nécessite un Frame tkinter natif, pas un CTkFrame
+        self.html_frame_container = tk.Frame(
             self,
-            bg=COLORS.get("BG_MAIN", "#1E1E1E"),
-            highlightthickness=0
+            bg=COLORS.get("BG_MAIN", "#1E1E1E")
         )
+        self.html_frame_container.pack(fill="both", expand=True, padx=0, pady=0)
         
-        # Scrollbar verticale
-        scrollbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = tk.Frame(self.canvas, bg=COLORS.get("BG_MAIN", "#1E1E1E"))
-        
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        # Créer HtmlFrame dans le container
+        self.html_frame = HtmlFrame(
+            self.html_frame_container,
+            messages_enabled=False  # Désactiver les messages de console
         )
-        
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Pack canvas et scrollbar
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        # Créer HTMLLabel dans le frame scrollable
-        self.html_label = HTMLLabel(
-            self.scrollable_frame,
-            html="",
-            background=COLORS.get("BG_MAIN", "#1E1E1E")
-        )
-        self.html_label.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        # Bind mousewheel pour le scroll
-        def _on_mousewheel(event):
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        
-        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self.html_frame.pack(fill="both", expand=True)
         
         # Définir le contenu si fourni
         if content:
@@ -623,7 +601,7 @@ class MarkdownViewer(ctk.CTkFrame):
             content: Texte Markdown ou HTML
             is_markdown: Si True, convertir Markdown en HTML. Si None, utilise self.is_markdown
         """
-        if not TKHTMLVIEW_AVAILABLE:
+        if not TKINTERWEB_AVAILABLE:
             return
         
         if is_markdown is None:
@@ -637,38 +615,59 @@ class MarkdownViewer(ctk.CTkFrame):
                 # Utiliser directement comme HTML
                 html_content = content
             
-            # [CORRECTION] HTMLLabel ne supporte pas bien les balises <style> dans le body
-            # Il faut extraire le contenu du body seulement et appliquer les styles différemment
-            if '<style>' in html_content or '<body>' in html_content:
-                import re
-                # Extraire le contenu du body
-                body_match = re.search(r'<body[^>]*>(.*?)</body>', html_content, re.DOTALL | re.IGNORECASE)
-                if body_match:
-                    body_content = body_match.group(1)
-                    # Extraire le CSS et créer un wrapper avec style inline
-                    style_match = re.search(r'<style[^>]*>(.*?)</style>', html_content, re.DOTALL | re.IGNORECASE)
-                    if style_match:
-                        # Créer un wrapper div avec les styles de base appliqués
-                        html_content = f'''<div style="background-color: #1E1E1E; color: #CCCCCC; font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; padding: 20px; margin: 0;">
-{body_content}
-</div>'''
-                    else:
-                        html_content = body_content
-                else:
-                    # Si pas de body, essayer d'extraire juste le contenu sans les balises head/style
-                    html_content = re.sub(r'<head>.*?</head>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
-                    html_content = re.sub(r'<style>.*?</style>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+            # tkinterweb HtmlFrame supporte mieux les balises <style> et <body>
+            # On peut utiliser le HTML complet directement
+            # Si le HTML n'a pas de structure complète, on l'emballe
+            if not html_content.strip().startswith('<!DOCTYPE') and not html_content.strip().startswith('<html'):
+                # Si c'est juste du contenu HTML sans structure, on l'emballe
+                if '<body>' not in html_content and '<style>' not in html_content:
+                    # Contenu simple, on ajoute juste les styles de base
+                    html_content = f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{
+            background-color: #1E1E1E;
+            color: #CCCCCC;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            line-height: 1.6;
+            padding: 20px;
+            margin: 0;
+        }}
+    </style>
+</head>
+<body>
+{html_content}
+</body>
+</html>'''
             
-            # Mettre à jour HTMLLabel
-            self.html_label.set_html(html_content)
-            
-            # Mettre à jour le scrollregion après le rendu
-            self.after(100, lambda: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+            # Charger le HTML dans HtmlFrame
+            self.html_frame.load_html(html_content)
             
         except Exception as e:
-            log.error(f"Erreur lors de l'affichage du contenu: {e}")
-            error_html = f"<p style='color: #F44336;'>Erreur: {str(e)}</p>"
-            self.html_label.set_html(error_html)
+            log.error(f"Erreur lors de l'affichage du contenu: {e}", exc_info=True)
+            error_html = f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{
+            background-color: #1E1E1E;
+            color: #F44336;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            padding: 20px;
+        }}
+    </style>
+</head>
+<body>
+    <p>Erreur: {str(e)}</p>
+</body>
+</html>'''
+            try:
+                self.html_frame.load_html(error_html)
+            except:
+                pass
 
 
 class ThinkingWidget(ctk.CTkFrame):
@@ -790,12 +789,75 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.widgets = []  # Liste des widgets ajoutés
         
+        # Intercepter les événements de molette AVANT CustomTkinter pour éviter les erreurs
+        # Utiliser bind_class pour intercepter au niveau de la classe
+        self._intercept_mousewheel_events()
+        
         # Masquer la scrollbar mais garder le scroll fonctionnel
         # CTkScrollableFrame crée un canvas parent avec une scrollbar
         # On accède au canvas parent après que le widget soit créé et packé
         self.after(200, self._hide_scrollbar)
         # Réessayer après un délai plus long au cas où
         self.after(500, self._hide_scrollbar)
+    
+    def _intercept_mousewheel_events(self):
+        """Intercepte les événements de molette pour éviter les erreurs CustomTkinter et gère le scroll."""
+        def safe_mousewheel_handler(event):
+            """Handler sécurisé qui gère le scroll et intercepte les événements problématiques."""
+            try:
+                # Vérifier si event.widget est problématique (chaîne ou sans master)
+                widget_invalid = False
+                if hasattr(event, 'widget'):
+                    widget = event.widget
+                    if isinstance(widget, str) or not hasattr(widget, 'master'):
+                        widget_invalid = True
+                
+                # Si le widget est invalide, intercepter immédiatement
+                if widget_invalid:
+                    return "break"
+                
+                # Sinon, gérer le scroll nous-mêmes pour éviter que CustomTkinter ne le fasse
+                # et cause l'erreur
+                if hasattr(self, '_parent_canvas'):
+                    canvas = self._parent_canvas
+                    try:
+                        # Scroll avec la molette (Windows/Linux)
+                        if hasattr(event, 'delta') and event.delta:
+                            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                        # Scroll avec la molette (Linux avec Button-4/5)
+                        elif hasattr(event, 'num'):
+                            if event.num == 4:
+                                canvas.yview_scroll(-1, "units")
+                            elif event.num == 5:
+                                canvas.yview_scroll(1, "units")
+                    except:
+                        pass
+                
+                # Intercepter pour empêcher CustomTkinter de traiter l'événement
+                return "break"
+            except:
+                return "break"
+        
+        # Bind sur le widget lui-même SANS add="+" pour remplacer le handler CustomTkinter
+        # Cela empêche CustomTkinter de traiter ces événements
+        self.bind("<MouseWheel>", safe_mousewheel_handler)
+        self.bind("<Button-4>", safe_mousewheel_handler)
+        self.bind("<Button-5>", safe_mousewheel_handler)
+        
+        # Aussi bind sur tous les enfants après création
+        def bind_children():
+            try:
+                for child in self.winfo_children():
+                    if hasattr(child, 'bind'):
+                        child.bind("<MouseWheel>", safe_mousewheel_handler)
+                        child.bind("<Button-4>", safe_mousewheel_handler)
+                        child.bind("<Button-5>", safe_mousewheel_handler)
+            except:
+                pass
+        
+        # Bind les enfants après un court délai
+        self.after(50, bind_children)
+        self.after(200, bind_children)
     
     def _hide_scrollbar(self):
         """Masque la scrollbar du CTkScrollableFrame tout en gardant le scroll fonctionnel."""
@@ -883,7 +945,7 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             yscrollcommand=None,  # Désactiver le scroll vertical
             xscrollcommand=None   # Désactiver le scroll horizontal
         )
-        textbox.pack(fill="x", padx=5, pady=2)
+        textbox.pack(fill="x", padx=5, pady=0)
         textbox.configure(state="disabled")
         
         textbox.configure(state="normal")
@@ -925,7 +987,7 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             is_markdown=is_markdown,
             on_open_in_tab=on_open_in_tab
         )
-        md_widget.pack(fill="x", padx=5, pady=2)
+        md_widget.pack(fill="x", padx=5, pady=0)
         self.widgets.append(md_widget)
         return md_widget
 
@@ -987,7 +1049,7 @@ class CollapsibleMarkdownWidget(ctk.CTkFrame):
         # Calculer la hauteur approximative
         lines = self.content.count('\n') + 1
         estimated_height = min(max(lines * 25, 150), 800)
-        # Note: MarkdownViewer utilise un Canvas, on ne peut pas directement set height
+        # Note: MarkdownViewer utilise tkinterweb HtmlFrame qui gère automatiquement la taille
         # La hauteur sera gérée par le contenu
     
     def toggle(self):
@@ -1027,7 +1089,7 @@ class CollapsibleMarkdownWidget(ctk.CTkFrame):
 class NonCollapsibleMarkdownWidget(ctk.CTkFrame):
     """
     Widget Markdown non-collapsible pour la réponse finale.
-    Taille adaptative au contenu, scrollbar masquée mais fonctionnelle.
+    Taille adaptative au contenu, scroll géré automatiquement par tkinterweb.
     """
     def __init__(self, master, content, is_markdown=True, on_open_in_tab=None, **kwargs):
         super().__init__(master, **kwargs)
@@ -1058,23 +1120,10 @@ class NonCollapsibleMarkdownWidget(ctk.CTkFrame):
         self.after(200, self._hide_markdown_viewer_scrollbar)
     
     def _hide_markdown_viewer_scrollbar(self):
-        """Masque la scrollbar du MarkdownViewer."""
-        try:
-            if hasattr(self, 'md_widget') and hasattr(self.md_widget, 'canvas'):
-                # MarkdownViewer utilise un Canvas avec scrollbar
-                canvas = self.md_widget.canvas
-                # Chercher la scrollbar dans les enfants du canvas
-                for child in canvas.winfo_children():
-                    if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
-                        child.place_forget()
-                        child.pack_forget()
-                        child.grid_forget()
-                        try:
-                            child.configure(width=0)
-                        except:
-                            pass
-        except Exception as e:
-            log.debug(f"Impossible de masquer la scrollbar MarkdownViewer: {e}")
+        """Masque la scrollbar du MarkdownViewer (tkinterweb gère le scroll automatiquement)."""
+        # tkinterweb HtmlFrame gère le scroll automatiquement, pas besoin de masquer de scrollbar
+        # Cette méthode est conservée pour compatibilité mais ne fait rien
+        pass
 
 
 class ApiKeyStatusMenu(ctk.CTkButton):

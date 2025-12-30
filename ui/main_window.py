@@ -530,7 +530,7 @@ class GeminiApp:
             yscrollcommand=None,  # Désactiver le scroll vertical
             xscrollcommand=None   # Désactiver le scroll horizontal
         )
-        textbox.pack(fill="x", padx=5, pady=2)
+        textbox.pack(fill="x", padx=5, pady=0)
         textbox.configure(state="disabled")
         self._configure_chat_tags(textbox)
         
@@ -584,12 +584,12 @@ class GeminiApp:
                 widgets_container,
                 content=thinking_content
             )
-            thinking_widget.pack(fill="x", padx=5, pady=2)
+            thinking_widget.pack(fill="x", padx=5, pady=0)
         
         # Créer le ResponseContainer pour la réponse finale
         if response_parts:
             response_container = ResponseContainer(widgets_container)
-            response_container.pack(fill="both", expand=True, padx=5, pady=2)
+            response_container.pack(fill="both", expand=True, padx=5, pady=0)
             
             # Ajouter tous les éléments de la réponse au container
             for part_type, part_content in response_parts:
@@ -666,6 +666,10 @@ class GeminiApp:
             while not result_queue.empty():
                 res = result_queue.get_nowait()
                 msg_type = res.get('type')
+                
+                # DEBUG: Log tous les messages reçus pour diagnostiquer
+                if msg_type in ['ui_stream_chunk', 'ui_stream_thinking', 'ui_stream_start', 'ui_stream_end']:
+                    log.debug(f"📨 Message reçu: type={msg_type}, keys={list(res.keys())}, has_text={'text' in res}")
 
                 if msg_type == 'chat_response':
                     self._stop_animation()
@@ -690,10 +694,22 @@ class GeminiApp:
                 
                 elif msg_type == 'ui_stream_chunk':
                     # Accumuler le contenu de la réponse finale dans le buffer (ne pas afficher pendant le stream)
-                    text = res['text']
-                    text = text.replace('\\n\\n', '\n\n').replace('\\n', '\n')
-                    self._stream_buffer += text
-                    log.info(f"🟢 CONTENU accumulé: {len(text)} chars, total: {len(self._stream_buffer)} chars")
+                    # Initialiser le buffer s'il n'existe pas (défense contre les messages hors ordre)
+                    if not hasattr(self, '_stream_buffer'):
+                        log.warning("⚠️ ui_stream_chunk reçu avant ui_stream_start, initialisation du buffer")
+                        self._stream_buffer = ""
+                    
+                    try:
+                        text = res.get('text', '')
+                        if not text:
+                            log.warning(f"⚠️ ui_stream_chunk reçu avec texte vide: {res}")
+                            return
+                        
+                        text = text.replace('\\n\\n', '\n\n').replace('\\n', '\n')
+                        self._stream_buffer += text
+                        log.info(f"🟢 CONTENU accumulé: {len(text)} chars, total: {len(self._stream_buffer)} chars")
+                    except Exception as e:
+                        log.error(f"❌ Erreur traitement ui_stream_chunk: {e}", exc_info=True)
                 
                 elif msg_type == 'ui_stream_end':
                     self._stop_animation() 
@@ -712,7 +728,7 @@ class GeminiApp:
                                 self.chat1_widgets_container,
                                 content=thinking_content
                             )
-                            thinking_widget.pack(fill="x", padx=5, pady=2)
+                            thinking_widget.pack(fill="x", padx=5, pady=0)
                             if hasattr(self, '_thinking_buffer'):
                                 del self._thinking_buffer
                         except Exception as e:
@@ -727,6 +743,10 @@ class GeminiApp:
                     # Traiter la réponse finale (sans thinking, déjà séparé)
                     # IMPORTANT: Vérifier que _stream_buffer contient bien du contenu (pas vide)
                     stream_buffer_content = getattr(self, '_stream_buffer', None)
+                    
+                    # DEBUG: Log le contenu du buffer avant traitement
+                    log.info(f"🔍 DEBUG ui_stream_end: stream_buffer_content type={type(stream_buffer_content)}, length={len(stream_buffer_content) if stream_buffer_content else 0}, preview={str(stream_buffer_content)[:200] if stream_buffer_content else 'None'}")
+                    
                     if stream_buffer_content and stream_buffer_content.strip():
                         try:
                             # Nettoyer le buffer
@@ -744,7 +764,7 @@ class GeminiApp:
                             # Créer le ResponseContainer pour la réponse finale
                             # Pas de hauteur limitée, affichage en grand, scrollbar masquée
                             response_container = ResponseContainer(self.chat1_widgets_container)
-                            response_container.pack(fill="both", expand=True, padx=5, pady=2)
+                            response_container.pack(fill="both", expand=True, padx=5, pady=0)
                             
                             if is_markdown:
                                 # Ajouter un widget Markdown
@@ -771,9 +791,16 @@ class GeminiApp:
                                 textbox.configure(state="disabled")
                                 del self._stream_buffer
                     elif hasattr(self, '_stream_buffer'):
-                        # Buffer vide ou None, nettoyer
-                        log.debug("Stream buffer is empty, skipping response container")
+                        # Buffer vide ou None, mais log pour debug
+                        log.warning(f"⚠️ Stream buffer is empty at ui_stream_end. Content was: {repr(stream_buffer_content)}")
+                        # Vérifier s'il y a du thinking mais pas de réponse finale
+                        thinking_content = getattr(self, '_thinking_buffer', None)
+                        if thinking_content and thinking_content.strip():
+                            log.info(f"ℹ️ Thinking présent ({len(thinking_content)} chars) mais pas de réponse finale - c'est normal si l'IA n'a généré que des pensées")
                         del self._stream_buffer
+                    else:
+                        # Buffer n'existe même pas - problème d'initialisation
+                        log.error("❌ _stream_buffer n'existe pas à ui_stream_end - ui_stream_start n'a peut-être pas été reçu")
                     
                     # Scroll vers le bas
                     def scroll_to_bottom():

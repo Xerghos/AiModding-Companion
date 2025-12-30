@@ -978,6 +978,43 @@ class CodeAssistClient:
                                                         "STREAM_CANDIDATES",
                                                         f"Chunk {total_chunks} - Part {i} (text): {len(part_text)} caractères"
                                                     )
+                                        elif "functionCall" in part:
+                                            # L'IA veut appeler un outil - convertir en format !native_tool pour exécution
+                                            func_call = part["functionCall"]
+                                            func_name = func_call.get("name", "unknown_tool")
+                                            func_args = func_call.get("args", {})
+                                            
+                                            # Convertir en format !native_tool pour que le worker puisse l'exécuter
+                                            import json
+                                            try:
+                                                args_json = json.dumps(func_args, ensure_ascii=False)
+                                                tool_command = f'!native_tool {{"name": "{func_name}", "args": {args_json}}}'
+                                                
+                                                # Ajouter au texte pour que le worker le détecte et l'exécute
+                                                chunk_text += f"\n{tool_command}\n"
+                                                
+                                                UnifiedLogger.write(
+                                                    "AI_CORE",
+                                                    "STREAM_CANDIDATES",
+                                                    f"Chunk {total_chunks} - FunctionCall converti en !native_tool: {func_name}"
+                                                )
+                                            except Exception as e:
+                                                # Fallback: afficher comme texte si conversion échoue
+                                                func_call_text = f"\n[🔧 L'IA souhaite utiliser l'outil '{func_name}'"
+                                                if func_args:
+                                                    try:
+                                                        args_str = json.dumps(func_args, ensure_ascii=False, indent=2)
+                                                        func_call_text += f" avec les paramètres:\n{args_str}"
+                                                    except:
+                                                        func_call_text += f" avec des paramètres"
+                                                func_call_text += "]\n"
+                                                chunk_text += func_call_text
+                                                
+                                                UnifiedLogger.write(
+                                                    "AI_CORE",
+                                                    "STREAM_CANDIDATES",
+                                                    f"Chunk {total_chunks} - FunctionCall conversion échouée: {e}, affiché comme texte"
+                                                )
                                 
                                 # Envoyer le thinking séparément si présent (avec marqueur)
                                 if chunk_thinking:
