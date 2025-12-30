@@ -502,7 +502,7 @@ class GeminiApp:
         syntax_highlighter.configure_tags(widget)
     
     def _create_message_textbox(self, container, tag="gemini", content=""):
-        """Crée une nouvelle textbox pour un message avec hauteur adaptative. Pas de scrollbar visible."""
+        """Crée une nouvelle textbox pour un message avec hauteur adaptative. Pas de scrollbar."""
         # Récupérer la taille de police depuis les settings
         font_size = APP_SETTINGS.get("system_settings", {}).get("font_size", 12)
         
@@ -520,67 +520,43 @@ class GeminiApp:
         else:
             estimated_height = 50
         
-        # Créer la textbox avec la taille de police configurée
+        # Créer la textbox avec la taille de police configurée et SANS scrollbars ni scroll
         textbox = ctk.CTkTextbox(
             container, 
             wrap="word", 
             font=("Consolas", font_size), 
-            height=estimated_height
+            height=estimated_height,
+            activate_scrollbars=False,  # Désactiver les scrollbars
+            yscrollcommand=None,  # Désactiver le scroll vertical
+            xscrollcommand=None   # Désactiver le scroll horizontal
         )
         textbox.pack(fill="x", padx=5, pady=2)
         textbox.configure(state="disabled")
         self._configure_chat_tags(textbox)
         
-        # Désactiver IMMÉDIATEMENT le scroll et masquer la scrollbar
-        def disable_scroll_immediate():
+        # Désactiver complètement le scroll avec la molette
+        def disable_mousewheel():
             try:
-                # Forcer la mise à jour pour que le widget soit complètement créé
-                container.update_idletasks()
+                # Bind sur le textbox lui-même pour intercepter la molette
+                def stop_scroll(event):
+                    return "break"
                 
-                # Accéder au widget Text interne de CTkTextbox
+                textbox.bind("<MouseWheel>", stop_scroll)
+                textbox.bind("<Button-4>", stop_scroll)
+                textbox.bind("<Button-5>", stop_scroll)
+                
+                # Aussi sur le widget Text interne si accessible
                 if hasattr(textbox, '_textbox'):
                     text_widget = textbox._textbox
-                    # Désactiver le scroll sur le widget Text IMMÉDIATEMENT
-                    text_widget.configure(yscrollcommand=lambda *args: None)
-                    text_widget.configure(xscrollcommand=lambda *args: None)
-                    
-                    # Empêcher la recréation de la scrollbar en bindant les événements de configuration
-                    def prevent_scrollbar(event=None):
-                        text_widget.configure(yscrollcommand=lambda *args: None)
-                        text_widget.configure(xscrollcommand=lambda *args: None)
-                        hide_all_scrollbars()
-                    
-                    text_widget.bind('<Configure>', prevent_scrollbar, add='+')
-                
-                # Fonction pour masquer toutes les scrollbars
-                def hide_all_scrollbars():
-                    def hide_scrollbars_recursive(widget):
-                        """Cherche récursivement toutes les scrollbars dans le widget."""
-                        for child in widget.winfo_children():
-                            # Vérifier si c'est une scrollbar
-                            if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
-                                child.place_forget()
-                                child.pack_forget()
-                                child.grid_forget()
-                                try:
-                                    child.configure(width=0, height=0)
-                                except:
-                                    pass
-                            # Chercher récursivement dans les enfants
-                            hide_scrollbars_recursive(child)
-                    
-                    hide_scrollbars_recursive(textbox)
-                
-                hide_all_scrollbars()
+                    text_widget.bind("<MouseWheel>", stop_scroll)
+                    text_widget.bind("<Button-4>", stop_scroll)
+                    text_widget.bind("<Button-5>", stop_scroll)
             except Exception as e:
-                log.debug(f"Erreur désactivation scroll: {e}")
+                log.debug(f"Erreur désactivation molette: {e}")
         
-        # Désactiver IMMÉDIATEMENT (0ms) puis avec des délais pour s'assurer
-        disable_scroll_immediate()  # Exécution immédiate
-        container.after(1, disable_scroll_immediate)  # 1ms après
-        container.after(10, disable_scroll_immediate)  # 10ms après
-        container.after(50, disable_scroll_immediate)  # 50ms après
-        container.after(100, disable_scroll_immediate)  # 100ms après
+        # Désactiver la molette après création
+        container.after(10, disable_mousewheel)
+        container.after(50, disable_mousewheel)
         
         return textbox
     
