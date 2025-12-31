@@ -633,11 +633,11 @@ class Worker(threading.Thread):
             # Encapsuler dans un objet JSON si c'est du texte brut (section 8.1 du document CodeAssist)
             # Le document recommande {"output": "..."} pour du texte brut
             # Mais selon le document Gemini, on peut aussi utiliser directement "content" avec le texte
-            # On va utiliser le format recommandé par Gemini : {"content": "..."}
+            # Format conforme à gemini-cli : {"output": "..."}
             function_response = {
                 "name": function_call_object.name,
                 "response": {
-                    "content": tool_result_str  # ✅ "content" au lieu de "result" (document Gemini ligne 364)
+                    "output": tool_result_str  # ✅ "output" conforme à gemini-cli
                 }
             }
             
@@ -690,30 +690,21 @@ class Worker(threading.Thread):
                 "functionCall": {
                     "name": function_call.name,
                     "args": function_call.args or {}
+                    # ❌ NE PAS AJOUTER D'ID ICI - gemini-cli n'inclut pas d'ID dans functionCall
                 }
             }
-            
-            # Ajouter l'ID de corrélation si présent (CRITIQUE pour éviter les boucles)
-            # L'ID peut être dans function_call.id ou dans function_response["id"] (ID temporaire)
-            if function_call.id:
-                function_call_dict["functionCall"]["id"] = function_call.id
-            elif "id" in function_response:
-                # Si l'ID est None dans function_call, utiliser l'ID temporaire généré dans function_response
-                function_call_dict["functionCall"]["id"] = function_response["id"]
-                log.info(f"📝 ID temporaire utilisé pour functionCall: {function_response['id']}")
-            # Si aucun ID n'est disponible, ne pas en ajouter (l'API générera peut-être une erreur, mais on essaie)
             
             # NOTE: thoughtSignature est stockée mais non injectée dans l'historique
             # L'API CodeAssist ne l'accepte pas dans functionCall lors de l'injection
             # Elle est préservée dans function_call.thought_signature pour référence future si nécessaire
             
-            # Ajouter au Shadow History (format CodeAssist: role="model", parts=[functionCall])
-            self._shadow_history.append({
-                "role": "model",
-                "parts": [function_call_dict]
-            })
+            # ❌ NE PAS INJECTER LE FUNCTIONCALL DANS SHADOW_HISTORY
+            # Le functionCall original est déjà dans l'historique de la première requête
+            # L'API CodeAssist le maintient via session_id
+            # gemini-cli envoie uniquement le functionResponse lors de la continuation
             
-            # Ajouter le functionResponse (format CodeAssist: role="function", parts=[functionResponse])
+            # Ajouter uniquement le functionResponse (format CodeAssist: role="function", parts=[functionResponse])
+            # Conforme à gemini-cli : responsesToSend contient uniquement les responseParts (functionResponse)
             self._shadow_history.append({
                 "role": "function",
                 "parts": [{"functionResponse": function_response}]
@@ -722,8 +713,7 @@ class Worker(threading.Thread):
             log.info(f"📝 Shadow History mis à jour: {len(self._shadow_history)} messages")
             
             # Log détaillé pour diagnostic
-            log.info(f"📝 FunctionCall injecté: name={function_call.name}, id={function_call_dict.get('functionCall', {}).get('id')}")
-            log.info(f"📝 FunctionResponse injecté: name={function_response.get('name')}, id={function_response.get('id')}, content_type={type(function_response.get('response', {}).get('content')).__name__}, content_len={len(str(function_response.get('response', {}).get('content', '')))}")
+            log.info(f"📝 FunctionResponse injecté: name={function_response.get('name')}, id={function_response.get('id')}, output_type={type(function_response.get('response', {}).get('output')).__name__}, output_len={len(str(function_response.get('response', {}).get('output', '')))}")
             
             # Changer l'état et continuer le stream
             self.agent_state = AgentState.INJECTING
@@ -751,11 +741,11 @@ class Worker(threading.Thread):
                 for part_idx, part in enumerate(parts):
                     if "functionCall" in part:
                         func_call = part["functionCall"]
-                        log.info(f"📝   Part {part_idx} - functionCall: name={func_call.get('name')}, id={func_call.get('id')}")
+                        log.info(f"📝   Part {part_idx} - functionCall: name={func_call.get('name')} (sans ID)")
                     elif "functionResponse" in part:
                         func_resp = part["functionResponse"]
-                        resp_content = func_resp.get("response", {}).get("content", "")
-                        log.info(f"📝   Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, content_len={len(str(resp_content))}")
+                        resp_content = func_resp.get("response", {}).get("output", "")  # ✅ "output" au lieu de "content"
+                        log.info(f"📝   Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, output_len={len(str(resp_content))}")
                     elif "text" in part:
                         text_content = part["text"]
                         log.info(f"📝   Part {part_idx} - text: len={len(str(text_content))}")

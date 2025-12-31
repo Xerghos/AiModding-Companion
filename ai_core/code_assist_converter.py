@@ -234,15 +234,15 @@ def to_generate_content_request(
                     UnifiedLogger.write(
                         "AI_CORE",
                         "DEBUG",
-                        f"📝     Part {part_idx} - functionCall: name={func_call.get('name')}, id={func_call.get('id')}"
+                        f"📝     Part {part_idx} - functionCall: name={func_call.get('name')} (sans ID)"
                     )
                 elif "functionResponse" in part:
                     func_resp = part["functionResponse"]
-                    resp_content = func_resp.get("response", {}).get("content", "")
+                    resp_content = func_resp.get("response", {}).get("output", "")  # ✅ "output" au lieu de "content"
                     UnifiedLogger.write(
                         "AI_CORE",
                         "DEBUG",
-                        f"📝     Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, content_len={len(str(resp_content))}"
+                        f"📝     Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, output_len={len(str(resp_content))}"
                     )
                 elif "text" in part:
                     text_content = part["text"]

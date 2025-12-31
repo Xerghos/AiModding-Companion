@@ -731,25 +731,25 @@ class CodeAssistClient:
                                         UnifiedLogger.write(
                                             "AI_CORE",
                                             "DEBUG",
-                                            f"📋 Part {part_idx} - functionCall: name={func_call.get('name')}, id={func_call.get('id')}, keys={list(func_call.keys())}"
+                                            f"📋 Part {part_idx} - functionCall: name={func_call.get('name')}, keys={list(func_call.keys())} (sans ID - conforme gemini-cli)"
                                         )
                                     if "functionResponse" in part:
                                         func_resp = part["functionResponse"]
-                                        resp_content = func_resp.get("response", {}).get("content", "")
-                                        content_type = type(resp_content).__name__
-                                        content_len = len(str(resp_content))
+                                        resp_content = func_resp.get("response", {}).get("output", "")  # ✅ "output" au lieu de "content"
+                                        output_type = type(resp_content).__name__
+                                        output_len = len(str(resp_content))
                                         UnifiedLogger.write(
                                             "AI_CORE",
                                             "DEBUG",
-                                            f"📋 Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, content_type={content_type}, content_len={content_len}"
+                                            f"📋 Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, output_type={output_type}, output_len={output_len}"
                                         )
                                         # Log un extrait du contenu pour voir le format
-                                        if content_len > 0:
-                                            content_preview = str(resp_content)[:500]
+                                        if output_len > 0:
+                                            output_preview = str(resp_content)[:500]
                                             UnifiedLogger.write(
                                                 "AI_CORE",
                                                 "DEBUG",
-                                                f"📋 functionResponse.content preview: {content_preview}..."
+                                                f"📋 functionResponse.output preview: {output_preview}..."
                                             )
                         except Exception as payload_err:
                             UnifiedLogger.write(
@@ -1157,17 +1157,17 @@ class CodeAssistClient:
                                             )
                                         
                                         if "text" in part:
-                                        part_text = part["text"]
-                                        
+                                            part_text = part["text"]
+                                            
                                             if is_thinking:
                                                 # C'est du thinking → accumuler séparément
                                                 chunk_thinking += part_text
-                                        if DEBUG_STREAM:
-                                            UnifiedLogger.write(
-                                                "AI_CORE",
-                                                "STREAM_CANDIDATES",
+                                                if DEBUG_STREAM:
+                                                    UnifiedLogger.write(
+                                                        "AI_CORE",
+                                                        "STREAM_CANDIDATES",
                                                         f"Chunk {total_chunks} - Part {i} (thinking): {len(part_text)} caractères"
-                                            )
+                                                    )
                                             else:
                                                 # C'est la réponse finale
                                                 chunk_text += part_text
