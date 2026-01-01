@@ -805,8 +805,15 @@ class MarkdownViewer(ctk.CTkFrame):
                 return
             
             # Estimer la hauteur basée sur le contenu
-            # Compter les lignes dans le contenu (approximatif)
-            lines = self.content.count('\n') + 1
+            # Compter les lignes dans le contenu (approximatif avec wrapping)
+            avg_chars_per_line = 80
+            lines = 0
+            if self.content:
+                for line in self.content.split('\n'):
+                    # Compter au moins 1 ligne, plus le wrapping
+                    lines += max(1, (len(line) // avg_chars_per_line) + 1)
+            else:
+                lines = 1
             
             # Limite à ~100 lignes
             max_lines = 100
@@ -820,9 +827,11 @@ class MarkdownViewer(ctk.CTkFrame):
             # Limite maximale à 2500px (100 lignes)
             estimated_height = min(estimated_height, 2500)
             
-            # Configurer la hauteur du container
-            self.html_frame_container.configure(height=estimated_height)
-            # Permettre l'expansion verticale si nécessaire
+            # Configurer la hauteur du widget principal (MarkdownViewer)
+            # pack_propagate(False) est activé, donc on doit définir la hauteur explicitement
+            self.configure(height=estimated_height)
+            
+            # Le container interne suivra grâce à fill="both"
             self.html_frame_container.pack_configure(fill="both", expand=True)
             
             # Mettre à jour le widget
