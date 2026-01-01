@@ -1069,8 +1069,8 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             wrapped_lines = sum(len(line) // avg_chars_per_line + 1 for line in text.split('\n'))
             total_lines = max(lines, wrapped_lines)
             # Calculer la hauteur en fonction de la taille de police
-            line_height = max(int(font_size * 1.5), 18)  # Environ 1.5x la taille de police
-            height = max(total_lines * line_height, 50)
+            line_height = max(int(font_size * 1.1), 16)  # Réduit à 1.1x pour moins d'espace
+            height = max(total_lines * line_height + 10, 40)  # Padding minimal
         
         # Créer la textbox avec la taille de police configurée et SANS scrollbars ni scroll
         textbox = ctk.CTkTextbox(
@@ -1082,7 +1082,7 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             yscrollcommand=None,  # Désactiver le scroll vertical
             xscrollcommand=None   # Désactiver le scroll horizontal
         )
-        textbox.pack(fill="x", padx=5, pady=0)
+        textbox.pack(fill="x", padx=2, pady=2)
         textbox.configure(state="disabled")
         
         textbox.configure(state="normal")
@@ -1130,10 +1130,10 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             # Obtenir le nombre de lignes réelles dans la textbox
             line_count = int(textbox.index("end-1c").split('.')[0])
             if line_count > 0:
-                # Calculer la hauteur nécessaire (environ 1.5x la taille de police par ligne)
+                # Calculer la hauteur nécessaire (environ 1.1x la taille de police par ligne)
                 font_size = APP_SETTINGS.get("system_settings", {}).get("font_size", 12)
-                line_height = max(int(font_size * 1.5), 18)
-                new_height = max(line_count * line_height, 50)
+                line_height = max(int(font_size * 1.1), 16)
+                new_height = max(line_count * line_height + 10, 40)
                 textbox.configure(height=new_height)
                 textbox.update_idletasks()
         except Exception as e:

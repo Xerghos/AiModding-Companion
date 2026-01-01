@@ -693,6 +693,32 @@ class CodeAssistClient:
                 # 400 -> Bad Request : log détaillé pour diagnostic
                 if status_code == 400:
                     try:
+                        # 🔍 Capturer la réponse HTTP complète
+                        response_obj = getattr(e, "response", None)
+                        if response_obj is not None:
+                            # Log des headers de réponse
+                            response_headers = dict(response_obj.headers) if hasattr(response_obj, 'headers') else {}
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "DEBUG",
+                                f"🔍 Headers réponse HTTP (400): {json.dumps(response_headers, indent=2, ensure_ascii=False)}"
+                            )
+                            
+                            # Log du body brut (avant parsing JSON)
+                            try:
+                                response_text = response_obj.text if hasattr(response_obj, 'text') else str(response_obj.content)
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "DEBUG",
+                                    f"🔍 Body réponse HTTP brut (400): {response_text[:2000]}..."  # Limiter à 2000 chars
+                                )
+                            except Exception as text_err:
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "WARN",
+                                    f"Impossible de lire body réponse: {text_err}"
+                                )
+                        
                         error_detail = e.response.json() if getattr(e, "response", None) is not None else {}
                         error_message = error_detail.get("error", {}).get("message", "")
                         error_code = error_detail.get("error", {}).get("code", "")
@@ -704,6 +730,40 @@ class CodeAssistClient:
                             f"❌ Erreur 400 Bad Request: {error_message} (code: {error_code}, status: {error_status})"
                         )
                         
+                        # 🔍 Log des fieldViolations (champs problématiques)
+                        error_obj = error_detail.get("error", {})
+                        details = error_obj.get("details", [])
+                        if details:
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "DEBUG",
+                                f"🔍 Détails erreur complets: {json.dumps(error_detail, indent=2, ensure_ascii=False)}"
+                            )
+                            for detail in details:
+                                if isinstance(detail, dict):
+                                    field_violations = detail.get("fieldViolations", [])
+                                    if field_violations:
+                                        UnifiedLogger.write(
+                                            "AI_CORE",
+                                            "ERROR",
+                                            f"❌ Field Violations détectées: {len(field_violations)} violation(s)"
+                                        )
+                                        for violation in field_violations:
+                                            field = violation.get("field", "unknown")
+                                            description = violation.get("description", "no description")
+                                            UnifiedLogger.write(
+                                                "AI_CORE",
+                                                "ERROR",
+                                                f"❌ VIOLATION: field='{field}', description='{description}'"
+                                            )
+                        else:
+                            # Si pas de details, log quand même l'erreur complète
+                            UnifiedLogger.write(
+                                "AI_CORE",
+                                "DEBUG",
+                                f"🔍 Erreur complète (sans details): {json.dumps(error_detail, indent=2, ensure_ascii=False)}"
+                            )
+                        
                         # Log détaillé de la structure du payload qui a causé l'erreur
                         try:
                             request_data = payload.get("request", {})
@@ -714,7 +774,70 @@ class CodeAssistClient:
                                 f"📋 Structure payload (400): {len(contents)} messages dans contents"
                             )
                             
-                            # Vérifier chaque message dans contents
+                            # 🔍 Sauvegarder le payload problématique dans un fichier séparé
+                            try:
+                                from datetime import datetime
+                                logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+                                os.makedirs(logs_dir, exist_ok=True)
+                                timestamp = datetime.now().strftime("%d-%b_%Hh%M_%S")
+                                error_payload_file = os.path.join(logs_dir, f"error_400_payload_{timestamp}.json")
+                                
+                                # 🔍 Analyser le payload pour identifier les problèmes potentiels
+                                payload_analysis = {
+                                    "error": error_detail,
+                                    "payload": payload,
+                                    "timestamp": datetime.now().isoformat(),
+                                    "analysis": {
+                                        "functionCall_with_id": False,
+                                        "functionResponse_with_id": False,
+                                        "id_mismatch": False,
+                                        "id_generated_by_client": False
+                                    }
+                                }
+                                
+                                # Analyser les IDs dans le payload
+                                request_data = payload.get("request", {})
+                                contents = request_data.get("contents", [])
+                                for idx, msg in enumerate(contents):
+                                    if msg.get("role") == "model":
+                                        parts = msg.get("parts", [])
+                                        for part in parts:
+                                            if "functionCall" in part:
+                                                func_call = part["functionCall"]
+                                                if func_call.get("id"):
+                                                    payload_analysis["analysis"]["functionCall_with_id"] = True
+                                    elif msg.get("role") == "function":
+                                        parts = msg.get("parts", [])
+                                        for part in parts:
+                                            if "functionResponse" in part:
+                                                func_resp = part["functionResponse"]
+                                                if func_resp.get("id"):
+                                                    payload_analysis["analysis"]["functionResponse_with_id"] = True
+                                                    # Vérifier si l'ID semble être un UUID généré (format standard)
+                                                    resp_id = func_resp.get("id")
+                                                    if resp_id and len(resp_id) == 36 and resp_id.count('-') == 4:
+                                                        payload_analysis["analysis"]["id_generated_by_client"] = True
+                                
+                                with open(error_payload_file, "w", encoding="utf-8") as f:
+                                    json.dump(payload_analysis, f, indent=2, ensure_ascii=False)
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "ERROR",
+                                    f"💾 Payload problématique sauvegardé: {error_payload_file}"
+                                )
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "DEBUG",
+                                    f"🔍 Analyse payload: {json.dumps(payload_analysis['analysis'], indent=2, ensure_ascii=False)}"
+                                )
+                            except Exception as save_err:
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "WARN",
+                                    f"Impossible de sauvegarder payload: {save_err}"
+                                )
+                            
+                            # Vérifier chaque message dans contents avec plus de détails
                             for idx, msg in enumerate(contents):
                                 role = msg.get("role", "unknown")
                                 parts = msg.get("parts", [])
@@ -724,14 +847,26 @@ class CodeAssistClient:
                                     f"📋 Message {idx}: role={role}, {len(parts)} parts"
                                 )
                                 
-                                # Vérifier les functionCall et functionResponse
+                                # Vérifier les functionCall et functionResponse avec TOUS les champs
                                 for part_idx, part in enumerate(parts):
                                     if "functionCall" in part:
                                         func_call = part["functionCall"]
+                                        # 🔍 Log de TOUS les champs du functionCall
+                                        all_keys = list(func_call.keys())
+                                        has_thought_sig = "thoughtSignature" in func_call or "thought_signature" in func_call
                                         UnifiedLogger.write(
                                             "AI_CORE",
                                             "DEBUG",
-                                            f"📋 Part {part_idx} - functionCall: name={func_call.get('name')}, keys={list(func_call.keys())} (sans ID - conforme gemini-cli)"
+                                            f"📋 Part {part_idx} - functionCall: name={func_call.get('name')}, "
+                                            f"id={func_call.get('id', 'ABSENT')}, "
+                                            f"keys={all_keys}, "
+                                            f"has_thoughtSignature={has_thought_sig}"
+                                        )
+                                        # 🔍 Log du contenu complet du functionCall
+                                        UnifiedLogger.write(
+                                            "AI_CORE",
+                                            "DEBUG",
+                                            f"📋 Part {part_idx} - functionCall complet: {json.dumps(func_call, indent=2, ensure_ascii=False)}"
                                         )
                                     if "functionResponse" in part:
                                         func_resp = part["functionResponse"]
@@ -741,8 +876,33 @@ class CodeAssistClient:
                                         UnifiedLogger.write(
                                             "AI_CORE",
                                             "DEBUG",
-                                            f"📋 Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, output_type={output_type}, output_len={output_len}"
+                                            f"📋 Part {part_idx} - functionResponse: name={func_resp.get('name')}, "
+                                            f"id={func_resp.get('id', 'ABSENT')}, "
+                                            f"output_type={output_type}, output_len={output_len}"
                                         )
+                                        # 🔍 Vérifier la corrélation ID
+                                        if idx > 0:
+                                            prev_msg = contents[idx - 1]
+                                            if prev_msg.get("role") == "model":
+                                                prev_parts = prev_msg.get("parts", [])
+                                                for prev_part in prev_parts:
+                                                    if "functionCall" in prev_part:
+                                                        prev_func_call = prev_part["functionCall"]
+                                                        prev_id = prev_func_call.get("id")
+                                                        resp_id = func_resp.get("id")
+                                                        if prev_id and resp_id:
+                                                            if prev_id != resp_id:
+                                                                UnifiedLogger.write(
+                                                                    "AI_CORE",
+                                                                    "ERROR",
+                                                                    f"❌ ID MISMATCH: functionCall.id={prev_id} != functionResponse.id={resp_id}"
+                                                                )
+                                                        elif not prev_id and resp_id:
+                                                            UnifiedLogger.write(
+                                                                "AI_CORE",
+                                                                "WARNING",
+                                                                f"⚠️ functionCall.id ABSENT mais functionResponse.id={resp_id} présent"
+                                                            )
                                         # Log un extrait du contenu pour voir le format
                                         if output_len > 0:
                                             output_preview = str(resp_content)[:500]

@@ -641,16 +641,17 @@ class Worker(threading.Thread):
                 }
             }
             
-            # Si un ID de corrélation existe, l'ajouter (CRITIQUE - section 7.2 du document CodeAssist)
-            if function_call_object.id:
-                function_response["id"] = function_call_object.id
-            else:
-                # Si l'ID est None, générer un UUID complet (pas un ID temporaire avec préfixe)
-                # L'API CodeAssist rejette les IDs avec préfixe "temp_" (erreur 400)
-                # Utiliser un UUID complet pour éviter le rejet par l'API
-                generated_id = str(uuid.uuid4())
-                log.warning(f"⚠️ FunctionCall sans ID détecté pour {function_call_object.name}. Génération d'un UUID: {generated_id}")
-                function_response["id"] = generated_id
+            # Générer l'ID pour functionResponse au format gemini-cli : {name}-{timestamp}-{uuid_short}
+            # Format observé dans les payloads gemini-cli : "read_file-1767237028616-6430fdc8fc31c"
+            # - {name} : nom de la fonction
+            # - {timestamp} : timestamp en millisecondes
+            # - {uuid_short} : 13 premiers caractères d'un UUID sans tirets
+            timestamp_ms = int(time.time() * 1000)
+            uuid_short = str(uuid.uuid4()).replace('-', '')[:13]
+            function_response_id = f"{function_call_object.name}-{timestamp_ms}-{uuid_short}"
+            function_response["id"] = function_response_id
+            
+            log.info(f"📝 FunctionResponse ID généré (format gemini-cli): {function_response_id}")
             
             # Injecter dans le Shadow History et continuer le stream
             self._inject_function_response(function_call_object, function_response)
@@ -675,44 +676,61 @@ class Worker(threading.Thread):
     @trace_action(source="core")
     def _inject_function_response(self, function_call, function_response):
         """
-        Injecte le functionCall et functionResponse dans le Shadow History.
+        Injecte le functionCall ORIGINAL et functionResponse dans le Shadow History.
+        
+        CRITIQUE : Selon les spécifications CodeAssist v1internal :
+        - Le functionCall original DOIT être réinjecté avec TOUS ses champs
+        - La thought_signature est OBLIGATOIRE pour Gemini 2.5/3
+        - L'ID doit correspondre exactement entre functionCall et functionResponse
         
         Args:
-            function_call: FunctionCallObject avec les métadonnées
+            function_call: FunctionCallObject avec les métadonnées (name, args, id, thought_signature)
             function_response: Dict formaté selon CodeAssist avec name, response, id
         """
         try:
-            # Formater le functionCall selon le format CodeAssist
-            # IMPORTANT: thoughtSignature ne doit PAS être dans functionCall lors de l'injection
-            # L'API CodeAssist rejette thoughtSignature dans functionCall (erreur 400)
-            # thoughtSignature est utilisé uniquement lors de la génération initiale, pas lors de l'injection
-            function_call_dict = {
+            # 1. Construire le message "model" avec le functionCall ORIGINAL
+            # CRITIQUE : Selon l'analyse des payloads gemini-cli capturés :
+            # - functionCall n'a PAS d'ID (l'API rejette les IDs dans functionCall)
+            # - functionCall n'a PAS de thoughtSignature dans le functionCall lui-même
+            # - Seuls name et args sont autorisés dans functionCall
+            # - MAIS le thoughtSignature DOIT être présent dans la MÊME PART que le functionCall
+            #   (l'API exige le thoughtSignature dans le message model contenant le functionCall)
+            function_call_part = {
                 "functionCall": {
                     "name": function_call.name,
                     "args": function_call.args or {}
-                    # ❌ NE PAS AJOUTER D'ID ICI - gemini-cli n'inclut pas d'ID dans functionCall
+                    # PAS d'ID - gemini-cli n'inclut pas d'ID dans functionCall
+                    # PAS de thoughtSignature dans functionCall - ce champ est rejeté par l'API
                 }
             }
             
-            # NOTE: thoughtSignature est stockée mais non injectée dans l'historique
-            # L'API CodeAssist ne l'accepte pas dans functionCall lors de l'injection
-            # Elle est préservée dans function_call.thought_signature pour référence future si nécessaire
+            # CRITIQUE : Le thoughtSignature DOIT être inclus dans la même part que le functionCall
+            # (mais pas dans le functionCall lui-même). L'API rejette les functionCall sans thoughtSignature
+            # avec l'erreur : "function call is missing a thought_signature"
+            if function_call.thought_signature:
+                function_call_part["thoughtSignature"] = function_call.thought_signature
             
-            # ❌ NE PAS INJECTER LE FUNCTIONCALL DANS SHADOW_HISTORY
-            # Le functionCall original est déjà dans l'historique de la première requête
-            # L'API CodeAssist le maintient via session_id
-            # gemini-cli envoie uniquement le functionResponse lors de la continuation
-            
-            # Ajouter uniquement le functionResponse (format CodeAssist: role="function", parts=[functionResponse])
-            # Conforme à gemini-cli : responsesToSend contient uniquement les responseParts (functionResponse)
+            # Ajouter le message "model" avec le functionCall AVANT le message "user" avec functionResponse
+            # La séquence doit être : user → model (functionCall) → user (functionResponse)
             self._shadow_history.append({
-                "role": "function",
+                "role": "model",
+                "parts": [function_call_part]
+            })
+            
+            # 2. Ajouter le message "user" avec le functionResponse
+            # CRITIQUE : Selon l'analyse des payloads gemini-cli, functionResponse doit être dans un message avec role="user"
+            # et non role="function" (l'API rejette role="function" avec une erreur 400)
+            self._shadow_history.append({
+                "role": "user",
                 "parts": [{"functionResponse": function_response}]
             })
             
-            log.info(f"📝 Shadow History mis à jour: {len(self._shadow_history)} messages")
+            # NOTE : Pas de validation de corrélation ID car functionCall n'a pas d'ID dans gemini-cli
+            # L'ID est uniquement présent dans functionResponse (généré par le client)
             
-            # Log détaillé pour diagnostic
+            log.info(f"📝 Shadow History mis à jour: {len(self._shadow_history)} messages")
+            thought_sig_status = "présent (dans la même part que functionCall)" if function_call.thought_signature else "absent"
+            log.info(f"📝 FunctionCall réinjecté: name={function_call.name} (sans ID - conforme gemini-cli), thoughtSignature={thought_sig_status}")
             log.info(f"📝 FunctionResponse injecté: name={function_response.get('name')}, id={function_response.get('id')}, output_type={type(function_response.get('response', {}).get('output')).__name__}, output_len={len(str(function_response.get('response', {}).get('output', '')))}")
             
             # Changer l'état et continuer le stream
@@ -741,11 +759,22 @@ class Worker(threading.Thread):
                 for part_idx, part in enumerate(parts):
                     if "functionCall" in part:
                         func_call = part["functionCall"]
-                        log.info(f"📝   Part {part_idx} - functionCall: name={func_call.get('name')} (sans ID)")
+                        func_id = func_call.get('id', 'absent')
+                        # NOTE: thoughtSignature est inclus dans la même part que functionCall (mais pas dans functionCall lui-même)
+                        # NOTE: functionCall n'a pas d'ID dans gemini-cli (conforme à l'analyse des payloads)
+                        id_status = f"id={func_id}" if func_id else "sans ID (conforme gemini-cli)"
+                        thought_sig_in_part = "thoughtSignature présent" if part.get("thoughtSignature") else "thoughtSignature absent"
+                        log.info(f"📝   Part {part_idx} - functionCall: name={func_call.get('name')}, {id_status}, {thought_sig_in_part}")
                     elif "functionResponse" in part:
                         func_resp = part["functionResponse"]
                         resp_content = func_resp.get("response", {}).get("output", "")  # ✅ "output" au lieu de "content"
-                        log.info(f"📝   Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={func_resp.get('id')}, output_len={len(str(resp_content))}")
+                        resp_id = func_resp.get('id', 'absent')
+                        log.info(f"📝   Part {part_idx} - functionResponse: name={func_resp.get('name')}, id={resp_id}, output_len={len(str(resp_content))}")
+                        
+                        # NOTE : Pas de validation de corrélation ID car functionCall n'a pas d'ID dans gemini-cli
+                        # L'ID est uniquement présent dans functionResponse (généré par le client au format gemini-cli)
+                        if resp_id:
+                            log.info(f"📝 FunctionResponse ID: {resp_id} (format gemini-cli: {{name}}-{{timestamp}}-{{uuid}})")
                     elif "text" in part:
                         text_content = part["text"]
                         log.info(f"📝   Part {part_idx} - text: len={len(str(text_content))}")

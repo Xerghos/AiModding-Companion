@@ -515,10 +515,10 @@ class GeminiApp:
             wrapped_lines = sum(len(line) // avg_chars_per_line + 1 for line in content.split('\n'))
             total_lines = max(lines, wrapped_lines)
             # Calculer la hauteur en fonction de la taille de police
-            line_height = max(int(font_size * 1.5), 18)  # Environ 1.5x la taille de police
-            estimated_height = max(total_lines * line_height, 50)
+            line_height = max(int(font_size * 1.1), 16)  # Réduit à 1.1x pour moins d'espace
+            estimated_height = max(total_lines * line_height + 10, 40)  # Padding minimal
         else:
-            estimated_height = 50
+            estimated_height = 40
         
         # Créer la textbox avec la taille de police configurée et SANS scrollbars ni scroll
         textbox = ctk.CTkTextbox(
@@ -530,7 +530,7 @@ class GeminiApp:
             yscrollcommand=None,  # Désactiver le scroll vertical
             xscrollcommand=None   # Désactiver le scroll horizontal
         )
-        textbox.pack(fill="x", padx=5, pady=0)
+        textbox.pack(fill="x", padx=2, pady=2)
         textbox.configure(state="disabled")
         self._configure_chat_tags(textbox)
         
