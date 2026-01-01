@@ -389,15 +389,35 @@ def _is_thinking_content(text):
         "I registered",
         "My focus is",
         "I'm considering",
+        "I'm focusing",
+        "I'm diving",
+        "I'm examining",
+        "I'm investigating",
+        "I'm breaking down",
+        "I'm currently focused",
+        "I'm now",
         "Protocol V4",
         "tools are ready",
         "file system",
         "RAG are primed",
+        "Analyzing",  # Avec majuscule
+        "Investigating",
     ]
     
     phrase_count = sum(1 for phrase in thinking_phrases if phrase.lower() in text.lower())
-    if phrase_count >= 2:
+    if phrase_count >= 1:  # Réduire à 1 pour détecter plus facilement
         return True
+    
+    # Détecter aussi les patterns français
+    french_thinking_patterns = [
+        r"^Je suis.*en train",
+        r"^J'analyse",
+        r"^Je me concentre",
+        r"^Je vais",
+    ]
+    for pattern in french_thinking_patterns:
+        if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+            return True
     
     return False
 
@@ -589,6 +609,9 @@ class MarkdownViewer(ctk.CTkFrame):
         )
         self.html_frame.pack(fill="both", expand=True)
         
+        # Stocker le contenu pour ajustement de hauteur
+        self.content = content if content else ""
+        
         # Définir le contenu si fourni
         if content:
             self.set_content(content, is_markdown)
@@ -611,6 +634,32 @@ class MarkdownViewer(ctk.CTkFrame):
             if is_markdown and MARKDOWN_CONVERTER_AVAILABLE:
                 # Convertir Markdown en HTML
                 html_content = markdown_to_html(content, theme="dark")
+                # Injecter le CSS pour masquer la scrollbar dans le HTML généré
+                if '<style>' in html_content:
+                    # Injecter le CSS dans le style existant
+                    scrollbar_css = """
+        /* Masquer la scrollbar mais garder le scroll fonctionnel */
+        ::-webkit-scrollbar {
+            display: none;
+        }
+        * {
+            scrollbar-width: none; /* Firefox */
+            -ms-overflow-style: none; /* IE et Edge */
+        }"""
+                    html_content = html_content.replace('</style>', scrollbar_css + '\n    </style>')
+                elif '<head>' in html_content:
+                    # Ajouter un style dans le head
+                    scrollbar_style = """
+    <style>
+        ::-webkit-scrollbar {
+            display: none;
+        }
+        * {
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+        }
+    </style>"""
+                    html_content = html_content.replace('</head>', scrollbar_style + '\n</head>')
             else:
                 # Utiliser directement comme HTML
                 html_content = content
@@ -635,6 +684,14 @@ class MarkdownViewer(ctk.CTkFrame):
             padding: 20px;
             margin: 0;
         }}
+        /* Masquer la scrollbar mais garder le scroll fonctionnel */
+        ::-webkit-scrollbar {{
+            display: none;
+        }}
+        * {{
+            scrollbar-width: none; /* Firefox */
+            -ms-overflow-style: none; /* IE et Edge */
+        }}
     </style>
 </head>
 <body>
@@ -642,8 +699,14 @@ class MarkdownViewer(ctk.CTkFrame):
 </body>
 </html>'''
             
+            # Stocker le contenu pour ajustement de hauteur
+            self.content = content
+            
             # Charger le HTML dans HtmlFrame
             self.html_frame.load_html(html_content)
+            
+            # Ajuster la hauteur après chargement
+            self.after(100, self._adjust_html_height)
             
         except Exception as e:
             log.error(f"Erreur lors de l'affichage du contenu: {e}", exc_info=True)
@@ -668,6 +731,36 @@ class MarkdownViewer(ctk.CTkFrame):
                 self.html_frame.load_html(error_html)
             except:
                 pass
+    
+    def _adjust_html_height(self):
+        """Ajuste la hauteur du widget HTML selon le contenu (limite ~100 lignes = ~2500px max)."""
+        try:
+            if not hasattr(self, 'content') or not self.content:
+                return
+            
+            # Estimer la hauteur basée sur le contenu
+            # Compter les lignes dans le contenu (approximatif)
+            lines = self.content.count('\n') + 1
+            
+            # Limite à ~100 lignes
+            max_lines = 100
+            lines = min(lines, max_lines)
+            
+            # Environ 25px par ligne (hauteur de ligne + padding)
+            estimated_height = max(lines * 25, 100)
+            # Limite maximale à 2500px
+            estimated_height = min(estimated_height, 2500)
+            
+            # Configurer la hauteur du container
+            self.html_frame_container.configure(height=estimated_height)
+            self.html_frame_container.pack_configure(fill="x", expand=False)  # Ne pas expand, juste fill x
+            
+            # Mettre à jour le widget
+            self.update_idletasks()
+            
+            log.debug(f"📏 Hauteur HTML ajustée: {estimated_height}px pour {lines} lignes")
+        except Exception as e:
+            log.debug(f"Erreur ajustement hauteur HTML: {e}")
 
 
 class ThinkingWidget(ctk.CTkFrame):
@@ -733,9 +826,12 @@ class ThinkingWidget(ctk.CTkFrame):
             wrap="word",
             font=("Consolas", 10),
             height=100,
-            fg_color=COLORS.get("BG_WIDGET", "#2D2D30")
+            fg_color=COLORS.get("BG_WIDGET", "#2D2D30"),
+            corner_radius=0,      # Espacement minimal
+            border_spacing=0       # Texte touche les bords
         )
-        self.thinking_textbox.pack(fill="both", expand=True, padx=5, pady=0)
+        # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+        self.thinking_textbox.pack(fill="both", expand=True, padx=0, pady=1)
         self.thinking_textbox.configure(state="disabled")
         
         # Insérer le contenu combiné
@@ -797,8 +893,18 @@ class ResponseContainer(ctk.CTkScrollableFrame):
     """
     def __init__(self, master, **kwargs):
         # Ne pas limiter la hauteur, affichage en grand
-        super().__init__(master, fg_color="transparent", **kwargs)
+        # Configurer corner_radius=0 et border_width=0 pour réduire les paddings internes
+        super().__init__(
+            master, 
+            fg_color="transparent", 
+            corner_radius=0, 
+            border_width=0,
+            **kwargs
+        )
         self.widgets = []  # Liste des widgets ajoutés
+        
+        # Activer pack_propagate pour que le container s'adapte exactement au contenu (pas d'espace vide)
+        self.pack_propagate(True)
         
         # Monkey-patch CustomTkinter pour éviter l'erreur 'str' object has no attribute 'master'
         self._patch_customtkinter_mousewheel()
@@ -990,9 +1096,15 @@ class ResponseContainer(ctk.CTkScrollableFrame):
                 if widget.winfo_viewable():
                     widget.update_idletasks()
                     total_height += widget.winfo_reqheight()
-            # Le pack_propagate(True) devrait gérer ça, mais on force le recalcul
+            # Configurer la hauteur minimale pour éviter l'espace vide
             if total_height > 0:
+                # Utiliser pack_propagate(True) pour que le container s'adapte au contenu
+                self.pack_propagate(True)
                 self.update_idletasks()
+            else:
+                # Si pas de contenu, hauteur minimale très petite
+                self.pack_propagate(False)
+                self.configure(height=1)
         except Exception as e:
             log.debug(f"Erreur ajustement hauteur container: {e}")
     
@@ -1069,8 +1181,8 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             wrapped_lines = sum(len(line) // avg_chars_per_line + 1 for line in text.split('\n'))
             total_lines = max(lines, wrapped_lines)
             # Calculer la hauteur en fonction de la taille de police
-            line_height = max(int(font_size * 1.1), 16)  # Réduit à 1.1x pour moins d'espace
-            height = max(total_lines * line_height + 10, 40)  # Padding minimal
+            line_height = max(int(font_size * 1.0), 13)  # Harmonisé avec main_window.py
+            height = max(total_lines * line_height, 40)  # Pas de padding supplémentaire
         
         # Créer la textbox avec la taille de police configurée et SANS scrollbars ni scroll
         textbox = ctk.CTkTextbox(
@@ -1080,9 +1192,12 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             height=height,
             activate_scrollbars=False,  # Désactiver les scrollbars
             yscrollcommand=None,  # Désactiver le scroll vertical
-            xscrollcommand=None   # Désactiver le scroll horizontal
+            xscrollcommand=None,   # Désactiver le scroll horizontal
+            corner_radius=0,       # Espacement minimal
+            border_spacing=0       # Texte touche les bords
         )
-        textbox.pack(fill="x", padx=2, pady=2)
+        # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+        textbox.pack(fill="x", padx=0, pady=1)
         textbox.configure(state="disabled")
         
         textbox.configure(state="normal")
@@ -1132,8 +1247,8 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             if line_count > 0:
                 # Calculer la hauteur nécessaire (environ 1.1x la taille de police par ligne)
                 font_size = APP_SETTINGS.get("system_settings", {}).get("font_size", 12)
-                line_height = max(int(font_size * 1.1), 16)
-                new_height = max(line_count * line_height + 10, 40)
+                line_height = max(int(font_size * 1.0), 13)
+                new_height = max(line_count * line_height, 40)
                 textbox.configure(height=new_height)
                 textbox.update_idletasks()
         except Exception as e:
@@ -1147,7 +1262,8 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             is_markdown=is_markdown,
             on_open_in_tab=on_open_in_tab
         )
-        md_widget.pack(fill="x", padx=5, pady=0)
+        # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+        md_widget.pack(fill="x", padx=0, pady=1)
         self.widgets.append(md_widget)
         
         # Ajuster la hauteur du container après ajout du widget
@@ -1208,7 +1324,8 @@ class CollapsibleMarkdownWidget(ctk.CTkFrame):
             content=self.content,
             is_markdown=self.is_markdown
         )
-        self.md_widget.pack(fill="both", expand=True, padx=5, pady=5)
+        # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+        self.md_widget.pack(fill="both", expand=True, padx=0, pady=1)
         
         # Calculer la hauteur approximative
         lines = self.content.count('\n') + 1
@@ -1284,19 +1401,23 @@ class NonCollapsibleMarkdownWidget(ctk.CTkFrame):
             content=self.content,
             is_markdown=self.is_markdown
         )
-        self.md_widget.pack(fill="both", expand=True, padx=5, pady=0)
+        # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+        self.md_widget.pack(fill="both", expand=True, padx=0, pady=1)
         
         # Masquer la scrollbar du MarkdownViewer après création
         self.after(200, self._hide_markdown_viewer_scrollbar)
     
     def _adjust_markdown_widget_height(self):
-        """Ajuste la hauteur du widget markdown pour qu'il corresponde au contenu."""
+        """Ajuste la hauteur du widget markdown pour qu'il corresponde au contenu (limite ~100 lignes = ~2500px max)."""
         try:
             self.update_idletasks()
             # Calculer approximativement la hauteur basée sur le nombre de lignes
             lines = self.content.count('\n') + 1
+            # Limite à ~100 lignes
+            max_lines = 100
+            lines = min(lines, max_lines)
             # Estimer environ 25px par ligne pour le markdown
-            estimated_height = min(max(lines * 25, 150), 2000)
+            estimated_height = min(max(lines * 25, 100), 2500)  # Limite à 2500px (100 lignes)
             # Note: MarkdownViewer avec tkinterweb gère la taille automatiquement
             # On peut juste s'assurer que le container s'adapte
             self.update_idletasks()

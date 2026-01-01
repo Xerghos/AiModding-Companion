@@ -88,11 +88,21 @@ class MainPanel(ctk.CTkFrame):
         
         # Chat Principal - Approche hybride avec affichage mixte
         self.tab_view.add("Chat Principal")
-        chat1_container = ctk.CTkFrame(self.tab_view.tab("Chat Principal"), fg_color="transparent")
+        chat1_container = ctk.CTkFrame(
+            self.tab_view.tab("Chat Principal"), 
+            fg_color="transparent",
+            corner_radius=0,
+            border_width=0
+        )
         chat1_container.pack(fill="both", expand=True)
         
         # ScrollableFrame principal qui contiendra toutes les textboxes et widgets
-        self.chat1_scroll = ctk.CTkScrollableFrame(chat1_container, fg_color="transparent")
+        self.chat1_scroll = ctk.CTkScrollableFrame(
+            chat1_container, 
+            fg_color="transparent",
+            corner_radius=0,
+            border_width=0
+        )
         self.chat1_scroll.pack(fill="both", expand=True)
         
         # Container pour widgets Markdown (sera ajouté dynamiquement)
@@ -273,12 +283,13 @@ class MainPanel(ctk.CTkFrame):
                 widgets_container,
                 content=thinking_content
             )
-            thinking_widget.pack(fill="x", padx=5, pady=0)
+            # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+            thinking_widget.pack(fill="x", padx=0, pady=1)
         
         # Créer le ResponseContainer pour la réponse finale
         if response_parts:
             response_container = ResponseContainer(widgets_container)
-            response_container.pack(fill="both", expand=True, padx=5, pady=0)
+            response_container.pack(fill="both", expand=True, padx=0, pady=0)
             
             # Ajouter tous les éléments de la réponse au container
             for part_type, part_content in response_parts:

@@ -1008,8 +1008,8 @@ class Worker(threading.Thread):
                 if native_match:
                     raw_cmd = native_match.group(1).strip()
                     if '"name": "..."' not in raw_cmd and "'name': '...'" not in raw_cmd:
-                        log.info(f"🔧 Outil détecté (fallback texte) : {raw_cmd[:50]}...")
-                        self.task_queue.put({'action': 'command', 'payload': {'command': raw_cmd}})
+                            log.info(f"🔧 Outil détecté (fallback texte) : {raw_cmd[:50]}...")
+                            self.task_queue.put({'action': 'command', 'payload': {'command': raw_cmd}})
                 
                 if not full_text.strip() and not has_received_content:
                     log.warning("⚠️ Réponse IA vide reçue (aucun contenu dans le stream).")

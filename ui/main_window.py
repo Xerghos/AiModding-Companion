@@ -130,11 +130,21 @@ class GeminiApp:
         
         # Chat Principal - Approche hybride avec affichage mixte
         self.tab_view.add("Chat Principal")
-        chat1_container = ctk.CTkFrame(self.tab_view.tab("Chat Principal"), fg_color="transparent")
+        chat1_container = ctk.CTkFrame(
+            self.tab_view.tab("Chat Principal"), 
+            fg_color="transparent",
+            corner_radius=0,
+            border_width=0
+        )
         chat1_container.pack(fill="both", expand=True)
         
         # ScrollableFrame principal qui contiendra toutes les textboxes et widgets
-        self.chat1_scroll = ctk.CTkScrollableFrame(chat1_container, fg_color="transparent")
+        self.chat1_scroll = ctk.CTkScrollableFrame(
+            chat1_container, 
+            fg_color="transparent",
+            corner_radius=0,
+            border_width=0
+        )
         self.chat1_scroll.pack(fill="both", expand=True)
         
         # Container pour widgets Markdown (sera ajouté dynamiquement)
@@ -142,11 +152,21 @@ class GeminiApp:
         
         # Chat Secondaire - Approche hybride avec affichage mixte
         self.tab_view.add("Chat Secondaire")
-        chat2_container = ctk.CTkFrame(self.tab_view.tab("Chat Secondaire"), fg_color="transparent")
+        chat2_container = ctk.CTkFrame(
+            self.tab_view.tab("Chat Secondaire"), 
+            fg_color="transparent",
+            corner_radius=0,
+            border_width=0
+        )
         chat2_container.pack(fill="both", expand=True)
         
         # ScrollableFrame principal qui contiendra toutes les textboxes et widgets
-        self.chat2_scroll = ctk.CTkScrollableFrame(chat2_container, fg_color="transparent")
+        self.chat2_scroll = ctk.CTkScrollableFrame(
+            chat2_container, 
+            fg_color="transparent",
+            corner_radius=0,
+            border_width=0
+        )
         self.chat2_scroll.pack(fill="both", expand=True)
         
         # Container pour widgets Markdown (sera ajouté dynamiquement)
@@ -515,8 +535,8 @@ class GeminiApp:
             wrapped_lines = sum(len(line) // avg_chars_per_line + 1 for line in content.split('\n'))
             total_lines = max(lines, wrapped_lines)
             # Calculer la hauteur en fonction de la taille de police
-            line_height = max(int(font_size * 1.1), 16)  # Réduit à 1.1x pour moins d'espace
-            estimated_height = max(total_lines * line_height + 10, 40)  # Padding minimal
+            line_height = max(int(font_size * 1.0), 13)  # Harmonisé avec widgets.py
+            estimated_height = max(total_lines * line_height, 40)  # Pas de padding supplémentaire
         else:
             estimated_height = 40
         
@@ -528,9 +548,12 @@ class GeminiApp:
             height=estimated_height,
             activate_scrollbars=False,  # Désactiver les scrollbars
             yscrollcommand=None,  # Désactiver le scroll vertical
-            xscrollcommand=None   # Désactiver le scroll horizontal
+            xscrollcommand=None,   # Désactiver le scroll horizontal
+            corner_radius=0,      # Espacement minimal
+            border_spacing=0       # Texte touche les bords
         )
-        textbox.pack(fill="x", padx=2, pady=2)
+        # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+        textbox.pack(fill="x", padx=0, pady=1)
         textbox.configure(state="disabled")
         self._configure_chat_tags(textbox)
         
@@ -584,12 +607,15 @@ class GeminiApp:
                 widgets_container,
                 content=thinking_content
             )
-            thinking_widget.pack(fill="x", padx=5, pady=0)
+            # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+            thinking_widget.pack(fill="x", padx=0, pady=1)
         
         # Créer le ResponseContainer pour la réponse finale
         if response_parts:
             response_container = ResponseContainer(widgets_container)
-            response_container.pack(fill="both", expand=True, padx=5, pady=0)
+            # Utiliser fill="x" et expand=False pour éviter l'expansion verticale inutile
+            # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+            response_container.pack(fill="x", expand=False, padx=0, pady=1)
             
             # Ajouter tous les éléments de la réponse au container
             for part_type, part_content in response_parts:
@@ -606,6 +632,7 @@ class GeminiApp:
                     )
         elif not thinking_content:
             # Si pas de thinking et pas de réponse structurée, afficher le texte simple
+            # Le pady=1 est déjà géré dans _create_message_textbox.pack()
             textbox = self._create_message_textbox(widgets_container, tag, text)
             textbox.configure(state="normal")
             textbox.insert("1.0", text + "\n\n", tag)
@@ -728,7 +755,8 @@ class GeminiApp:
                                 self.chat1_widgets_container,
                                 content=thinking_content
                             )
-                            thinking_widget.pack(fill="x", padx=5, pady=0)
+                            # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+                            thinking_widget.pack(fill="x", padx=0, pady=1)
                             if hasattr(self, '_thinking_buffer'):
                                 del self._thinking_buffer
                         except Exception as e:
@@ -751,9 +779,43 @@ class GeminiApp:
                         try:
                             # Nettoyer le buffer
                             streamed_text = stream_buffer_content.replace('\\n\\n', '\n\n').replace('\\n', '\n')
+                            
+                            # CRITIQUE: Filtrer les pensées du streamed_text si elles sont présentes
+                            # (même si _thinking_buffer a été affiché, certaines pensées peuvent être dans streamed_text)
+                            if _is_thinking_content(streamed_text):
+                                # Le contenu entier est du thinking, ne pas l'afficher dans la réponse
+                                log.info(f"🔵 Streamed text contient uniquement du thinking, filtré de la réponse")
+                                streamed_text = ""
+                            else:
+                                # Vérifier si le texte contient des blocs de thinking mélangés
+                                # IMPORTANT: Toujours utiliser _group_thinking_and_response pour filtrer les pensées
+                                thinking_content_filtered, response_parts = _group_thinking_and_response(streamed_text)
+                                if thinking_content_filtered:
+                                    # Reconstruire streamed_text sans les pensées (filtrer tous les types sauf thinking)
+                                    filtered_parts = [p[1] for p in response_parts if p[0] != 'thinking']
+                                    if filtered_parts:
+                                        streamed_text = "\n\n".join(filtered_parts)
+                                    else:
+                                        # Si après filtrage il ne reste rien, c'est que tout était du thinking
+                                        streamed_text = ""
+                                    log.info(f"🔵 Pensées filtrées du streamed_text ({len(thinking_content_filtered)} chars), réponse restante: {len(streamed_text)} chars")
+                                elif response_parts:
+                                    # S'il y a des response_parts mais pas de thinking_content_filtered,
+                                    # reconstruire quand même pour être sûr (au cas où _parse_mixed_content a mal classé)
+                                    filtered_parts = [p[1] for p in response_parts if p[0] != 'thinking']
+                                    if filtered_parts:
+                                        streamed_text = "\n\n".join(filtered_parts)
+                            
+                            if not streamed_text or not streamed_text.strip():
+                                log.info(f"ℹ️ Streamed text vide après filtrage des pensées - réponse finale vide")
+                                # Nettoyer le buffer et sortir
+                                if hasattr(self, '_stream_buffer'):
+                                    del self._stream_buffer
+                                return
+                            
                             log.info(f"🟢 Displaying response container: {len(streamed_text)} chars, preview: {streamed_text[:200]}")
                             
-                            # IMPORTANT: Le thinking a déjà été séparé, donc on ne doit PAS utiliser _parse_mixed_content
+                            # IMPORTANT: Le thinking a déjà été séparé et filtré, donc on ne doit PAS utiliser _parse_mixed_content
                             # qui pourrait détecter incorrectement le texte comme du thinking.
                             # On parse seulement pour détecter Markdown vs texte simple.
                             
@@ -764,7 +826,9 @@ class GeminiApp:
                             # Créer le ResponseContainer pour la réponse finale
                             # Pas de hauteur limitée, affichage en grand, scrollbar masquée
                             response_container = ResponseContainer(self.chat1_widgets_container)
-                            response_container.pack(fill="both", expand=True, padx=5, pady=0)
+                            # Utiliser fill="x" et expand=False pour éviter l'expansion verticale inutile
+                            # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
+                            response_container.pack(fill="x", expand=False, padx=0, pady=1)
                             
                             if is_markdown:
                                 # Ajouter un widget Markdown
