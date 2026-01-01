@@ -417,7 +417,7 @@ class GeminiApp:
         # Créer une nouvelle textbox pour le message utilisateur
         textbox = self._create_message_textbox(widgets_container, "user")
         textbox.configure(state="normal")
-        textbox.insert("1.0", f"Vous: {msg}\n\n", "user")
+        textbox.insert("1.0", f"Vous: {msg}", "user")
         textbox.configure(state="disabled")
         
         # Scroll vers le bas
@@ -536,9 +536,9 @@ class GeminiApp:
             total_lines = max(lines, wrapped_lines)
             # Calculer la hauteur en fonction de la taille de police
             line_height = max(int(font_size * 1.0), 13)  # Harmonisé avec widgets.py
-            estimated_height = max(total_lines * line_height, 40)  # Pas de padding supplémentaire
+            estimated_height = total_lines * line_height  # Pas de padding supplémentaire ni de minimum
         else:
-            estimated_height = 40
+            estimated_height = 20  # Hauteur minimale très réduite pour les textboxes vides
         
         # Créer la textbox avec la taille de police configurée et SANS scrollbars ni scroll
         textbox = ctk.CTkTextbox(
@@ -557,33 +557,34 @@ class GeminiApp:
         textbox.configure(state="disabled")
         self._configure_chat_tags(textbox)
         
-        # Désactiver complètement le scroll avec la molette
-        def disable_mousewheel():
-            try:
-                # Bind sur le textbox lui-même pour intercepter la molette
-                def stop_scroll(event):
-                    return "break"
-                
-                textbox.bind("<MouseWheel>", stop_scroll)
-                textbox.bind("<Button-4>", stop_scroll)
-                textbox.bind("<Button-5>", stop_scroll)
-                
-                # Aussi sur le widget Text interne si accessible
-                if hasattr(textbox, '_textbox'):
-                    text_widget = textbox._textbox
-                    text_widget.bind("<MouseWheel>", stop_scroll)
-                    text_widget.bind("<Button-4>", stop_scroll)
-                    text_widget.bind("<Button-5>", stop_scroll)
-            except Exception as e:
-                log.debug(f"Erreur désactivation molette: {e}")
-        
-        # Désactiver la molette après création
-        container.after(10, disable_mousewheel)
-        container.after(50, disable_mousewheel)
-        
         return textbox
     
-    def _log_chat(self, widget, text, tag):
+    def _adjust_textbox_height(self, textbox):
+        """Ajuste la hauteur d'une textbox pour qu'elle corresponde exactement au contenu."""
+        try:
+            textbox.update_idletasks()
+            # Obtenir le nombre de lignes réelles dans la textbox
+            line_count = int(textbox.index("end-1c").split('.')[0])
+            if line_count > 0:
+                # Calculer la hauteur nécessaire
+                font_size = APP_SETTINGS.get("system_settings", {}).get("font_size", 12)
+                line_height = max(int(font_size * 1.0), 13)
+                new_height = line_count * line_height  # Pas de minimum
+                textbox.configure(height=new_height)
+                textbox.update_idletasks()
+        except Exception as e:
+            log.debug(f"Erreur ajustement hauteur textbox: {e}")
+    
+    def _log_chat(self, widget, text, tag, thought_content=None):
+        """
+        Affiche un message dans le chat.
+        
+        Args:
+            widget: Widget parent (None pour chat principal)
+            text: Contenu principal du message
+            tag: Tag pour le style (user, gemini, etc.)
+            thought_content: Contenu de pensée optionnel (si fourni, utilisé directement au lieu de la regex)
+        """
         # Nettoyer les séquences \n\n échappées
         text = text.replace('\\n\\n', '\n\n').replace('\\n', '\n')
         
@@ -598,8 +599,15 @@ class GeminiApp:
             scroll_container = self.chat1_scroll
             widgets_container = self.chat1_widgets_container
         
-        # Séparer thinking et réponse finale
-        thinking_content, response_parts = _group_thinking_and_response(text)
+        # Si thought_content est fourni explicitement, l'utiliser directement
+        # Sinon, utiliser la regex comme fallback pour compatibilité historique
+        if thought_content is not None:
+            thinking_content = thought_content
+            # Si thought est fourni, le texte principal ne contient que la réponse
+            response_parts = _group_thinking_and_response(text) if text.strip() else []
+        else:
+            # Fallback : utiliser la regex pour séparer thinking et réponse
+            thinking_content, response_parts = _group_thinking_and_response(text)
         
         # Afficher le thinking (un seul widget regroupé, collapsed par défaut)
         if thinking_content:
@@ -635,8 +643,10 @@ class GeminiApp:
             # Le pady=1 est déjà géré dans _create_message_textbox.pack()
             textbox = self._create_message_textbox(widgets_container, tag, text)
             textbox.configure(state="normal")
-            textbox.insert("1.0", text + "\n\n", tag)
+            textbox.insert("1.0", text, tag)
             textbox.configure(state="disabled")
+            # Ajuster la hauteur après insertion du texte
+            self.after(10, lambda: self._adjust_textbox_height(textbox))
         
         # Scroll vers le bas
         def scroll_to_bottom():
@@ -700,8 +710,12 @@ class GeminiApp:
 
                 if msg_type == 'chat_response':
                     self._stop_animation()
-                    # Utiliser le container directement (pas de widget spécifique)
-                    self._log_chat(None, f"🤖 {res['text']}", "gemini")
+                    # Le message système (toolcall) doit être affiché même pendant le stream
+                    # Nouveau format structuré : utiliser content et thought séparément
+                    content = res.get('content', res.get('text', ''))  # Fallback sur 'text' pour compatibilité
+                    thought = res.get('thought', None)
+                    # Utiliser _log_chat qui gère correctement la création des widgets
+                    self._log_chat(None, content, "gemini", thought_content=thought)
                 
                 elif msg_type == 'ui_stream_start':
                     # Réinitialiser les buffers pour le nouveau stream
@@ -780,31 +794,32 @@ class GeminiApp:
                             # Nettoyer le buffer
                             streamed_text = stream_buffer_content.replace('\\n\\n', '\n\n').replace('\\n', '\n')
                             
-                            # CRITIQUE: Filtrer les pensées du streamed_text si elles sont présentes
-                            # (même si _thinking_buffer a été affiché, certaines pensées peuvent être dans streamed_text)
-                            if _is_thinking_content(streamed_text):
-                                # Le contenu entier est du thinking, ne pas l'afficher dans la réponse
-                                log.info(f"🔵 Streamed text contient uniquement du thinking, filtré de la réponse")
-                                streamed_text = ""
-                            else:
-                                # Vérifier si le texte contient des blocs de thinking mélangés
-                                # IMPORTANT: Toujours utiliser _group_thinking_and_response pour filtrer les pensées
-                                thinking_content_filtered, response_parts = _group_thinking_and_response(streamed_text)
-                                if thinking_content_filtered:
-                                    # Reconstruire streamed_text sans les pensées (filtrer tous les types sauf thinking)
-                                    filtered_parts = [p[1] for p in response_parts if p[0] != 'thinking']
-                                    if filtered_parts:
-                                        streamed_text = "\n\n".join(filtered_parts)
-                                    else:
-                                        # Si après filtrage il ne reste rien, c'est que tout était du thinking
-                                        streamed_text = ""
+                            # CRITIQUE: Le thinking a déjà été séparé dans _thinking_buffer et affiché séparément
+                            # Le streamed_text ne devrait contenir QUE la réponse finale, pas de thinking
+                            # Mais on vérifie quand même pour filtrer les pensées qui pourraient s'y être glissées
+                            # IMPORTANT: Ne PAS utiliser _is_thinking_content() directement car elle peut être trop agressive
+                            # et supprimer toute la réponse si elle commence par un pattern de thinking
+                            
+                            # Utiliser _group_thinking_and_response pour séparer proprement thinking et réponse
+                            thinking_content_filtered, response_parts = _group_thinking_and_response(streamed_text)
+                            
+                            if thinking_content_filtered:
+                                # Reconstruire streamed_text sans les pensées (filtrer tous les types sauf thinking)
+                                filtered_parts = [p[1] for p in response_parts if p[0] != 'thinking']
+                                if filtered_parts:
+                                    streamed_text = "\n\n".join(filtered_parts)
                                     log.info(f"🔵 Pensées filtrées du streamed_text ({len(thinking_content_filtered)} chars), réponse restante: {len(streamed_text)} chars")
-                                elif response_parts:
-                                    # S'il y a des response_parts mais pas de thinking_content_filtered,
-                                    # reconstruire quand même pour être sûr (au cas où _parse_mixed_content a mal classé)
-                                    filtered_parts = [p[1] for p in response_parts if p[0] != 'thinking']
-                                    if filtered_parts:
-                                        streamed_text = "\n\n".join(filtered_parts)
+                                else:
+                                    # Si après filtrage il ne reste rien, c'est que tout était du thinking
+                                    streamed_text = ""
+                                    log.info(f"🔵 Streamed text contient uniquement du thinking, filtré de la réponse")
+                            elif response_parts:
+                                # S'il y a des response_parts mais pas de thinking_content_filtered,
+                                # reconstruire quand même pour être sûr (au cas où _parse_mixed_content a mal classé)
+                                filtered_parts = [p[1] for p in response_parts if p[0] != 'thinking']
+                                if filtered_parts:
+                                    streamed_text = "\n\n".join(filtered_parts)
+                            # Si pas de response_parts, garder streamed_text tel quel (c'est probablement de la réponse pure)
                             
                             if not streamed_text or not streamed_text.strip():
                                 log.info(f"ℹ️ Streamed text vide après filtrage des pensées - réponse finale vide")
@@ -851,8 +866,10 @@ class GeminiApp:
                             if hasattr(self, '_stream_buffer') and self._stream_buffer:
                                 textbox = self._create_message_textbox(self.chat1_widgets_container, "gemini", self._stream_buffer)
                                 textbox.configure(state="normal")
-                                textbox.insert("1.0", f"🤖 {self._stream_buffer}\n\n", "gemini")
+                                textbox.insert("1.0", f"🤖 {self._stream_buffer}", "gemini")
                                 textbox.configure(state="disabled")
+                                # Ajuster la hauteur après insertion du texte
+                                self.after(10, lambda: self._adjust_textbox_height(textbox))
                                 del self._stream_buffer
                     elif hasattr(self, '_stream_buffer'):
                         # Buffer vide ou None, mais log pour debug

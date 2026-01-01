@@ -6,6 +6,33 @@ import time
 import re # Nécessaire pour la recherche/remplacement
 import os
 
+# --- MONKEYPATCH CTkScrollableFrame (Fix AttributeError: 'str' object has no attribute 'master') ---
+from customtkinter.windows.widgets.ctk_scrollable_frame import CTkScrollableFrame
+
+def _check_if_master_is_canvas_patched(self, widget):
+    try:
+        if widget == self._parent_canvas:
+            return True
+        
+        # Si le widget est une chaîne (chemin Tkinter), essayer de récupérer l'objet
+        if isinstance(widget, str):
+            try:
+                # On utilise nametowidget sur le canvas parent ou root
+                widget = self._parent_canvas.nametowidget(widget)
+            except Exception:
+                return False
+
+        if hasattr(widget, 'master') and widget.master is not None:
+            return self.check_if_master_is_canvas(widget.master)
+        else:
+            return False
+    except Exception:
+        return False
+
+# Appliquer le patch
+CTkScrollableFrame.check_if_master_is_canvas = _check_if_master_is_canvas_patched
+# ------------------------------------------------------------------------------------------------
+
 # Import pour récupérer la taille de police depuis les settings
 try:
     from config.settings import APP_SETTINGS
@@ -747,7 +774,7 @@ class MarkdownViewer(ctk.CTkFrame):
             lines = min(lines, max_lines)
             
             # Environ 25px par ligne (hauteur de ligne + padding)
-            estimated_height = max(lines * 25, 100)
+            estimated_height = lines * 25  # Pas de minimum
             # Limite maximale à 2500px
             estimated_height = min(estimated_height, 2500)
             
@@ -867,7 +894,7 @@ class ThinkingWidget(ctk.CTkFrame):
             self.thinking_textbox.update_idletasks()
             line_count = int(self.thinking_textbox.index("end-1c").split('.')[0])
             if line_count > 0:
-                estimated_height = min(max(line_count * 18, 80), 400)
+                estimated_height = min(line_count * 18, 400)  # Pas de minimum
                 self.thinking_textbox.configure(height=estimated_height)
                 self.thinking_textbox.update_idletasks()
         except Exception as e:
@@ -885,14 +912,13 @@ class ThinkingWidget(ctk.CTkFrame):
             self.content_frame.pack_forget()
 
 
-class ResponseContainer(ctk.CTkScrollableFrame):
+class ResponseContainer(ctk.CTkFrame):
     """
-    Container scrollable pour regrouper toutes les textboxes et widgets md de la réponse finale.
-    Permet le scroll indépendant de la réponse finale.
-    Scrollbar masquée mais fonctionnelle pour les longues réponses.
+    Container simple pour regrouper toutes les textboxes et widgets md de la réponse finale.
+    Transformé en CTkFrame simple (au lieu de CTkScrollableFrame) pour éviter l'espace vide de 200px.
+    Le scroll est géré par le parent chat1_scroll qui est déjà un CTkScrollableFrame.
     """
     def __init__(self, master, **kwargs):
-        # Ne pas limiter la hauteur, affichage en grand
         # Configurer corner_radius=0 et border_width=0 pour réduire les paddings internes
         super().__init__(
             master, 
@@ -903,271 +929,8 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         )
         self.widgets = []  # Liste des widgets ajoutés
         
-        # Activer pack_propagate pour que le container s'adapte exactement au contenu (pas d'espace vide)
+        # Activer pack_propagate pour que le Frame s'adapte exactement au contenu
         self.pack_propagate(True)
-        
-        # Monkey-patch CustomTkinter pour éviter l'erreur 'str' object has no attribute 'master'
-        self._patch_customtkinter_mousewheel()
-        
-        # Intercepter les événements de molette AVANT CustomTkinter pour éviter les erreurs
-        # Utiliser bind_class pour intercepter au niveau de la classe
-        self._intercept_mousewheel_events()
-        
-        # Masquer la scrollbar mais garder le scroll fonctionnel
-        # CTkScrollableFrame crée un canvas parent avec une scrollbar
-        # On accède au canvas parent après que le widget soit créé et packé
-        self.after(200, self._hide_scrollbar)
-        # Réessayer après un délai plus long au cas où
-        self.after(500, self._hide_scrollbar)
-    
-    def _patch_customtkinter_mousewheel(self):
-        """Monkey-patch CustomTkinter pour éviter l'erreur 'str' object has no attribute 'master'."""
-        try:
-            import customtkinter.windows.widgets.ctk_scrollable_frame as ctk_sf
-            
-            # Sauvegarder la méthode originale si pas déjà patchée
-            if not hasattr(ctk_sf.CTkScrollableFrame, '_check_if_master_is_canvas_original'):
-                ctk_sf.CTkScrollableFrame._check_if_master_is_canvas_original = ctk_sf.CTkScrollableFrame.check_if_master_is_canvas
-                
-                def safe_check_if_master_is_canvas(self, widget):
-                    """Version sécurisée qui gère les widgets invalides."""
-                    try:
-                        # Vérifier si widget est invalide (chaîne, None, ou sans master)
-                        if widget is None:
-                            return False
-                        if isinstance(widget, str):
-                            return False
-                        if not hasattr(widget, 'master'):
-                            return False
-                        # Appeler la méthode originale
-                        return ctk_sf.CTkScrollableFrame._check_if_master_is_canvas_original(self, widget)
-                    except (AttributeError, TypeError, ValueError):
-                        return False
-                
-                # Remplacer la méthode
-                ctk_sf.CTkScrollableFrame.check_if_master_is_canvas = safe_check_if_master_is_canvas
-            
-            # Aussi patcher _mouse_wheel_all pour intercepter avant le traitement
-            if not hasattr(ctk_sf.CTkScrollableFrame, '_mouse_wheel_all_original'):
-                ctk_sf.CTkScrollableFrame._mouse_wheel_all_original = ctk_sf.CTkScrollableFrame._mouse_wheel_all
-                
-                def safe_mouse_wheel_all(self, event):
-                    """Version sécurisée de _mouse_wheel_all qui vérifie event.widget."""
-                    try:
-                        # Vérifier si event.widget est invalide avant de continuer
-                        if not hasattr(event, 'widget'):
-                            return
-                        
-                        widget = event.widget
-                        # Vérifier si widget est une chaîne ou None
-                        if widget is None:
-                            return
-                        if isinstance(widget, str):
-                            return
-                        if not hasattr(widget, 'master'):
-                            return
-                        
-                        # Widget valide, appeler la méthode originale
-                        return ctk_sf.CTkScrollableFrame._mouse_wheel_all_original(self, event)
-                    except (AttributeError, TypeError, ValueError):
-                        # Erreur, ne pas traiter
-                        return
-                
-                # Remplacer la méthode
-                ctk_sf.CTkScrollableFrame._mouse_wheel_all = safe_mouse_wheel_all
-        except Exception as e:
-            # Si le patch échoue, on continue sans
-            import logging
-            logging.getLogger("ui.widgets").debug(f"Échec patch CustomTkinter: {e}")
-    
-    def _intercept_mousewheel_events(self):
-        """Intercepte les événements de molette pour éviter les erreurs CustomTkinter et gère le scroll."""
-        def safe_mousewheel_handler(event):
-            """Handler sécurisé qui gère le scroll et intercepte les événements problématiques."""
-            try:
-                # Vérifier si event.widget est problématique (chaîne ou sans master)
-                widget_invalid = False
-                if hasattr(event, 'widget'):
-                    widget = event.widget
-                    if isinstance(widget, str) or not hasattr(widget, 'master'):
-                        widget_invalid = True
-                
-                # Si le widget est invalide, intercepter immédiatement
-                if widget_invalid:
-                    return "break"
-                
-                # Sinon, gérer le scroll nous-mêmes pour éviter que CustomTkinter ne le fasse
-                # et cause l'erreur
-                if hasattr(self, '_parent_canvas'):
-                    canvas = self._parent_canvas
-                    try:
-                        # Scroll avec la molette (Windows/Linux)
-                        if hasattr(event, 'delta') and event.delta:
-                            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                        # Scroll avec la molette (Linux avec Button-4/5)
-                        elif hasattr(event, 'num'):
-                            if event.num == 4:
-                                canvas.yview_scroll(-1, "units")
-                            elif event.num == 5:
-                                canvas.yview_scroll(1, "units")
-                    except:
-                        pass
-                
-                # Intercepter pour empêcher CustomTkinter de traiter l'événement
-                return "break"
-            except:
-                return "break"
-        
-        # Intercepter au niveau de la fenêtre racine AVANT CustomTkinter (priorité maximale)
-        def bind_at_root():
-            try:
-                root = self.winfo_toplevel()
-                if root:
-                    # Bind au niveau du root pour intercepter TOUS les événements avant CustomTkinter
-                    root.bind_class("CTkScrollableFrame", "<MouseWheel>", safe_mousewheel_handler, add="+")
-                    root.bind_class("CTkScrollableFrame", "<Button-4>", safe_mousewheel_handler, add="+")
-                    root.bind_class("CTkScrollableFrame", "<Button-5>", safe_mousewheel_handler, add="+")
-            except:
-                pass
-        
-        # Essayer immédiatement et après délais
-        try:
-            bind_at_root()
-        except:
-            pass
-        self.after(10, bind_at_root)
-        self.after(100, bind_at_root)
-        self.after(500, bind_at_root)
-        
-        # Utiliser bind_class pour intercepter au niveau de la classe avant CustomTkinter
-        # Cela intercepte TOUS les événements de molette sur tous les CTkScrollableFrame
-        try:
-            self.bind_class("CTkScrollableFrame", "<MouseWheel>", safe_mousewheel_handler, add="+")
-            self.bind_class("CTkScrollableFrame", "<Button-4>", safe_mousewheel_handler, add="+")
-            self.bind_class("CTkScrollableFrame", "<Button-5>", safe_mousewheel_handler, add="+")
-        except:
-            # Fallback si bind_class ne fonctionne pas
-            self.bind("<MouseWheel>", safe_mousewheel_handler, add="+")
-            self.bind("<Button-4>", safe_mousewheel_handler, add="+")
-            self.bind("<Button-5>", safe_mousewheel_handler, add="+")
-        
-        # Aussi bind sur tous les enfants après création
-        def bind_children():
-            try:
-                for child in self.winfo_children():
-                    if hasattr(child, 'bind'):
-                        child.bind("<MouseWheel>", safe_mousewheel_handler, add="+")
-                        child.bind("<Button-4>", safe_mousewheel_handler, add="+")
-                        child.bind("<Button-5>", safe_mousewheel_handler, add="+")
-            except:
-                pass
-        
-        # Bind les enfants après un court délai
-        self.after(50, bind_children)
-        self.after(200, bind_children)
-        self.after(500, bind_children)
-        
-        # Bind récursif sur tous les descendants pour être exhaustif
-        def bind_all_descendants():
-            try:
-                def bind_recursive(widget):
-                    try:
-                        if hasattr(widget, 'bind'):
-                            widget.bind("<MouseWheel>", safe_mousewheel_handler, add="+")
-                            widget.bind("<Button-4>", safe_mousewheel_handler, add="+")
-                            widget.bind("<Button-5>", safe_mousewheel_handler, add="+")
-                        for child in widget.winfo_children():
-                            bind_recursive(child)
-                    except:
-                        pass
-                
-                bind_recursive(self)
-            except:
-                pass
-        
-        self.after(1000, bind_all_descendants)
-    
-    def _adjust_container_height(self):
-        """Ajuste la hauteur du container pour qu'elle corresponde exactement au contenu."""
-        try:
-            self.update_idletasks()
-            total_height = 0
-            for widget in self.widgets:
-                if widget.winfo_viewable():
-                    widget.update_idletasks()
-                    total_height += widget.winfo_reqheight()
-            # Configurer la hauteur minimale pour éviter l'espace vide
-            if total_height > 0:
-                # Utiliser pack_propagate(True) pour que le container s'adapte au contenu
-                self.pack_propagate(True)
-                self.update_idletasks()
-            else:
-                # Si pas de contenu, hauteur minimale très petite
-                self.pack_propagate(False)
-                self.configure(height=1)
-        except Exception as e:
-            log.debug(f"Erreur ajustement hauteur container: {e}")
-    
-    def _hide_scrollbar(self):
-        """Masque la scrollbar du CTkScrollableFrame tout en gardant le scroll fonctionnel."""
-        try:
-            # Accéder au canvas parent qui contient la scrollbar
-            if hasattr(self, '_parent_canvas'):
-                canvas = self._parent_canvas
-                # Dans CustomTkinter, la scrollbar est généralement dans le même parent que le canvas
-                parent = canvas.master
-                
-                # Chercher la scrollbar dans les enfants du parent du canvas
-                for child in parent.winfo_children():
-                    # La scrollbar peut être un CTkScrollbar ou un Scrollbar tkinter
-                    if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
-                        # Masquer complètement la scrollbar
-                        child.place_forget()
-                        child.pack_forget()
-                        child.grid_forget()
-                        try:
-                            child.configure(width=0)  # Largeur à 0
-                        except:
-                            pass
-                        break
-                
-                # Aussi chercher dans les enfants directs du canvas
-                for child in canvas.winfo_children():
-                    if isinstance(child, (tk.Scrollbar, ctk.CTkScrollbar)):
-                        child.place_forget()
-                        child.pack_forget()
-                        child.grid_forget()
-                        try:
-                            child.configure(width=0)
-                        except:
-                            pass
-                        break
-                
-                # S'assurer que le scroll avec la molette fonctionne
-                def on_mousewheel(event):
-                    try:
-                        if hasattr(self, '_parent_canvas'):
-                            canvas = self._parent_canvas
-                            # Scroll avec la molette (Windows/Linux)
-                            if event.delta:
-                                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                            # Scroll avec la molette (Linux avec Button-4/5)
-                            elif event.num == 4:
-                                canvas.yview_scroll(-1, "units")
-                            elif event.num == 5:
-                                canvas.yview_scroll(1, "units")
-                    except Exception:
-                        pass
-                
-                # Bind la molette sur le canvas et le container
-                canvas.bind("<MouseWheel>", on_mousewheel)
-                canvas.bind("<Button-4>", on_mousewheel)
-                canvas.bind("<Button-5>", on_mousewheel)
-                self.bind("<MouseWheel>", on_mousewheel)
-                self.bind("<Button-4>", on_mousewheel)
-                self.bind("<Button-5>", on_mousewheel)
-        except Exception as e:
-            log.debug(f"Impossible de masquer la scrollbar: {e}")
     
     def add_textbox(self, text, tag="gemini", height=None):
         """Ajoute une textbox au container. Hauteur adaptative, pas de scrollbar."""
@@ -1182,7 +945,7 @@ class ResponseContainer(ctk.CTkScrollableFrame):
             total_lines = max(lines, wrapped_lines)
             # Calculer la hauteur en fonction de la taille de police
             line_height = max(int(font_size * 1.0), 13)  # Harmonisé avec main_window.py
-            height = max(total_lines * line_height, 40)  # Pas de padding supplémentaire
+            height = total_lines * line_height  # Pas de padding supplémentaire ni de minimum
         
         # Créer la textbox avec la taille de police configurée et SANS scrollbars ni scroll
         textbox = ctk.CTkTextbox(
@@ -1201,40 +964,15 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         textbox.configure(state="disabled")
         
         textbox.configure(state="normal")
-        textbox.insert("1.0", text + "\n\n", tag)
+        textbox.insert("1.0", text, tag)
         textbox.configure(state="disabled")
         
         # Ajuster la hauteur après insertion pour être plus précis
         self.after(10, lambda: self._adjust_textbox_height(textbox))
         
-        # Désactiver complètement le scroll avec la molette
-        def disable_mousewheel():
-            try:
-                # Bind sur le textbox lui-même pour intercepter la molette
-                def stop_scroll(event):
-                    return "break"
-                
-                textbox.bind("<MouseWheel>", stop_scroll)
-                textbox.bind("<Button-4>", stop_scroll)
-                textbox.bind("<Button-5>", stop_scroll)
-                
-                # Aussi sur le widget Text interne si accessible
-                if hasattr(textbox, '_textbox'):
-                    text_widget = textbox._textbox
-                    text_widget.bind("<MouseWheel>", stop_scroll)
-                    text_widget.bind("<Button-4>", stop_scroll)
-                    text_widget.bind("<Button-5>", stop_scroll)
-            except Exception as e:
-                log.debug(f"Erreur désactivation molette: {e}")
-        
-        # Désactiver la molette après création
-        self.after(10, disable_mousewheel)
-        self.after(50, disable_mousewheel)
-        
         self.widgets.append(textbox)
         
         # Ajuster la hauteur du container après ajout du widget
-        self.after(50, self._adjust_container_height)
         
         return textbox
     
@@ -1248,7 +986,7 @@ class ResponseContainer(ctk.CTkScrollableFrame):
                 # Calculer la hauteur nécessaire (environ 1.1x la taille de police par ligne)
                 font_size = APP_SETTINGS.get("system_settings", {}).get("font_size", 12)
                 line_height = max(int(font_size * 1.0), 13)
-                new_height = max(line_count * line_height, 40)
+                new_height = line_count * line_height  # Pas de minimum
                 textbox.configure(height=new_height)
                 textbox.update_idletasks()
         except Exception as e:
@@ -1267,7 +1005,6 @@ class ResponseContainer(ctk.CTkScrollableFrame):
         self.widgets.append(md_widget)
         
         # Ajuster la hauteur du container après ajout du widget
-        self.after(50, self._adjust_container_height)
         
         return md_widget
 
@@ -1329,7 +1066,7 @@ class CollapsibleMarkdownWidget(ctk.CTkFrame):
         
         # Calculer la hauteur approximative
         lines = self.content.count('\n') + 1
-        estimated_height = min(max(lines * 25, 150), 800)
+        estimated_height = min(lines * 25, 800)  # Pas de minimum
         # Note: MarkdownViewer utilise tkinterweb HtmlFrame qui gère automatiquement la taille
         # La hauteur sera gérée par le contenu
     

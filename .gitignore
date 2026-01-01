@@ -14,6 +14,7 @@ db_key_states.json.md
 DOC_codes_sources/
 src/
 temp/
+cursor-deepseek-proxy/
 logs/
 ia_history/
 backups/

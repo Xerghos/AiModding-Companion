@@ -519,10 +519,28 @@ class Worker(threading.Thread):
     # --- HANDLERS UI ---
 
     @trace_action(source="core")
-    def _save_and_display(self, text, role="assistant"):
+    def _save_and_display(self, text, role="assistant", thought=None):
+        """
+        Sauvegarde et affiche un message dans l'interface.
+        
+        Args:
+            text: Contenu principal du message
+            role: Rôle du message (assistant par défaut)
+            thought: Contenu de pensée optionnel (thinking process)
+        """
         if GlobalMemoryManager and self.main_session:
             GlobalMemoryManager.save_session_history(self.main_session)
-        self.response_queue.put({"type": "chat_response", "text": text, "action": "chat"})
+        # Nouveau format structuré avec thought et content séparés
+        message = {
+            "type": "chat_response",
+            "content": text,
+            "action": "chat"
+        }
+        if thought:
+            message["thought"] = thought
+        # Compatibilité rétroactive : garder "text" pour les anciens messages
+        message["text"] = text
+        self.response_queue.put(message)
     
     @trace_action(source="core")
     def _execute_tool(self, tool_function, args, kwargs):
@@ -979,7 +997,7 @@ class Worker(threading.Thread):
                                 self.response_queue.put({'type': 'ui_stream_thinking', 'text': txt})
                             else:
                                 log.info(f"🟢 Routing content chunk: {len(txt)} chars, is_thinking={is_thinking}")
-                            self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
+                                self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
                 except StopIteration:
                     # Itérateur terminé normalement
                     pass
