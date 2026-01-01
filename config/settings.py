@@ -76,6 +76,9 @@ DEFAULT_SETTINGS = {
     "system_settings": {
         "theme": "Dark",
         "font_size": 12,
+        "scroll_speed": 4,
+        "scroll_modifier_key": "Alt_L",
+        "scroll_modifier_multiplier": 4,
         "auto_backup": True,
         "backup_interval": 30,
         "max_backups": 10,

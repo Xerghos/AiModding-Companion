@@ -313,6 +313,24 @@ class SettingsWindow(BaseWindow):
         self._add_switch(scroll, "ui_settings.streaming_text", "Effet Machine à écrire (Stream)", True)
         self._add_switch(scroll, "ui_settings.sidebar_visible", "Barre Latérale au démarrage", True)
 
+        self._add_header(scroll, "Défilement & Navigation")
+        self._add_slider(scroll, "system_settings.scroll_speed", "Vitesse de base", 1, 20, 4, False)
+        
+        # Modifier Key with Capture
+        frame_mod = ctk.CTkFrame(scroll, fg_color="transparent"); frame_mod.pack(fill="x", pady=2)
+        ctk.CTkLabel(frame_mod, text="Touche Accélérateur", width=220, anchor="w").pack(side="left", padx=5)
+        
+        var_mod = tk.StringVar(value=self._get_val("system_settings.scroll_modifier_key", "Alt_L"))
+        self.vars["system_settings.scroll_modifier_key"] = var_mod
+        
+        e_mod = ctk.CTkEntry(frame_mod, textvariable=var_mod, width=150, state="readonly")
+        e_mod.pack(side="left", padx=5, expand=True, fill="x")
+        
+        ctk.CTkButton(frame_mod, text="Modifier", width=80, 
+                      command=lambda: self._capture_key("Accélérateur Scroll", var_mod)).pack(side="right", padx=5)
+                      
+        self._add_slider(scroll, "system_settings.scroll_modifier_multiplier", "Facteur Accélération", 1, 10, 4, False)
+
         self._add_header(scroll, "Gestion des Pools (Threads)")
         self._add_switch(scroll, "general_settings.dynamic_pool_management", "Gestion Dynamique des Pools", False)
         self._add_slider(scroll, "general_settings.chat_pool_size", "Pool Chat Principal", 1, 30, 4, False)

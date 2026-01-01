@@ -669,11 +669,45 @@ class MarkdownViewer(ctk.CTkFrame):
                     break
             
             if parent and isinstance(parent, CTkScrollableFrame):
-                # Calcul du delta pour Windows
+                # Récupérer les paramètres de scroll
+                system_settings = APP_SETTINGS.get("system_settings", {})
+                base_speed = system_settings.get("scroll_speed", 4)
+                modifier_key = system_settings.get("scroll_modifier_key", "Alt_L")
+                modifier_mult = system_settings.get("scroll_modifier_multiplier", 4)
+                
+                # Vérifier le modificateur
+                is_mod_active = False
+                state = getattr(event, "state", 0)
+                
+                # Mapping basique des modificateurs pour Windows/Linux
+                # Alt: 131072 (Windows), 8 ou 24 (Linux Mod1)
+                # Control: 4
+                # Shift: 1
+                
+                if "Alt" in modifier_key:
+                    is_mod_active = (state & 131072) or (state & 8)
+                elif "Control" in modifier_key or "Ctrl" in modifier_key:
+                    is_mod_active = (state & 4)
+                elif "Shift" in modifier_key:
+                    is_mod_active = (state & 1)
+                
+                # Calculer la vitesse finale
+                scroll_amount = base_speed
+                if is_mod_active:
+                    scroll_amount *= modifier_mult
+                
+                # Appliquer le scroll (négatif = haut, positif = bas pour yview_scroll)
+                # Mais delta est positif pour haut (120), négatif pour bas (-120) sur Windows
+                # Button-4 = Haut, Button-5 = Bas sur Linux
+                
+                steps = int(scroll_amount)
+                
                 if event.num == 5 or (hasattr(event, "delta") and event.delta < 0):
-                    parent._parent_canvas.yview_scroll(1, "units")
+                    # Scroll bas
+                    parent._parent_canvas.yview_scroll(steps, "units")
                 elif event.num == 4 or (hasattr(event, "delta") and event.delta > 0):
-                    parent._parent_canvas.yview_scroll(-1, "units")
+                    # Scroll haut
+                    parent._parent_canvas.yview_scroll(-steps, "units")
                     
         except Exception:
             pass
