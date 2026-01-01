@@ -632,7 +632,9 @@ class MarkdownViewer(ctk.CTkFrame):
         # Créer HtmlFrame dans le container
         self.html_frame = HtmlFrame(
             self.html_frame_container,
-            messages_enabled=False  # Désactiver les messages de console
+            messages_enabled=False,  # Désactiver les messages de console
+            vertical_scrollbar=False,    # Désactiver la scrollbar verticale
+            horizontal_scrollbar=False    # Désactiver la scrollbar horizontale
         )
         self.html_frame.pack(fill="both", expand=True)
         
@@ -662,29 +664,44 @@ class MarkdownViewer(ctk.CTkFrame):
                 # Convertir Markdown en HTML
                 html_content = markdown_to_html(content, theme="dark")
                 # Injecter le CSS pour masquer la scrollbar dans le HTML généré
+                scrollbar_css = """
+        /* Masquer TOUTES les scrollbars de manière plus agressive */
+        ::-webkit-scrollbar {
+            width: 0px !important;
+            height: 0px !important;
+            display: none !important;
+        }
+        ::-webkit-scrollbar-track {
+            display: none !important;
+        }
+        ::-webkit-scrollbar-thumb {
+            display: none !important;
+        }
+        ::-webkit-scrollbar-corner {
+            display: none !important;
+        }
+        /* Pour Firefox, IE, Edge */
+        * {
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+        }
+        /* Permettre le scroll avec la souris mais sans scrollbar visible */
+        html, body {
+            overflow: auto !important;
+            overflow-y: auto !important;
+            -ms-overflow-style: none !important;
+            scrollbar-width: none !important;
+        }
+        html::-webkit-scrollbar, body::-webkit-scrollbar {
+            display: none !important;
+        }"""
                 if '<style>' in html_content:
                     # Injecter le CSS dans le style existant
-                    scrollbar_css = """
-        /* Masquer la scrollbar mais garder le scroll fonctionnel */
-        ::-webkit-scrollbar {
-            display: none;
-        }
-        * {
-            scrollbar-width: none; /* Firefox */
-            -ms-overflow-style: none; /* IE et Edge */
-        }"""
                     html_content = html_content.replace('</style>', scrollbar_css + '\n    </style>')
                 elif '<head>' in html_content:
                     # Ajouter un style dans le head
-                    scrollbar_style = """
-    <style>
-        ::-webkit-scrollbar {
-            display: none;
-        }
-        * {
-            scrollbar-width: none;
-            -ms-overflow-style: none;
-        }
+                    scrollbar_style = f"""
+    <style>{scrollbar_css}
     </style>"""
                     html_content = html_content.replace('</head>', scrollbar_style + '\n</head>')
             else:
@@ -711,13 +728,35 @@ class MarkdownViewer(ctk.CTkFrame):
             padding: 20px;
             margin: 0;
         }}
-        /* Masquer la scrollbar mais garder le scroll fonctionnel */
+        /* Masquer TOUTES les scrollbars de manière plus agressive */
         ::-webkit-scrollbar {{
-            display: none;
+            width: 0px !important;
+            height: 0px !important;
+            display: none !important;
         }}
+        ::-webkit-scrollbar-track {{
+            display: none !important;
+        }}
+        ::-webkit-scrollbar-thumb {{
+            display: none !important;
+        }}
+        ::-webkit-scrollbar-corner {{
+            display: none !important;
+        }}
+        /* Pour Firefox, IE, Edge */
         * {{
-            scrollbar-width: none; /* Firefox */
-            -ms-overflow-style: none; /* IE et Edge */
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+        }}
+        /* Permettre le scroll avec la souris mais sans scrollbar visible */
+        html, body {{
+            overflow: auto !important;
+            overflow-y: auto !important;
+            -ms-overflow-style: none !important;
+            scrollbar-width: none !important;
+        }}
+        html::-webkit-scrollbar, body::-webkit-scrollbar {{
+            display: none !important;
         }}
     </style>
 </head>
@@ -774,20 +813,45 @@ class MarkdownViewer(ctk.CTkFrame):
             lines = min(lines, max_lines)
             
             # Environ 25px par ligne (hauteur de ligne + padding)
-            estimated_height = lines * 25  # Pas de minimum
-            # Limite maximale à 2500px
+            estimated_height = lines * 25
+            # Limite minimale pour éviter les boîtes trop petites (6 lignes visibles)
+            min_height = 150
+            estimated_height = max(estimated_height, min_height)
+            # Limite maximale à 2500px (100 lignes)
             estimated_height = min(estimated_height, 2500)
             
             # Configurer la hauteur du container
             self.html_frame_container.configure(height=estimated_height)
-            self.html_frame_container.pack_configure(fill="x", expand=False)  # Ne pas expand, juste fill x
+            # Permettre l'expansion verticale si nécessaire
+            self.html_frame_container.pack_configure(fill="both", expand=True)
             
             # Mettre à jour le widget
             self.update_idletasks()
             
             log.debug(f"📏 Hauteur HTML ajustée: {estimated_height}px pour {lines} lignes")
+            
+            # Essayer de masquer les scrollbars après ajustement de la hauteur
+            self.after(200, self._hide_html_frame_scrollbars)
+            
         except Exception as e:
             log.debug(f"Erreur ajustement hauteur HTML: {e}")
+    
+    def _hide_html_frame_scrollbars(self):
+        """Tente de masquer les scrollbars du HtmlFrame si les paramètres ne suffisent pas."""
+        try:
+            if hasattr(self, 'html_frame'):
+                # Essayer de masquer via configuration si disponible
+                if hasattr(self.html_frame, 'configure'):
+                    try:
+                        self.html_frame.configure(vertical_scrollbar=False)
+                    except Exception:
+                        pass
+                    try:
+                        self.html_frame.configure(horizontal_scrollbar=False)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug(f"Impossible de masquer les scrollbars via configuration: {e}")
 
 
 class ThinkingWidget(ctk.CTkFrame):
@@ -1154,7 +1218,7 @@ class NonCollapsibleMarkdownWidget(ctk.CTkFrame):
             max_lines = 100
             lines = min(lines, max_lines)
             # Estimer environ 25px par ligne pour le markdown
-            estimated_height = min(max(lines * 25, 100), 2500)  # Limite à 2500px (100 lignes)
+            estimated_height = min(max(lines * 25, 150), 2500)  # Minimum 150px (6 lignes), maximum 2500px (100 lignes)
             # Note: MarkdownViewer avec tkinterweb gère la taille automatiquement
             # On peut juste s'assurer que le container s'adapte
             self.update_idletasks()
