@@ -637,6 +637,13 @@ class MarkdownViewer(ctk.CTkFrame):
             horizontal_scrollbar=False    # Désactiver la scrollbar horizontale
         )
         self.html_frame.pack(fill="both", expand=True)
+
+        # Propager les événements de scroll au parent de manière plus robuste
+        # On utilise bind_all car les widgets internes de HtmlFrame peuvent capturer le focus/events
+        # Mais on filtrera dans le handler pour ne réagir que si l'événement vient de ce widget
+        self.html_frame.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.html_frame.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self.html_frame.bind_all("<Button-5>", self._on_mousewheel, add="+")
         
         # Stocker le contenu pour ajustement de hauteur
         self.content = content if content else ""
@@ -644,6 +651,32 @@ class MarkdownViewer(ctk.CTkFrame):
         # Définir le contenu si fourni
         if content:
             self.set_content(content, is_markdown)
+
+    def _on_mousewheel(self, event):
+        """
+        Gère le scroll de la molette pour propager au parent si nécessaire.
+        """
+        try:
+            # Vérifier si l'événement vient de notre HtmlFrame ou de ses enfants
+            if not str(event.widget).startswith(str(self.html_frame)):
+                return
+
+            # Trouver le CTkScrollableFrame parent (chat1_scroll)
+            parent = self.master
+            while parent and not isinstance(parent, CTkScrollableFrame):
+                parent = parent.master
+                if not parent:
+                    break
+            
+            if parent and isinstance(parent, CTkScrollableFrame):
+                # Calcul du delta pour Windows
+                if event.num == 5 or (hasattr(event, "delta") and event.delta < 0):
+                    parent._parent_canvas.yview_scroll(1, "units")
+                elif event.num == 4 or (hasattr(event, "delta") and event.delta > 0):
+                    parent._parent_canvas.yview_scroll(-1, "units")
+                    
+        except Exception:
+            pass
     
     def set_content(self, content, is_markdown=None):
         """
