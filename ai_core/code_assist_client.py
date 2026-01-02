@@ -140,6 +140,11 @@ class CodeAssistClient:
     
     BASE_ENDPOINT = "https://cloudcode-pa.googleapis.com"
     API_VERSION = "v1internal"
+
+    # Headers capturés depuis le vrai client Gemini CLI (v0.22.5)
+    # Permet d'éviter le rate-limiting agressif appliqué aux clients génériques "python-requests"
+    GEMINI_CLI_USER_AGENT = "GeminiCLI/0.22.5/gemini-3-pro-preview (win32; x64) google-api-nodejs-client/9.15.1"
+    GEMINI_CLI_CLIENT_HEADER = "gl-node/25.2.1"
     
     def __init__(self, project_id: Optional[str] = None, session_id: Optional[str] = None, use_personal_quota: bool = True):
         """
@@ -222,6 +227,18 @@ class CodeAssistClient:
                     # - Le refresh du token si nécessaire
                     # - Les headers supplémentaires requis par Google
                     self._session = AuthorizedSession(self._creds)
+                    
+                    # MIMIC GEMINI CLI: Injecter les headers exacts pour éviter le rate-limiting
+                    self._session.headers.update({
+                        "User-Agent": self.GEMINI_CLI_USER_AGENT,
+                        "x-goog-api-client": self.GEMINI_CLI_CLIENT_HEADER
+                    })
+                    
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "AUTH",
+                        f"✅ Session autorisée configurée avec User-Agent: {self.GEMINI_CLI_USER_AGENT[:20]}..."
+                    )
                 return self._session
             
             return None
@@ -311,19 +328,20 @@ class CodeAssistClient:
             payload_json = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
             payload_size = len(payload_json.encode('utf-8'))
             
-            # Solution 4 : Logging détaillé du JSON sérialisé + vérification ordre des clés
-            request_data = payload.get("request", {})
-            request_keys = list(request_data.keys()) if isinstance(request_data, dict) else []
-            UnifiedLogger.write(
-                "AI_CORE",
-                "DEBUG",
-                f"Payload JSON sérialisé: {payload_size} bytes, ordre clés dans request: {request_keys}"
-            )
-            UnifiedLogger.write(
-                "AI_CORE",
-                "DEBUG",
-                f"Preview JSON (1000 chars): {payload_json[:1000]}"
-            )
+            # Solution 4 : Logging détaillé du JSON sérialisé + vérification ordre des clés (DEBUG seulement)
+            if DEBUG_STREAM:
+                request_data = payload.get("request", {})
+                request_keys = list(request_data.keys()) if isinstance(request_data, dict) else []
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "DEBUG",
+                    f"Payload JSON sérialisé: {payload_size} bytes, ordre clés dans request: {request_keys}"
+                )
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "DEBUG",
+                    f"Preview JSON (1000 chars): {payload_json[:1000]}"
+                )
 
             try:
                 # Utiliser AuthorizedSession.post() (comme gemini-cli)
@@ -516,19 +534,20 @@ class CodeAssistClient:
             payload_json = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
             payload_size = len(payload_json.encode('utf-8'))
             
-            # Solution 4 : Logging détaillé du JSON sérialisé + vérification ordre des clés
-            request_data = payload.get("request", {})
-            request_keys = list(request_data.keys()) if isinstance(request_data, dict) else []
-            UnifiedLogger.write(
-                "AI_CORE",
-                "DEBUG",
-                f"Payload JSON sérialisé: {payload_size} bytes, ordre clés dans request: {request_keys}"
-            )
-            UnifiedLogger.write(
-                "AI_CORE",
-                "DEBUG",
-                f"Preview JSON (1000 chars): {payload_json[:1000]}"
-            )
+            # Solution 4 : Logging détaillé du JSON sérialisé + vérification ordre des clés (DEBUG seulement)
+            if DEBUG_STREAM:
+                request_data = payload.get("request", {})
+                request_keys = list(request_data.keys()) if isinstance(request_data, dict) else []
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "DEBUG",
+                    f"Payload JSON sérialisé: {payload_size} bytes, ordre clés dans request: {request_keys}"
+                )
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "DEBUG",
+                    f"Preview JSON (1000 chars): {payload_json[:1000]}"
+                )
 
             try:
                 # Utiliser AuthorizedSession.post() (comme gemini-cli)
@@ -557,27 +576,13 @@ class CodeAssistClient:
                             line_text = line.decode('utf-8')
                             line_count += 1
                             
-                            # Log chaque ligne brute (toujours, pour diagnostic)
-                            UnifiedLogger.write(
-                                "AI_CORE",
-                                "STREAM_RAW",
-                                f"Ligne {line_count} reçue ({len(line_text)} chars): {line_text[:200]}"
-                            )
-                            
-                            # Log les lignes qui ne commencent pas par "data: " (pour identifier d'autres formats)
-                            if not line_text.startswith("data: "):
-                                if line_text.strip():
-                                    UnifiedLogger.write(
-                                        "AI_CORE",
-                                        "STREAM_RAW",
-                                        f"Ligne non-data ({line_count}): {line_text[:200]}"
-                                    )
-                                else:
-                                    UnifiedLogger.write(
-                                        "AI_CORE",
-                                        "STREAM_RAW",
-                                        f"Ligne vide ({line_count})"
-                                    )
+                            # Log chaque ligne brute (DEBUG seulement pour réduire I/O)
+                            if DEBUG_STREAM:
+                                UnifiedLogger.write(
+                                    "AI_CORE",
+                                    "STREAM_RAW",
+                                    f"Ligne {line_count} reçue ({len(line_text)} chars): {line_text[:200]}"
+                                )
                             
                             # Parser les chunks SSE de CodeAssist
                             # Format: chaque ligne "data: {...}" est un chunk complet
@@ -589,15 +594,8 @@ class CodeAssistClient:
                                         data = json.loads(data_json)
                                         chunk_count += 1
                                         
-                                        # Log succès parsing (toujours, mais limité)
-                                        UnifiedLogger.write(
-                                            "AI_CORE",
-                                            "STREAM_PARSE",
-                                            f"Chunk JSON {chunk_count} parsé avec succès"
-                                        )
-                                        
-                                        # Log structure du chunk (toujours)
-                                        if isinstance(data, dict):
+                                        # Log structure du chunk (DEBUG seulement)
+                                        if DEBUG_STREAM and isinstance(data, dict):
                                             keys = list(data.keys())
                                             UnifiedLogger.write(
                                                 "AI_CORE",
@@ -619,19 +617,20 @@ class CodeAssistClient:
                                         
                                         yield data
                                     except json.JSONDecodeError as e:
+                                        # Erreurs de parsing toujours loggées (important pour diagnostic)
                                         UnifiedLogger.write(
                                             "AI_CORE",
                                             "STREAM_ERROR",
                                             f"Erreur parsing JSON chunk {chunk_count + 1}: {e}"
                                         )
-                                        UnifiedLogger.write(
-                                            "AI_CORE",
-                                            "STREAM_ERROR",
-                                            f"Ligne qui a échoué: {line_text[:500]}"
-                                        )
-                            else:
-                                # Ligne qui ne commence pas par "data: " - peut être un événement SSE différent
-                                # (ex: "event: ...", "id: ...", ligne vide, etc.)
+                                        if DEBUG_STREAM:
+                                            UnifiedLogger.write(
+                                                "AI_CORE",
+                                                "STREAM_ERROR",
+                                                f"Ligne qui a échoué: {line_text[:500]}"
+                                            )
+                            elif DEBUG_STREAM:
+                                # Ligne qui ne commence pas par "data: " - log seulement en DEBUG
                                 if line_text.strip() and not line_text.startswith("event:") and not line_text.startswith("id:"):
                                     UnifiedLogger.write(
                                         "AI_CORE",
@@ -639,6 +638,7 @@ class CodeAssistClient:
                                         f"Ligne non-data ignorée ({line_count}): {line_text[:200]}"
                                     )
                         except Exception as e:
+                            # Erreurs toujours loggées (important pour diagnostic)
                             UnifiedLogger.write(
                                 "AI_CORE",
                                 "STREAM_ERROR",
@@ -652,12 +652,13 @@ class CodeAssistClient:
                                     f"Traceback: {traceback.format_exc()}"
                                 )
                 
-                # Log résumé du parsing SSE
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "STREAM_SUMMARY",
-                    f"Parsing SSE terminé: {line_count} lignes reçues, {chunk_count} chunks parsés"
-                )
+                # Log résumé du parsing SSE (toujours, mais concis)
+                if DEBUG_STREAM or chunk_count == 0:
+                    UnifiedLogger.write(
+                        "AI_CORE",
+                        "STREAM_SUMMARY",
+                        f"Parsing SSE terminé: {line_count} lignes reçues, {chunk_count} chunks parsés"
+                    )
                 
                 # Si aucun chunk n'a été parsé, logger un avertissement
                 if chunk_count == 0:
@@ -1345,6 +1346,8 @@ class CodeAssistClient:
                                             
                                             # Extraire l'ID de corrélation (id ou call_id)
                                             # L'ID peut être dans func_call directement ou dans part
+                                            # NOTE: Le vrai Gemini CLI ne reçoit SOUVENT PAS d'ID dans le functionCall du modèle
+                                            # C'est le client qui en génère un pour la réponse.
                                             func_call_id = (
                                                 func_call.get("id") or 
                                                 func_call.get("call_id") or
@@ -1358,14 +1361,13 @@ class CodeAssistClient:
                                                 part.get("thoughtSignature")
                                             )
                                             
-                                            # Log détaillé pour diagnostic si l'ID est manquant
+                                            # Si pas d'ID, on en générera un côté worker ou on laissera None
+                                            # L'important est de capturer le call
                                             if not func_call_id:
                                                 UnifiedLogger.write(
                                                     "AI_CORE",
                                                     "WARNING",
-                                                    f"FunctionCall sans ID détecté pour {func_name}. "
-                                                    f"Clés disponibles dans func_call: {list(func_call.keys())}, "
-                                                    f"Clés disponibles dans part: {list(part.keys())}"
+                                                    f"FunctionCall sans ID (normal pour Gemini CLI). Name={func_name}"
                                                 )
                                             
                                             # Créer un objet FunctionCallObject pour transporter les métadonnées

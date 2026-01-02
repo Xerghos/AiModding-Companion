@@ -232,9 +232,9 @@ class MainPanel(ctk.CTkFrame):
             viewer.pack(fill="both", expand=True)
         else:
             # Comportement actuel avec TextEditorWithLineNumbers pour les autres fichiers
-            editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
-            editor.pack(fill="both", expand=True)
-            editor.insert("1.0", content)
+        editor = TextEditorWithLineNumbers(self.tab_view.tab(filename), filename=filename)
+        editor.pack(fill="both", expand=True)
+        editor.insert("1.0", content)
         # Note: CTkCodeBox gère déjà le syntax highlighting automatiquement
         # On n'a plus besoin d'appeler apply_highlighting_to_editor
         

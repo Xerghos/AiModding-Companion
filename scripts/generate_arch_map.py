@@ -206,7 +206,7 @@ def generate_ultimate_graph():
             )]
         else:
             # Fallback : utiliser IGNORED_DIRS
-            d[:] = [x for x in d if x not in IGNORED_DIRS]
+        d[:] = [x for x in d if x not in IGNORED_DIRS]
         
         for file in f:
             if file.endswith('.py') and file not in IGNORED_FILES:

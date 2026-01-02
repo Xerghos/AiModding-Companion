@@ -5,11 +5,16 @@ Extrait uniquement les signatures (sans corps) pour injection dans le contexte L
 
 import os
 import logging
+import time
 from typing import List, Dict, Optional
 from config import get_logger, get_path
 from features.Decorators import trace_action
 
 log = get_logger("features.context.repo_map")
+
+# Cache pour la Repo Map (gain estimé: 2-3s par requête)
+_repo_map_cache: Optional[Dict[str, any]] = None
+REPO_MAP_CACHE_TIMEOUT = 60  # 60 secondes comme spécifié dans le plan
 
 
 class RepoMapGenerator:
@@ -430,4 +435,55 @@ def get_repo_map_generator(db_path_base=None) -> RepoMapGenerator:
     if _repo_map_generator is None:
         _repo_map_generator = RepoMapGenerator(db_path_base)
     return _repo_map_generator
+
+
+def get_cached_repo_map(db_path_base=None, max_chars: Optional[int] = None) -> str:
+    """
+    Récupère la Repo Map depuis le cache si disponible et valide (< 60s),
+    sinon la génère et la met en cache.
+    
+    Args:
+        db_path_base: Chemin de base de la base de données
+        max_chars: Nombre maximum de caractères (None = pas de limite)
+    
+    Returns:
+        Repo Map formatée
+    """
+    global _repo_map_cache
+    
+    current_time = time.time()
+    
+    # Vérifier si le cache est valide
+    if _repo_map_cache is not None:
+        cache_age = current_time - _repo_map_cache.get('timestamp', 0)
+        if cache_age < REPO_MAP_CACHE_TIMEOUT:
+            log.debug(f"✅ Repo Map récupérée depuis le cache ({cache_age:.1f}s < {REPO_MAP_CACHE_TIMEOUT}s)")
+            cached_map = _repo_map_cache.get('content', '')
+            
+            # Appliquer max_chars si spécifié
+            if max_chars is not None and len(cached_map) > max_chars:
+                return cached_map[:max_chars] + "\n... (tronqué)"
+            return cached_map
+        else:
+            log.debug(f"🔄 Repo Map expirée du cache ({cache_age:.1f}s > {REPO_MAP_CACHE_TIMEOUT}s), régénération...")
+    
+    # Générer la Repo Map
+    repo_map_gen = get_repo_map_generator(db_path_base)
+    repo_map = repo_map_gen.get_repo_map_for_context(max_chars=max_chars)
+    
+    # Mettre en cache
+    _repo_map_cache = {
+        'content': repo_map,
+        'timestamp': current_time
+    }
+    
+    log.info(f"✅ Repo Map générée et mise en cache ({len(repo_map)} caractères)")
+    return repo_map
+
+
+def invalidate_repo_map_cache():
+    """Invalide le cache de la Repo Map (utile après modifications du projet)."""
+    global _repo_map_cache
+    _repo_map_cache = None
+    log.debug("🗑️ Cache Repo Map invalidé")
 

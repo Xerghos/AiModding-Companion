@@ -196,215 +196,58 @@ class Worker(threading.Thread):
         """
         Récupère le contexte hybride avec Repo Map.
         Retourne un dict avec les composants séparés pour injection en blocs distincts.
+        Optimisé: Repo Map et RAG Docs sont récupérés en parallèle (gain estimé: 2-3s).
         """
         if not database or not self.rag_enabled or len(query) < 3: 
             return {"repo_map": None, "docs": None, "ltm": None}
         
         rag_components = {"repo_map": None, "docs": None, "ltm": None}
+        db_path = get_path(APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid"))
         
-        # A. Repo Map (contexte structurel global)
-        try:
-            from features.context.repo_map import get_repo_map_generator
-            db_path = get_path(APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid"))
-            repo_map_gen = get_repo_map_generator(db_path)
-            # Pas de limite : Repo Map complète (non tronquée)
-            repo_map = repo_map_gen.get_repo_map_for_context(max_chars=None)
-            if repo_map:
-                rag_components["repo_map"] = repo_map
-        except Exception as e:
-            log.debug(f"Repo Map non disponible: {e}")
+        # Parallélisation: Repo Map et RAG Docs en threads séparés (gain estimé: 2-3s)
+        def fetch_repo_map():
+            """Fonction pour récupérer la Repo Map dans un thread séparé."""
+            try:
+                from features.context.repo_map import get_cached_repo_map
+                # Utiliser le cache (gain estimé: 2-3s par requête)
+                # Pas de limite : Repo Map complète (non tronquée)
+                repo_map = get_cached_repo_map(db_path_base=db_path, max_chars=None)
+                return repo_map if repo_map else None
+            except Exception as e:
+                log.debug(f"Repo Map non disponible: {e}")
+                return None
         
-        # B. Documents (RAG Hybride) - Style Cursor
-        try:
-            db_path = get_path(APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid"))
-            # Utiliser la recherche hybride (FAISS + FTS5 avec RRF, k=60 comme Cursor)
-            # Récupérer plus de candidats initialement pour meilleur filtrage (style Cursor: 50-100 candidats)
-            # On prend 15 candidats puis on filtre par seuil RRF pour obtenir les 3-5 meilleurs
-            results, _ = database.search_hybrid(query, db_path, max_results=15, use_hybrid=True)
-            
-            doc_ctx_lines = []
-            if results:
-                log.debug(f"RAG: {len(results)} résultats initiaux de la recherche hybride")
+        def fetch_rag_docs():
+            """Fonction pour récupérer les documents RAG dans un thread séparé."""
+            try:
+                # Utiliser la recherche hybride (FAISS + FTS5 avec RRF, k=60 comme Cursor)
+                # Récupérer plus de candidats initialement pour meilleur filtrage (style Cursor: 50-100 candidats)
+                # On prend 15 candidats puis on filtre par seuil RRF pour obtenir les 3-5 meilleurs
+                results, _ = database.search_hybrid(query, db_path, max_results=15, use_hybrid=True)
                 
-                # Seuil de pertinence RRF (selon doc Cursor: scores typiquement 0.01-0.03 pour bons résultats)
-                # Seuil plus strict pour ne montrer que les résultats les plus pertinents (style Cursor)
-                RRF_THRESHOLD = 0.01
-                
-                # Budget total de contexte pour les docs RAG (style Cursor - plus sélectif)
-                # Limite réduite pour privilégier la qualité sur la quantité
-                MAX_TOTAL_CHARS = 3000
-                total_chars = 0
-                
-                # Déduplication par source (éviter plusieurs chunks du même fichier)
-                seen_sources = set()
-                
-                # Compteurs pour diagnostic
-                filtered_count = 0
-                accepted_count = 0
-                
-                # Décompacter les résultats avec métadonnées (compatibilité avec ancien format)
-                for result in results:
-                    # Gérer l'ancien format (3 éléments) et le nouveau format (7 éléments)
-                    if len(result) == 3:
-                        src, content, score = result
-                        ast_type, parent_context, start_line, end_line = None, None, None, None
-                    else:
-                        src, content, score, ast_type, parent_context, start_line, end_line = result[:7]
+                doc_ctx_lines = []
+                if results:
+                    log.debug(f"RAG: {len(results)} résultats initiaux de la recherche hybride")
                     
-                    if "memory://" in src:
-                        continue
+                    # Seuil de pertinence RRF (selon doc Cursor: scores typiquement 0.01-0.03 pour bons résultats)
+                    # Seuil plus strict pour ne montrer que les résultats les plus pertinents (style Cursor)
+                    RRF_THRESHOLD = 0.01
                     
-                    # Filtrer par seuil de pertinence RRF (comme Cursor)
-                    should_skip = False
-                    if isinstance(score, (int, float)):
-                        # Les scores RRF varient typiquement de 0.01 à 0.03 pour les bons résultats (k=60)
-                        # Si le score est > 1.0, c'est probablement une distance vectorielle (pas RRF)
-                        # Dans ce cas, on accepte seulement si distance < 2.5 (très proche)
-                        if score >= 1.0:
-                            # C'est probablement une distance L2, pas un score RRF
-                            if score > 2.5:  # Distance trop grande
-                                should_skip = True
-                                filtered_count += 1
-                            # On accepte mais on note que c'est une distance, pas un score RRF
-                        elif score < RRF_THRESHOLD:
-                            should_skip = True
-                            filtered_count += 1  # Score RRF trop faible, résultat peu pertinent
-                    else:
-                        should_skip = True
-                        filtered_count += 1  # Score invalide
+                    # Budget total de contexte pour les docs RAG (style Cursor - plus sélectif)
+                    # Limite réduite pour privilégier la qualité sur la quantité
+                    MAX_TOTAL_CHARS = 3000
+                    total_chars = 0
                     
-                    if should_skip:
-                        continue
+                    # Déduplication par source (éviter plusieurs chunks du même fichier)
+                    seen_sources = set()
                     
-                    # Éviter les doublons par source (même fichier)
-                    source_key = os.path.basename(src) if src else ""
-                    if source_key in seen_sources:
-                        filtered_count += 1
-                        continue  # Déjà traité ce fichier
-                    seen_sources.add(source_key)
-                    accepted_count += 1
+                    # Compteurs pour diagnostic
+                    filtered_count = 0
+                    accepted_count = 0
                     
-                    # Vérifier le budget de contexte restant
-                    remaining_chars = MAX_TOTAL_CHARS - total_chars
-                    if remaining_chars <= 200:  # Pas assez d'espace pour un chunk significatif
-                        break
-                    
-                    # Troncature intelligente pour préserver la structure sémantique (style Cursor)
-                    chunk_display = content
-                    needs_truncation = len(content) > remaining_chars
-                    
-                    if needs_truncation:
-                        truncate_pos = remaining_chars - 100  # Marge pour "... [tronqué]"
-                        
-                        # 1. Si end_line est disponible, utiliser le contenu réel jusqu'à cette ligne
-                        # (le chunk devrait déjà être délimité par start_line et end_line, donc normalement pas nécessaire)
-                        # Mais si le contenu stocké est plus long que prévu, on peut tronquer
-                        
-                        # 2. Chercher des frontières sémantiques naturelles (dé-indentation, lignes vides)
-                        # Analyser les lignes autour de truncate_pos pour trouver une frontière de bloc
-                        lines = content[:truncate_pos + 500].split('\n')  # Analyser un peu plus loin
-                        truncate_line_idx = None
-                        target_char_count = truncate_pos
-                        
-                        # Compter les caractères jusqu'à chaque ligne
-                        char_count = 0
-                        for i, line in enumerate(lines):
-                            line_with_newline = line + '\n'
-                            next_char_count = char_count + len(line_with_newline)
-                            
-                            if next_char_count > target_char_count:
-                                # On cherche une frontière sémantique dans les lignes précédentes
-                                # Chercher en arrière (jusqu'à 10 lignes) une frontière naturelle
-                                for j in range(i, max(0, i - 10), -1):
-                                    if j == 0:
-                                        truncate_line_idx = 0
-                                        break
-                                    
-                                    prev_line = lines[j - 1] if j > 0 else ""
-                                    curr_line = lines[j]
-                                    
-                                    # Frontière : ligne vide ou dé-indentation significative
-                                    if prev_line.strip() == "":
-                                        truncate_line_idx = j - 1
-                                        break
-                                    # Dé-indentation : ligne précédente avait plus d'indentation que la suivante
-                                    # (mais pas si c'est juste une ligne de code normale)
-                                    elif j < len(lines) - 1:
-                                        prev_indent = len(prev_line) - len(prev_line.lstrip())
-                                        next_indent = len(curr_line) - len(curr_line.lstrip())
-                                        # Dé-indentation significative (retour au niveau parent)
-                                        if prev_indent > 0 and next_indent < prev_indent - 2:
-                                            truncate_line_idx = j - 1
-                                            break
-                                
-                                if truncate_line_idx is None:
-                                    truncate_line_idx = i - 1 if i > 0 else 0
-                                break
-                            
-                            char_count = next_char_count
-                        
-                        # Si on a trouvé une bonne frontière, utiliser cette ligne
-                        if truncate_line_idx is not None and truncate_line_idx < len(lines):
-                            truncated_lines = lines[:truncate_line_idx + 1]
-                            chunk_display = '\n'.join(truncated_lines).rstrip() + "\n... [tronqué à la frontière sémantique]"
-                        else:
-                            # Fallback : chercher une nouvelle ligne proche
-                            last_newline = content.rfind('\n', 0, truncate_pos)
-                            if last_newline > truncate_pos * 0.7:  # Au moins 70% de la limite atteinte
-                                chunk_display = content[:last_newline] + "\n... [tronqué]"
-                            else:
-                                # Fallback: couper à un espace si pas de nouvelle ligne proche
-                                last_space = content.rfind(' ', 0, truncate_pos)
-                                if last_space > truncate_pos * 0.8:
-                                    chunk_display = content[:last_space] + " ... [tronqué]"
-                                else:
-                                    # Dernier recours: troncature brute avec indication
-                                    chunk_display = content[:truncate_pos] + " ... [tronqué]"
-                    
-                    # Construire le header enrichi avec métadonnées
-                    header_parts = []
-                    if start_line and end_line:
-                        header_parts.append(f"{os.path.basename(src)}:{start_line}-{end_line}")
-                    else:
-                        header_parts.append(os.path.basename(src))
-                    
-                    if ast_type:
-                        header_parts.append(f"type: {ast_type}")
-                    
-                    if parent_context:
-                        # Extraire seulement le nom de la fonction/classe du parent context
-                        parent_parts = parent_context.split('>')
-                        if len(parent_parts) > 1:
-                            last_part = parent_parts[-1].strip()
-                            # Extraire le nom de fonction/classe si présent
-                            if ':' in last_part:
-                                func_or_class = last_part.split(':')[-1].strip()
-                                header_parts.append(f"context: {func_or_class}")
-                    
-                    # Format structuré avec score et métadonnées
-                    if score < 1.0:
-                        score_label = "Score RRF"
-                    else:
-                        score_label = "Distance"
-                    score_str = f"{score:.4f}"
-                    
-                    header = f"• [{' | '.join(header_parts)}] ({score_label}: {score_str})"
-                    doc_ctx_lines.append(f"{header}:\n{chunk_display}")
-                    total_chars += len(chunk_display)
-                
-                if doc_ctx_lines:
-                    # Limiter à 3 résultats maximum après filtrage (style Cursor - privilégier qualité sur quantité)
-                    max_display_results = min(3, len(doc_ctx_lines))
-                    rag_components["docs"] = "\n\n".join(doc_ctx_lines[:max_display_results])
-                    log.debug(f"RAG: {accepted_count} résultats acceptés, {filtered_count} filtrés, {len(doc_ctx_lines)} affichés")
-                else:
-                    # Log pour diagnostic si aucun résultat ne passe les filtres
-                    log.warning(f"RAG: {len(results)} résultats initiaux, mais aucun n'a passé les filtres ({filtered_count} filtrés, {accepted_count} acceptés)")
-                    # Accepter quand même les 3 premiers résultats même avec scores faibles pour éviter un bloc vide
-                    log.info("RAG: Fallback - acceptation des 3 premiers résultats malgré filtres")
-                    fallback_sources = set()
-                    for i, result in enumerate(results[:3]):
-                        # Gérer l'ancien et nouveau format
+                    # Décompacter les résultats avec métadonnées (compatibilité avec ancien format)
+                    for result in results:
+                        # Gérer l'ancien format (3 éléments) et le nouveau format (7 éléments)
                         if len(result) == 3:
                             src, content, score = result
                             ast_type, parent_context, start_line, end_line = None, None, None, None
@@ -413,29 +256,202 @@ class Worker(threading.Thread):
                         
                         if "memory://" in src:
                             continue
-                        source_key = os.path.basename(src) if src else ""
-                        if source_key in fallback_sources:
-                            continue
-                        fallback_sources.add(source_key)
-                        chunk_preview = content[:800] + ("..." if len(content) > 800 else "")
-                        score_str = f"{score:.4f}"
-                        score_label = "Score RRF" if score < 1.0 else "Distance"
                         
-                        # Header enrichi pour fallback aussi
-                        header_parts = [source_key]
+                        # Filtrer par seuil de pertinence RRF (comme Cursor)
+                        should_skip = False
+                        if isinstance(score, (int, float)):
+                            # Les scores RRF varient typiquement de 0.01 à 0.03 pour les bons résultats (k=60)
+                            # Si le score est > 1.0, c'est probablement une distance vectorielle (pas RRF)
+                            # Dans ce cas, on accepte seulement si distance < 2.5 (très proche)
+                            if score >= 1.0:
+                                # C'est probablement une distance L2, pas un score RRF
+                                if score > 2.5:  # Distance trop grande
+                                    should_skip = True
+                                    filtered_count += 1
+                                # On accepte mais on note que c'est une distance, pas un score RRF
+                            elif score < RRF_THRESHOLD:
+                                should_skip = True
+                                filtered_count += 1  # Score RRF trop faible, résultat peu pertinent
+                        else:
+                            should_skip = True
+                            filtered_count += 1  # Score invalide
+                        
+                        if should_skip:
+                            continue
+                        
+                        # Éviter les doublons par source (même fichier)
+                        source_key = os.path.basename(src) if src else ""
+                        if source_key in seen_sources:
+                            filtered_count += 1
+                            continue  # Déjà traité ce fichier
+                        seen_sources.add(source_key)
+                        accepted_count += 1
+                        
+                        # Vérifier le budget de contexte restant
+                        remaining_chars = MAX_TOTAL_CHARS - total_chars
+                        if remaining_chars <= 200:  # Pas assez d'espace pour un chunk significatif
+                            break
+                        
+                        # Troncature intelligente pour préserver la structure sémantique (style Cursor)
+                        chunk_display = content
+                        needs_truncation = len(content) > remaining_chars
+                        
+                        if needs_truncation:
+                            truncate_pos = remaining_chars - 100  # Marge pour "... [tronqué]"
+                            
+                            # 1. Si end_line est disponible, utiliser le contenu réel jusqu'à cette ligne
+                            # (le chunk devrait déjà être délimité par start_line et end_line, donc normalement pas nécessaire)
+                            # Mais si le contenu stocké est plus long que prévu, on peut tronquer
+                            
+                            # 2. Chercher des frontières sémantiques naturelles (dé-indentation, lignes vides)
+                            # Analyser les lignes autour de truncate_pos pour trouver une frontière de bloc
+                            lines = content[:truncate_pos + 500].split('\n')  # Analyser un peu plus loin
+                            truncate_line_idx = None
+                            target_char_count = truncate_pos
+                            
+                            # Compter les caractères jusqu'à chaque ligne
+                            char_count = 0
+                            for i, line in enumerate(lines):
+                                line_with_newline = line + '\n'
+                                next_char_count = char_count + len(line_with_newline)
+                                
+                                if next_char_count > target_char_count:
+                                    # On cherche une frontière sémantique dans les lignes précédentes
+                                    # Chercher en arrière (jusqu'à 10 lignes) une frontière naturelle
+                                    for j in range(i, max(0, i - 10), -1):
+                                        if j == 0:
+                                            truncate_line_idx = 0
+                                            break
+                                        
+                                        prev_line = lines[j - 1] if j > 0 else ""
+                                        curr_line = lines[j]
+                                        
+                                        # Frontière : ligne vide ou dé-indentation significative
+                                        if prev_line.strip() == "":
+                                            truncate_line_idx = j - 1
+                                            break
+                                        # Dé-indentation : ligne précédente avait plus d'indentation que la suivante
+                                        # (mais pas si c'est juste une ligne de code normale)
+                                        elif j < len(lines) - 1:
+                                            prev_indent = len(prev_line) - len(prev_line.lstrip())
+                                            next_indent = len(curr_line) - len(curr_line.lstrip())
+                                            # Dé-indentation significative (retour au niveau parent)
+                                            if prev_indent > 0 and next_indent < prev_indent - 2:
+                                                truncate_line_idx = j - 1
+                                                break
+                                    
+                                    if truncate_line_idx is None:
+                                        truncate_line_idx = i - 1 if i > 0 else 0
+                                    break
+                                
+                                char_count = next_char_count
+                            
+                            # Si on a trouvé une bonne frontière, utiliser cette ligne
+                            if truncate_line_idx is not None and truncate_line_idx < len(lines):
+                                truncated_lines = lines[:truncate_line_idx + 1]
+                                chunk_display = '\n'.join(truncated_lines).rstrip() + "\n... [tronqué à la frontière sémantique]"
+                            else:
+                                # Fallback : chercher une nouvelle ligne proche
+                                last_newline = content.rfind('\n', 0, truncate_pos)
+                                if last_newline > truncate_pos * 0.7:  # Au moins 70% de la limite atteinte
+                                    chunk_display = content[:last_newline] + "\n... [tronqué]"
+                                else:
+                                    # Fallback: couper à un espace si pas de nouvelle ligne proche
+                                    last_space = content.rfind(' ', 0, truncate_pos)
+                                    if last_space > truncate_pos * 0.8:
+                                        chunk_display = content[:last_space] + " ... [tronqué]"
+                                    else:
+                                        # Dernier recours: troncature brute avec indication
+                                        chunk_display = content[:truncate_pos] + " ... [tronqué]"
+                        
+                        # Construire le header enrichi avec métadonnées
+                        header_parts = []
                         if start_line and end_line:
-                            header_parts[0] = f"{source_key}:{start_line}-{end_line}"
+                            header_parts.append(f"{os.path.basename(src)}:{start_line}-{end_line}")
+                        else:
+                            header_parts.append(os.path.basename(src))
+                        
                         if ast_type:
                             header_parts.append(f"type: {ast_type}")
                         
+                        if parent_context:
+                            # Extraire seulement le nom de la fonction/classe du parent context
+                            parent_parts = parent_context.split('>')
+                            if len(parent_parts) > 1:
+                                last_part = parent_parts[-1].strip()
+                                # Extraire le nom de fonction/classe si présent
+                                if ':' in last_part:
+                                    func_or_class = last_part.split(':')[-1].strip()
+                                    header_parts.append(f"context: {func_or_class}")
+                        
+                        # Format structuré avec score et métadonnées
+                        if score < 1.0:
+                            score_label = "Score RRF"
+                        else:
+                            score_label = "Distance"
+                        score_str = f"{score:.4f}"
+                        
                         header = f"• [{' | '.join(header_parts)}] ({score_label}: {score_str})"
-                        doc_ctx_lines.append(f"{header}:\n{chunk_preview}")
+                        doc_ctx_lines.append(f"{header}:\n{chunk_display}")
+                        total_chars += len(chunk_display)
+                    
                     if doc_ctx_lines:
-                        rag_components["docs"] = "\n\n".join(doc_ctx_lines)
-        except Exception as e: 
-            log.warning(f"RAG Error: {e}", exc_info=True)
+                        # Limiter à 3 résultats maximum après filtrage (style Cursor - privilégier qualité sur quantité)
+                        max_display_results = min(3, len(doc_ctx_lines))
+                        docs_text = "\n\n".join(doc_ctx_lines[:max_display_results])
+                        log.debug(f"RAG: {accepted_count} résultats acceptés, {filtered_count} filtrés, {len(doc_ctx_lines)} affichés")
+                        return docs_text
+                    else:
+                        # Log pour diagnostic si aucun résultat ne passe les filtres
+                        log.warning(f"RAG: {len(results)} résultats initiaux, mais aucun n'a passé les filtres ({filtered_count} filtrés, {accepted_count} acceptés)")
+                        # Accepter quand même les 3 premiers résultats même avec scores faibles pour éviter un bloc vide
+                        log.info("RAG: Fallback - acceptation des 3 premiers résultats malgré filtres")
+                        fallback_sources = set()
+                        for i, result in enumerate(results[:3]):
+                            # Gérer l'ancien et nouveau format
+                            if len(result) == 3:
+                                src, content, score = result
+                                ast_type, parent_context, start_line, end_line = None, None, None, None
+                            else:
+                                src, content, score, ast_type, parent_context, start_line, end_line = result[:7]
+                            
+                            if "memory://" in src:
+                                continue
+                            source_key = os.path.basename(src) if src else ""
+                            if source_key in fallback_sources:
+                                continue
+                            fallback_sources.add(source_key)
+                            chunk_preview = content[:800] + ("..." if len(content) > 800 else "")
+                            score_str = f"{score:.4f}"
+                            score_label = "Score RRF" if score < 1.0 else "Distance"
+                            
+                            # Header enrichi pour fallback aussi
+                            header_parts = [source_key]
+                            if start_line and end_line:
+                                header_parts[0] = f"{source_key}:{start_line}-{end_line}"
+                            if ast_type:
+                                header_parts.append(f"type: {ast_type}")
+                            
+                            header = f"• [{' | '.join(header_parts)}] ({score_label}: {score_str})"
+                            doc_ctx_lines.append(f"{header}:\n{chunk_preview}")
+                        if doc_ctx_lines:
+                            return "\n\n".join(doc_ctx_lines)
+                        return None
+                return None
+            except Exception as e: 
+                log.warning(f"RAG Error: {e}", exc_info=True)
+                return None
+        
+        # Exécuter Repo Map et RAG Docs en parallèle
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            repo_map_future = executor.submit(fetch_repo_map)
+            rag_docs_future = executor.submit(fetch_rag_docs)
+            
+            # Récupérer les résultats
+            rag_components["repo_map"] = repo_map_future.result()
+            rag_components["docs"] = rag_docs_future.result()
 
-        # C. Souvenirs (LTM)
+        # C. Souvenirs (LTM) - séquentiel (rapide, pas besoin de parallélisation)
         try:
             if GlobalMemoryManager:
                 ltm_ctx = GlobalMemoryManager.retrieve_relevant_context(query)
