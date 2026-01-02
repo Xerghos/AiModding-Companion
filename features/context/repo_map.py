@@ -6,8 +6,12 @@ Extrait uniquement les signatures (sans corps) pour injection dans le contexte L
 import os
 import logging
 import time
-from typing import List, Dict, Optional
+import hashlib
+from typing import List, Dict, Optional, Any
 from config import get_logger, get_path
+from config.utils import charger_json_robuste, sauvegarder_json
+from features.Documentation import calculate_file_hash
+from features.context.merkle_sync import MerkleTreeSync
 from features.Decorators import trace_action
 
 log = get_logger("features.context.repo_map")
@@ -15,6 +19,11 @@ log = get_logger("features.context.repo_map")
 # Cache pour la Repo Map (gain estimé: 2-3s par requête)
 _repo_map_cache: Optional[Dict[str, any]] = None
 REPO_MAP_CACHE_TIMEOUT = 60  # 60 secondes comme spécifié dans le plan
+
+# Constantes pour le cache persistant
+CACHE_DIR = "cache"  # Dossier relatif au workspace
+REPO_MAP_CACHE_FILE = "repo_map_cache.json"
+REPO_MAP_HASH_FILE = "repo_map_hash.json"
 
 
 class RepoMapGenerator:
@@ -29,6 +38,116 @@ class RepoMapGenerator:
         """
         self.db_path_base = db_path_base
     
+    def _get_cache_path(self, filename: str) -> str:
+        """Retourne le chemin absolu du fichier de cache."""
+        cache_dir = get_path(CACHE_DIR)
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, filename)
+    
+    def _load_cache(self) -> Optional[Dict[str, Any]]:
+        """Charge le cache depuis le disque (utilise utilitaire amélioré)."""
+        cache_path = self._get_cache_path(REPO_MAP_CACHE_FILE)
+        cache_data = charger_json_robuste(cache_path, default_return=None)
+        if cache_data and isinstance(cache_data, dict):
+            log.debug(f"✅ Cache Repo Map chargé depuis {cache_path}")
+            return cache_data
+        return None
+    
+    def _save_cache(self, content: str, top_n: int, db_path_base: str) -> None:
+        """Sauvegarde le cache sur le disque (utilise utilitaire existant)."""
+        cache_path = self._get_cache_path(REPO_MAP_CACHE_FILE)
+        cache_data = {
+            "content": content,
+            "timestamp": time.time(),
+            "top_n": top_n,
+            "db_path_base": str(db_path_base) if db_path_base else None
+        }
+        if sauvegarder_json(cache_path, cache_data):
+            log.info(f"✅ Cache Repo Map sauvegardé: {len(content)} caractères")
+        else:
+            log.warning(f"⚠️ Échec sauvegarde cache Repo Map")
+    
+    def _get_project_hash(self) -> str:
+        """Calcule le hash global du projet via MerkleTreeSync (réutilise code existant)."""
+        from config.settings import APP_SETTINGS
+        
+        cache_config = APP_SETTINGS.get("repo_map_cache", {})
+        watch_dirs = cache_config.get("watch_directories", ["features/", "ai_core/", "worker/"])
+        watch_files = cache_config.get("watch_files", ["config/architecture_map.json"])
+        
+        hasher = hashlib.sha256()
+        
+        # Utiliser MerkleTreeSync pour chaque dossier surveillé
+        for dir_path in watch_dirs:
+            abs_dir = get_path(dir_path) if not os.path.isabs(dir_path) else dir_path
+            if os.path.exists(abs_dir):
+                try:
+                    merkle = MerkleTreeSync(abs_dir)
+                    root = merkle.build_tree()
+                    if root and root.hash:
+                        hasher.update(root.hash.encode())
+                except Exception as e:
+                    log.warning(f"Erreur construction Merkle pour {dir_path}: {e}")
+        
+        # Ajouter les fichiers surveillés individuellement (utilise fonction existante)
+        for file_path in watch_files:
+            abs_file = get_path(file_path) if not os.path.isabs(file_path) else file_path
+            file_hash = calculate_file_hash(abs_file)
+            if file_hash:
+                hasher.update(file_hash.encode())
+        
+        return hasher.hexdigest()
+    
+    def _save_project_hash(self, project_hash: str) -> None:
+        """Sauvegarde le hash du projet (utilise utilitaire amélioré)."""
+        hash_path = self._get_cache_path(REPO_MAP_HASH_FILE)
+        sauvegarder_json(hash_path, {"hash": project_hash, "timestamp": time.time()})
+    
+    def _load_project_hash(self) -> Optional[str]:
+        """Charge le hash précédent (utilise utilitaire amélioré)."""
+        hash_path = self._get_cache_path(REPO_MAP_HASH_FILE)
+        data = charger_json_robuste(hash_path, default_return=None)
+        return data.get("hash") if isinstance(data, dict) else None
+    
+    def _is_cache_valid(self, cache_data: Dict[str, Any]) -> bool:
+        """Vérifie si le cache est valide (âge + hash)."""
+        if not cache_data:
+            return False
+        
+        from config.settings import APP_SETTINGS
+        
+        # Vérifier l'âge
+        cache_config = APP_SETTINGS.get("repo_map_cache", {})
+        ttl_seconds = cache_config.get("ttl_seconds", 300)
+        cache_age = time.time() - cache_data.get("timestamp", 0)
+        
+        if cache_age >= ttl_seconds:
+            log.debug(f"Cache expiré: {cache_age:.1f}s >= {ttl_seconds}s")
+            return False
+        
+        # Vérifier le hash
+        previous_hash = self._load_project_hash()
+        current_hash = self._get_project_hash()
+        
+        if previous_hash != current_hash:
+            log.debug(f"Hash projet changé: {previous_hash[:8] if previous_hash else 'None'}... -> {current_hash[:8]}...")
+            return False
+        
+        return True
+    
+    def invalidate_cache(self) -> None:
+        """Invalide le cache manuellement."""
+        cache_path = self._get_cache_path(REPO_MAP_CACHE_FILE)
+        hash_path = self._get_cache_path(REPO_MAP_HASH_FILE)
+        try:
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+            if os.path.exists(hash_path):
+                os.remove(hash_path)
+            log.info("🗑️ Cache Repo Map invalidé manuellement")
+        except Exception as e:
+            log.warning(f"Erreur invalidation cache: {e}")
+    
     @trace_action(source="repo_map")
     def generate_repo_map(self, top_n: int = 20) -> str:
         """
@@ -40,6 +159,12 @@ class RepoMapGenerator:
         Returns:
             Repo Map formatée en texte
         """
+        # Vérifier le cache avec validation complète
+        cache_data = self._load_cache()
+        if cache_data and self._is_cache_valid(cache_data):
+            log.debug(f"✅ Repo Map récupérée depuis le cache valide")
+            return cache_data.get('content', '')
+        
         from .symbol_graph import get_symbol_graph
         
         # Obtenir les fichiers les plus centraux
@@ -91,6 +216,13 @@ class RepoMapGenerator:
         
         repo_map_text = "\n".join(repo_map_lines)
         log.info(f"✅ Repo Map générée: {len(top_files)} fichiers, {len(repo_map_text)} caractères")
+        
+        # Sauvegarder le cache
+        self._save_cache(repo_map_text, top_n, self.db_path_base)
+        
+        # Sauvegarder le hash du projet
+        project_hash = self._get_project_hash()
+        self._save_project_hash(project_hash)
         
         return repo_map_text
     
@@ -482,8 +614,24 @@ def get_cached_repo_map(db_path_base=None, max_chars: Optional[int] = None) -> s
 
 
 def invalidate_repo_map_cache():
-    """Invalide le cache de la Repo Map (utile après modifications du projet)."""
-    global _repo_map_cache
+    """Invalide le cache Repo Map (mémoire + disque)."""
+    global _repo_map_cache, _repo_map_generator
     _repo_map_cache = None
-    log.debug("🗑️ Cache Repo Map invalidé")
+    
+    # Invalider aussi le cache disque
+    if _repo_map_generator:
+        _repo_map_generator.invalidate_cache()
+    else:
+        # Si le générateur n'existe pas encore, supprimer directement les fichiers
+        cache_dir = get_path(CACHE_DIR)
+        cache_file = os.path.join(cache_dir, REPO_MAP_CACHE_FILE)
+        hash_file = os.path.join(cache_dir, REPO_MAP_HASH_FILE)
+        for f in [cache_file, hash_file]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+    
+    log.debug("🗑️ Cache Repo Map invalidé (mémoire + disque)")
 

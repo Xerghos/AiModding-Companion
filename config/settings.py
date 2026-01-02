@@ -56,6 +56,11 @@ DEFAULT_SETTINGS = {
             "creative": "gemini-2.5-flash"
         }
     },
+    "repo_map_cache": {
+        "ttl_seconds": 300,  # 5 minutes par défaut
+        "watch_directories": ["features/", "ai_core/", "worker/"],
+        "watch_files": ["config/architecture_map.json"]
+    },
     "security": {
         "enable_sanity_check": True,
         "block_outside_project": True,

@@ -140,7 +140,7 @@ class CodeAssistClient:
     
     BASE_ENDPOINT = "https://cloudcode-pa.googleapis.com"
     API_VERSION = "v1internal"
-
+    
     # Headers capturés depuis le vrai client Gemini CLI (v0.22.5)
     # Permet d'éviter le rate-limiting agressif appliqué aux clients génériques "python-requests"
     GEMINI_CLI_USER_AGENT = "GeminiCLI/0.22.5/gemini-3-pro-preview (win32; x64) google-api-nodejs-client/9.15.1"
@@ -337,11 +337,11 @@ class CodeAssistClient:
                     "DEBUG",
                     f"Payload JSON sérialisé: {payload_size} bytes, ordre clés dans request: {request_keys}"
                 )
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "DEBUG",
-                    f"Preview JSON (1000 chars): {payload_json[:1000]}"
-                )
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Preview JSON (1000 chars): {payload_json[:1000]}"
+            )
 
             try:
                 # Utiliser AuthorizedSession.post() (comme gemini-cli)
@@ -543,11 +543,11 @@ class CodeAssistClient:
                     "DEBUG",
                     f"Payload JSON sérialisé: {payload_size} bytes, ordre clés dans request: {request_keys}"
                 )
-                UnifiedLogger.write(
-                    "AI_CORE",
-                    "DEBUG",
-                    f"Preview JSON (1000 chars): {payload_json[:1000]}"
-                )
+            UnifiedLogger.write(
+                "AI_CORE",
+                "DEBUG",
+                f"Preview JSON (1000 chars): {payload_json[:1000]}"
+            )
 
             try:
                 # Utiliser AuthorizedSession.post() (comme gemini-cli)
@@ -763,7 +763,7 @@ class CodeAssistClient:
                                 "AI_CORE",
                                 "DEBUG",
                                 f"🔍 Erreur complète (sans details): {json.dumps(error_detail, indent=2, ensure_ascii=False)}"
-                            )
+                        )
                         
                         # Log détaillé de la structure du payload qui a causé l'erreur
                         try:
@@ -903,7 +903,7 @@ class CodeAssistClient:
                                                                 "AI_CORE",
                                                                 "WARNING",
                                                                 f"⚠️ functionCall.id ABSENT mais functionResponse.id={resp_id} présent"
-                                                            )
+                                        )
                                         # Log un extrait du contenu pour voir le format
                                         if output_len > 0:
                                             output_preview = str(resp_content)[:500]

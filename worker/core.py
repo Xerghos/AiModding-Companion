@@ -208,10 +208,34 @@ class Worker(threading.Thread):
         def fetch_repo_map():
             """Fonction pour récupérer la Repo Map dans un thread séparé."""
             try:
-                from features.context.repo_map import get_cached_repo_map
-                # Utiliser le cache (gain estimé: 2-3s par requête)
-                # Pas de limite : Repo Map complète (non tronquée)
+                from features.context.repo_map import get_cached_repo_map, get_repo_map_generator, _repo_map_cache
+                
+                # Essayer le cache d'abord (même légèrement périmé < 10 min)
                 repo_map = get_cached_repo_map(db_path_base=db_path, max_chars=None)
+                
+                # Si cache absent ou très vieux (> 10 min), lancer régénération en arrière-plan
+                cache_age = 0
+                if _repo_map_cache:
+                    cache_age = time.time() - _repo_map_cache.get('timestamp', 0)
+                
+                if not repo_map or cache_age > 600:  # 10 minutes
+                    # Utiliser le cache actuel si disponible (même périmé)
+                    if _repo_map_cache and _repo_map_cache.get('content'):
+                        repo_map = _repo_map_cache['content']
+                        log.info("⚠️ Utilisation cache Repo Map périmé, régénération en cours...")
+                    
+                    # Lancer régénération en arrière-plan
+                    def regenerate_repo_map_async():
+                        try:
+                            repo_map_gen = get_repo_map_generator(db_path)
+                            new_repo_map = repo_map_gen.generate_repo_map()
+                            # Le cache sera mis à jour automatiquement par generate_repo_map()
+                            log.info("✅ Repo Map régénérée en arrière-plan")
+                        except Exception as e:
+                            log.warning(f"Erreur régénération Repo Map: {e}")
+                    
+                    threading.Thread(target=regenerate_repo_map_async, daemon=True, name="RepoMapRegen").start()
+                
                 return repo_map if repo_map else None
             except Exception as e:
                 log.debug(f"Repo Map non disponible: {e}")
@@ -1013,7 +1037,7 @@ class Worker(threading.Thread):
                                 self.response_queue.put({'type': 'ui_stream_thinking', 'text': txt})
                             else:
                                 log.info(f"🟢 Routing content chunk: {len(txt)} chars, is_thinking={is_thinking}")
-                                self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
+                            self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
                 except StopIteration:
                     # Itérateur terminé normalement
                     pass
@@ -1035,6 +1059,24 @@ class Worker(threading.Thread):
             else:
                 # Stream normal terminé
                 self.response_queue.put({'type': 'ui_stream_end'})
+                
+                # Compression mémoire en arrière-plan (non-bloquant)
+                if GlobalMemoryManager and self.main_session:
+                    def optimize_async():
+                        try:
+                            if hasattr(self.main_session, 'chat'):
+                                GlobalMemoryManager.optimize_history(self.main_session)
+                                log.debug("✅ Optimisation mémoire terminée en arrière-plan")
+                        except Exception as e:
+                            log.warning(f"Erreur optimisation mémoire asynchrone: {e}", exc_info=True)
+                    
+                    # Lancer dans un thread séparé avec priorité basse
+                    optimize_thread = threading.Thread(
+                        target=optimize_async,
+                        daemon=True,
+                        name="MemoryOptimizer"
+                    )
+                    optimize_thread.start()
             
             # Fallback : Détection !native_tool dans le texte (pour compatibilité)
             if not self.abort_current_stream:
@@ -1042,8 +1084,8 @@ class Worker(threading.Thread):
                 if native_match:
                     raw_cmd = native_match.group(1).strip()
                     if '"name": "..."' not in raw_cmd and "'name': '...'" not in raw_cmd:
-                            log.info(f"🔧 Outil détecté (fallback texte) : {raw_cmd[:50]}...")
-                            self.task_queue.put({'action': 'command', 'payload': {'command': raw_cmd}})
+                        log.info(f"🔧 Outil détecté (fallback texte) : {raw_cmd[:50]}...")
+                        self.task_queue.put({'action': 'command', 'payload': {'command': raw_cmd}})
                 
                 if not full_text.strip() and not has_received_content:
                     log.warning("⚠️ Réponse IA vide reçue (aucun contenu dans le stream).")
@@ -1286,8 +1328,6 @@ class Worker(threading.Thread):
                 if action == 'chat':
                     # [BACKGROUND] Lancement threadé pour ne pas bloquer le STOP
                     self.bg_executor.submit(self._handle_chat_stream, payload)
-                    if GlobalMemoryManager and self.main_session:
-                        self.bg_executor.submit(GlobalMemoryManager.optimize_history, self.main_session)
                 
                 # ... (Dans la boucle while, méthode run)
                 elif action == 'command':

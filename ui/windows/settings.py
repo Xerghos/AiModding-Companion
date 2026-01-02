@@ -301,6 +301,16 @@ class SettingsWindow(BaseWindow):
         var = tk.StringVar(value=str(val))
         self.vars[key] = var
         ctk.CTkEntry(frame, textvariable=var).pack(side="right", fill="x", expand=True, padx=5)
+    
+    def _add_text(self, parent, key, label, default):
+        """Ajoute un widget de texte multi-lignes."""
+        frame = ctk.CTkFrame(parent, fg_color="transparent"); frame.pack(fill="both", expand=True, pady=2)
+        ctk.CTkLabel(frame, text=label, anchor="w").pack(anchor="w", padx=5, pady=(0, 5))
+        val = self._get_val(key, default)
+        text_widget = ctk.CTkTextbox(frame, height=100)
+        text_widget.insert("1.0", str(val))
+        text_widget.pack(fill="both", expand=True, padx=5)
+        self.vars[key] = text_widget
 
     # --- CONSTRUCTION ONGLETS ---
 
@@ -337,6 +347,25 @@ class SettingsWindow(BaseWindow):
         self._add_slider(scroll, "general_settings.secondary_chat_pool_size", "Pool Tâches de Fond", 1, 10, 1, False)
         self._add_entry(scroll, "general_settings.api_cooldown_seconds", "Cooldown API (sec)", "60")
         self._add_entry(scroll, "general_settings.audit_interval_seconds", "Vitesse Audit (sec)", "0.1")
+        
+        # Section Cache Repo Map
+        self._add_header(scroll, "🗺️ Cache Repo Map")
+        self._add_slider(scroll, "repo_map_cache.ttl_seconds", "TTL Cache (secondes)", 60, 3600, 300)
+        
+        # Watch directories
+        watch_dirs = self._get_val("repo_map_cache.watch_directories", ["features/", "ai_core/", "worker/"])
+        watch_dirs_text = "\n".join(watch_dirs) if isinstance(watch_dirs, list) else str(watch_dirs)
+        self._add_text(scroll, "repo_map_cache.watch_directories", "Dossiers surveillés (un par ligne)", watch_dirs_text)
+        
+        # Watch files
+        watch_files = self._get_val("repo_map_cache.watch_files", ["config/architecture_map.json"])
+        watch_files_text = "\n".join(watch_files) if isinstance(watch_files, list) else str(watch_files)
+        self._add_text(scroll, "repo_map_cache.watch_files", "Fichiers surveillés (un par ligne)", watch_files_text)
+        
+        # Bouton Invalider Cache
+        invalidate_btn = ctk.CTkButton(scroll, text="🗑️ Invalider le Cache", 
+                                      command=lambda: self._invalidate_repo_map_cache())
+        invalidate_btn.pack(pady=5)
 
     def _build_api_tab_dynamic(self):
         scroll = self._add_scroll_frame(self.tab_api)
@@ -887,6 +916,16 @@ class SettingsWindow(BaseWindow):
         thread = threading.Thread(target=auth_thread, daemon=True)
         thread.start()
 
+    def _invalidate_repo_map_cache(self):
+        """Invalide le cache Repo Map."""
+        try:
+            from features.context.repo_map import invalidate_repo_map_cache
+            invalidate_repo_map_cache()
+            # Afficher un message de confirmation
+            show_messagebox("Cache invalidé", "Le cache Repo Map a été invalidé avec succès.", icon="info", parent=self)
+        except Exception as e:
+            show_messagebox("Erreur", f"Erreur lors de l'invalidation: {e}", icon="error", parent=self)
+
     def _build_system_code_tab(self):
         scroll = self._add_scroll_frame(self.tab_sys)
         
@@ -1117,7 +1156,23 @@ class SettingsWindow(BaseWindow):
                         APP_SETTINGS["cli_bridge"] = self.settings["cli_bridge"]
                         continue
                     
-                    val = var.get()
+                    # Gestion spéciale pour les widgets texte multi-lignes (CTkTextbox)
+                    if isinstance(var, ctk.CTkTextbox):
+                        val_str = var.get("1.0", "end-1c")
+                        # Convertir en liste si c'est watch_directories ou watch_files
+                        if "watch_directories" in key or "watch_files" in key:
+                            val_list = [x.strip() for x in val_str.split("\n") if x.strip()]
+                            parts = key.split(".")
+                            if len(parts) >= 2:
+                                section = parts[0]
+                                subkey = parts[1]
+                                if section not in self.settings: self.settings[section] = {}
+                                self.settings[section][subkey] = val_list
+                            continue
+                        else:
+                            val = val_str
+                    else:
+                        val = var.get()
                     
                     # Typage
                     if isinstance(val, str):

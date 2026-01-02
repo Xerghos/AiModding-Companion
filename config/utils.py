@@ -1,18 +1,30 @@
 import json
 import os
+import logging
 from .paths import get_path
 from .constants import HISTORY_FILE, CONTEXT_FILE
 
-def charger_json_robuste(file_path):
-    if os.path.exists(file_path):
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return data
-        except Exception as e:
-            print(f"Erreur chargement JSON {file_path}: {e}")
-            return []
-    return []
+def charger_json_robuste(file_path, default_return=None):
+    """
+    Charge un fichier JSON de manière robuste.
+    
+    Args:
+        file_path: Chemin du fichier JSON
+        default_return: Valeur à retourner si fichier inexistant ou erreur (None par défaut)
+    
+    Returns:
+        Données JSON chargées ou default_return
+    """
+    if not os.path.exists(file_path):
+        return default_return
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        # Utiliser logging au lieu de print
+        logging.getLogger("config.utils").warning(f"Erreur chargement JSON {file_path}: {e}")
+        return default_return
 
 def sauvegarder_json(file_path, data):
     def default_serializer(obj):
@@ -31,7 +43,7 @@ def sauvegarder_json(file_path, data):
 
 def charger_historique_robuste_worker(file_path=None):
     path = file_path if file_path else get_path(HISTORY_FILE)
-    data = charger_json_robuste(path)
+    data = charger_json_robuste(path, default_return=[])
     if isinstance(data, list): return [e for e in data if isinstance(e, dict)]
     return []
 
@@ -41,7 +53,7 @@ def sauvegarder_historique_worker(data, file_path=None):
 
 def charger_liens_contexte_worker(file_path=None):
     path = file_path if file_path else get_path(CONTEXT_FILE)
-    data = charger_json_robuste(path)
+    data = charger_json_robuste(path, default_return=[])
     return data if isinstance(data, list) else []
 
 def sauvegarder_liens_contexte_worker(data, file_path=None):

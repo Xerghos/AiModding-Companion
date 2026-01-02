@@ -83,6 +83,18 @@ def _calculate_file_hash(file_path):
     except Exception:
         return None
 
+def calculate_file_hash(file_path: str):
+    """
+    Calcule le hash SHA256 d'un fichier (fonction publique).
+    
+    Args:
+        file_path: Chemin du fichier
+    
+    Returns:
+        Hash hexadécimal ou None en cas d'erreur
+    """
+    return _calculate_file_hash(file_path)
+
 def _lister_fichiers_cibles(cible, strict_mode=True):
     """Helper pour récupérer les fichiers physiques."""
     abs_path = get_path(cible)
