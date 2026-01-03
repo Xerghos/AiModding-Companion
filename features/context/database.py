@@ -1,7 +1,7 @@
 """
 Moteur de base de données sémantique omniscient utilisant sqlite-vec.
-Version ultra-stable V4 optimisée pour Ryzen AI (GPU Radeon 780M).
-Correction : Autorisations SQLite, Signatures API et Robustesse.
+Version V6 : Pipeline Streaming TOTAL (Scan -> I/O -> Encode -> DB).
+Optimisation Windows/Ryzen : Démarrage instantané, zéro latence de scan.
 """
 
 import os
@@ -12,13 +12,14 @@ import numpy as np
 import threading
 import hashlib
 import time
-import json
-from typing import Dict, Optional, List, Tuple, Any
+import queue
+from typing import Dict, Optional, List, Tuple, Any, Callable
+from concurrent.futures import ThreadPoolExecutor
 
 from config import get_logger, get_path, SUPPORTED_FILE_EXTENSIONS
 from features.Decorators import trace_action
 
-# Initialisation hardware (Filtres warnings)
+# Initialisation hardware
 try:
     import ai_core.hardware_init
 except ImportError:
@@ -39,7 +40,7 @@ SentenceTransformer = None
 model = None
 _db_initialized = False
 
-# --- Fonctions de compatibilité API (Fix ImportError) ---
+# --- Fonctions API ---
 
 @trace_action(source="database")
 def _get_db_path():
@@ -49,39 +50,26 @@ def _get_db_path():
 
 @trace_action(source="database")
 def _get_paths(db_path_base=None):
-    """Restauré pour assurer la compatibilité avec symbol_graph et repo_map."""
     db_path = db_path_base or _get_db_path()
     return (db_path, None, None)
 
 def get_connection(db_path_base=None):
-    """Crée une connexion SQLite avec l'extension vec chargée."""
     db_path = db_path_base or _get_db_path()
     abs_db_path = os.path.abspath(db_path)
     os.makedirs(os.path.dirname(abs_db_path), exist_ok=True)
-    
-    # Timeout 60s pour éviter les verrous
     conn = sqlite3.connect(abs_db_path, timeout=60.0)
-    
     try:
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
-    except Exception as e:
-        log.warning(f"⚠️ Autorisation extension SQLite dégradée : {e}")
-        try:
-            sqlite_vec.load(conn)
-        except:
-            log.error("❌ Échec critique chargement sqlite-vec")
-            
+    except:
+        sqlite_vec.load(conn)
     return conn
-
-# --- Gestion du Modèle et Accélération ---
 
 @trace_action(source="database")
 def _ensure_model():
     global SentenceTransformer, model
-    if model is not None:
-        return
+    if model is not None: return
 
     with _ensure_libs_lock:
         if SentenceTransformer is None:
@@ -90,41 +78,33 @@ def _ensure_model():
                 from sentence_transformers import SentenceTransformer as ST
                 SentenceTransformer = ST
             except Exception as e:
-                log.error(f"❌ Échec import IA : {e}")
+                log.error(f"❌ Erreur import IA : {e}")
                 return
 
         if model is None:
             log.info(f"Chargement modèle Embedding : {EMBEDDING_MODEL_NAME}...")
             try:
                 import torch
-                # [PLAN STABILISATION] Forcer CPU pour éviter le bug "Inference Tensor" de DirectML
+                # Force CPU pour stabilité maximale et parallélisme AVX-512
                 device = "cpu"
-                log.info(f"⚙️ Mode CPU forcé pour stabilité indexation (Zen 4 Optimized)")
-                
+                log.info("⚙️ Mode CPU forcé (Zen 4 Optimized)")
                 base_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
-
-                # Optimisation CPU Native (INT8)
-                log.info("🔍 Application quantification dynamique native (INT8)...")
+                
+                # Quantification native INT8
                 try:
                     base_model = torch.quantization.quantize_dynamic(
                         base_model, {torch.nn.Linear}, dtype=torch.qint8
                     )
-                    log.info("✅ Modèle quantifié INT8 (Performance Max CPU)")
-                except Exception as q_e:
-                    log.warning(f"⚠️ Echec quantification : {q_e}")
+                    log.info("✅ Modèle quantifié INT8")
+                except: pass
 
                 model = base_model
-                log.info(f"✅ Modèle prêt sur CPU")
-                
             except Exception as e:
                 log.error(f"❌ Erreur _ensure_model : {e}")
                 raise
 
-# --- Opérations Base de Données ---
-
 @trace_action(source="database")
 def init_db(db_path_base=None):
-    """Initialise le schéma de la base de données."""
     global _db_initialized
     if _db_initialized and db_path_base is None: return
 
@@ -134,394 +114,289 @@ def init_db(db_path_base=None):
         cursor.execute("PRAGMA journal_mode=WAL;")
         cursor.execute("PRAGMA synchronous=NORMAL;")
         
-        # 1. Table des fichiers
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                path TEXT UNIQUE NOT NULL, 
-                checksum TEXT NOT NULL, 
-                last_indexed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # 2. Table des chunks (SCHEMA BLINDÉ V4)
+        cursor.execute('CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE, checksum TEXT, last_indexed TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                file_id INTEGER NOT NULL, 
-                chunk_index INTEGER DEFAULT 0, 
-                content TEXT NOT NULL, 
-                ast_type TEXT, 
-                start_line INTEGER, 
-                end_line INTEGER, 
-                parent_context TEXT,
-                metadata TEXT,
-                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
-            )
+                id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER, chunk_index INTEGER DEFAULT 0, 
+                content TEXT, ast_type TEXT, start_line INTEGER, end_line INTEGER, 
+                parent_context TEXT, metadata TEXT,
+                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE)
         ''')
-        
-        # 3. Table Vectorielle
-        cursor.execute(f'''
-            CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-                chunk_id INTEGER PRIMARY KEY, 
-                embedding float[{EMBEDDING_DIM}]
-            )
-        ''')
-        
-        # 4. Table FTS5
-        try:
-            cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(content, tokenize='trigram')")
+        cursor.execute(f'CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(chunk_id INTEGER PRIMARY KEY, embedding float[{EMBEDDING_DIM}])')
+        try: cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(content, tokenize='trigram')")
         except: pass
 
         conn.commit()
         conn.close()
         if db_path_base is None: _db_initialized = True
-        log.info("✅ Schéma DB Omni-V4 initialisé.")
-
-@trace_action(source="database")
-def _add_chunks_batch(file_id: int, chunks_data: List[Dict]):
-    _ensure_model()
-    if not chunks_data or not model: return 0
-    
-    texts = [c.get('content', '') for c in chunks_data]
-    vectors = model.encode(texts, convert_to_numpy=True)
-    
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            conn = get_connection()
-            cursor = conn.cursor()
-            inserted_count = 0
-            
-            for i, (chunk, vector) in enumerate(zip(chunks_data, vectors)):
-                params = {
-                    'file_id': file_id,
-                    'chunk_index': i,
-                    'content': chunk['content'],
-                    'ast_type': chunk.get('ast_type'),
-                    'start_line': chunk.get('start_line'),
-                    'end_line': chunk.get('end_line'),
-                    'parent_context': chunk.get('parent_context'),
-                    'metadata': chunk.get('metadata')
-                }
-                
-                cursor.execute('''
-                    INSERT INTO chunks (
-                        file_id, chunk_index, content, ast_type, 
-                        start_line, end_line, parent_context, metadata
-                    )
-                    VALUES (
-                        :file_id, :chunk_index, :content, :ast_type, 
-                        :start_line, :end_line, :parent_context, :metadata
-                    )
-                ''', params)
-                
-                cid = cursor.lastrowid
-                cursor.execute("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", (cid, vector.tobytes()))
-                try: 
-                    cursor.execute("INSERT INTO fts_chunks(rowid, content) VALUES (?, ?)", (cid, chunk['content']))
-                except: pass
-                inserted_count += 1
-            
-            conn.commit()
-            conn.close()
-            return inserted_count
-            
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.5 * (attempt + 1))
-                continue
-            else:
-                log.error(f"Erreur SQL finale : {e}")
-                if 'conn' in locals(): conn.close()
-                return 0
-        except Exception as e:
-            log.error(f"Erreur insertion batch : {e}")
-            if 'conn' in locals(): conn.close()
-            return 0
-    return 0
-
-@trace_action(source="database")
-def search_hybrid(query: str, db_path_base=None, limit: int = 20, use_hybrid=True, **kwargs) -> Tuple[List, Optional[str]]:
-    _ensure_model()
-    init_db(db_path_base)
-    if not model: return [], "Modèle non chargé"
-    
-    try:
-        query_vec = model.encode([query])[0]
-        conn = get_connection(db_path_base)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT chunk_id, distance 
-            FROM vec_chunks 
-            WHERE embedding MATCH ? AND k = 50 
-            ORDER BY distance ASC
-        ''', (query_vec.tobytes(),))
-        vec_results = cursor.fetchall()
-        
-        scores = {}
-        for i, (cid, _) in enumerate(vec_results): 
-            scores[cid] = scores.get(cid, 0) + (1.0 / (60 + i + 1))
-        
-        sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
-        final_results = []
-        for cid, score in sorted_ids:
-            cursor.execute('''
-                SELECT f.path, c.content, c.ast_type, c.start_line 
-                FROM chunks c 
-                JOIN files f ON f.id = c.file_id 
-                WHERE c.id = ?
-            ''', (cid,))
-            row = cursor.fetchone()
-            if row: final_results.append((row[0], row[1], score, row[2], row[3]))
-            
-        conn.close()
-        return final_results, None
-    except Exception as e:
-        log.error(f"Erreur recherche : {e}")
-        return [], str(e)
-
-def search_vector_db(query, db_path_base=None, max_results=5):
-    results, err = search_hybrid(query, db_path_base, limit=max_results)
-    return results, err
 
 @trace_action(source="database")
 def index_project_files(root_path: str, progress_callback=None, use_semantic_chunking=True, **kwargs):
-    """Indexation complète avec Mode Turbo (Massive Batch) pour >100 fichiers."""
+    """
+    Indexation V6 : Pipeline Streaming TOTAL (Scan -> I/O -> Encode -> DB).
+    Optimisation : Le Scan alimente la queue d'I/O en temps réel.
+    """
     from .merkle_sync import MerkleTreeSync
     from .code_chunker import get_chunker
     from features.gitignore_parser import parse_gitignore
     from config.settings import APP_SETTINGS
-    from concurrent.futures import ThreadPoolExecutor
     
     init_db()
+    log.info(f"🚀 Début Indexation V6 (Full Streaming) : {root_path}")
     
-    log.info(f"🚀 Début indexation (Mode Turbo) : {root_path}")
-    
-    # 1. Chargement .gitignore
-    gitignore_path = os.path.join(root_path, ".gitignore")
-    matches_gitignore = lambda x: False
-    if os.path.exists(gitignore_path):
-        try:
-            matches_gitignore = parse_gitignore(gitignore_path)
-        except: pass
-
-    # 2. Détection DB vide
-    db_is_empty = True
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM files")
-        db_is_empty = (cursor.fetchone()[0] == 0)
-        conn.close()
-    except: pass
-
-    # 3. Merkle Sync
-    state_file = get_path("db/merkle_state_v4.json")
-    current_tree = MerkleTreeSync(root_path)
-    current_tree.build_tree()
-    
-    previous_hashes = MerkleTreeSync.load_state(state_file)
-    from .merkle_sync import MerkleNode
-    prev_tree = MerkleTreeSync(root_path)
-    for p, h in previous_hashes.items(): prev_tree.node_map[p] = MerkleNode(p, is_file=True, hash_value=h)
-    
-    modified = current_tree.compare_trees(prev_tree)
-    
-    if db_is_empty and not modified:
-        log.info("🔄 DB vide : Forçage complet...")
-        modified = [n.path for n in current_tree.node_map.values() if n.is_file]
-    elif not modified:
-        return "Base déjà à jour."
-
     chunker = get_chunker()
-    _ensure_model()
-    
-    # 4. Filtrage & Qualification
-    critical_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'db', 'logs', 'dist', 'build', 'audio_cache', '.vscode', '.idea'}
-    watch_list = APP_SETTINGS.get("repo_map_cache", {}).get("watch_files", [])
-    normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
-    
-    to_index = []
-    for fpath in modified:
-        if os.path.normpath(fpath).lower() in normalized_watch_list:
-            to_index.append(fpath)
-            continue
+    _ensure_model() # Préchauffage modèle AVANT le scan pour ne pas bloquer
 
-        rel_path = os.path.relpath(fpath, root_path)
-        if any(p in critical_dirs for p in rel_path.split(os.sep)): continue
-        if matches_gitignore(fpath): continue
-            
-        valid_exts = SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css', '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml', '.toml', '.xml', '.sql', '.ini', '.cfg')
-        if not fpath.lower().endswith(valid_exts):
+    # --- PIPELINE COMPONENTS ---
+    
+    # file_queue: fpath (Scan -> I/O)
+    file_queue = queue.Queue(maxsize=2000)
+    # chunk_queue: (fpath, rel, checksum, [chunks]) (I/O -> Encoder)
+    chunk_queue = queue.Queue(maxsize=1000)
+    # write_queue: (file_data, vector_data) (Encoder -> Writer)
+    write_queue = queue.Queue(maxsize=1000)
+    
+    # Stats
+    stats = {'files_scanned': 0, 'files_read': 0, 'chunks_encoded': 0, 'db_writes': 0}
+    
+    # --- STAGE 1: SCANNER (Thread) ---
+    def scanner_thread():
+        gitignore_path = os.path.join(root_path, ".gitignore")
+        matches_gitignore = parse_gitignore(gitignore_path) if os.path.exists(gitignore_path) else lambda x: False
+        
+        critical_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'db', 'logs', 'dist', 'build', 'audio_cache', '.vscode', '.idea'}
+        watch_list = APP_SETTINGS.get("repo_map_cache", {}).get("watch_files", [])
+        normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
+        
+        for root, dirs, files in os.walk(root_path):
+            dirs[:] = [d for d in dirs if d not in critical_dirs]
+            for file in files:
+                fpath = os.path.join(root, file)
+                
+                # 1. Check Watchlist
+                if os.path.normpath(fpath).lower() in normalized_watch_list:
+                    file_queue.put(fpath)
+                    stats['files_scanned'] += 1
+                    continue
+                
+                # 2. Check Gitignore
+                if matches_gitignore(fpath): continue
+                
+                # 3. Check Extension
+                valid_exts = SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css', '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml', '.toml', '.xml', '.sql', '.ini', '.cfg')
+                if not fpath.lower().endswith(valid_exts):
+                    try: 
+                        if os.path.getsize(fpath) > 1024 * 1024: continue
+                    except: continue
+                
+                file_queue.put(fpath)
+                stats['files_scanned'] += 1
+        
+        # Signal de fin pour les I/O workers (on en envoie autant que de workers)
+        # Mais comme on utilise un ThreadPool, on ne peut pas envoyer de signal de fin direct dans la queue
+        # car on ne sait pas quel thread prendra quoi.
+        # Solution: On utilise un "poison pill" unique et le consumer gère.
+        # OU MIEUX : Le thread I/O Manager détecte que scanner est fini et que la queue est vide.
+        pass # Le thread s'arrête simplement
+
+    # --- STAGE 2: I/O MANAGER (Thread) ---
+    def io_manager_thread():
+        # Lance les workers I/O et distribue le travail
+        # Attend que le scanner ait fini ET que la queue soit vide
+        
+        def process_file_task(fpath):
             try:
-                if os.path.getsize(fpath) > 1024 * 1024: continue
-            except: continue
+                rel = os.path.relpath(fpath, root_path)
+                with open(fpath, 'rb') as f: data = f.read()
+                if b'\0' in data[:8000]: return
+                checksum = hashlib.sha256(data).hexdigest()
+                text = data.decode('utf-8', errors='ignore')
+                chunks = chunker.chunk_file(fpath) if use_semantic_chunking and fpath.endswith('.py') else [{'content': text}]
+                chunk_queue.put((fpath, rel, checksum, chunks))
+                stats['files_read'] += 1
+            except Exception: pass
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            while True:
+                try:
+                    # On attend un fichier avec timeout pour vérifier si le scan est fini
+                    fpath = file_queue.get(timeout=0.1)
+                    executor.submit(process_file_task, fpath)
+                except queue.Empty:
+                    if not t_scan.is_alive():
+                        break
         
-        to_index.append(fpath)
+        # Quand tout est soumis et fini
+        chunk_queue.put(None) # Signal pour l'encodeur
 
-    total_files = len(to_index)
-    log.info(f"📂 {total_files} fichiers à indexer.")
-    
-    if total_files == 0:
-        return "Aucun fichier éligible."
-
-    # --- PHASE 1 : Préparation Parallèle (Lecture + Chunking) ---
-    # On utilise tous les coeurs pour lire et découper les fichiers
-    def prepare_file(fpath):
-        try:
-            rel = os.path.relpath(fpath, root_path)
-            with open(fpath, 'rb') as f: data = f.read()
-            if b'\0' in data[:8000]: return None
-            
-            checksum = hashlib.sha256(data).hexdigest()
-            text = data.decode('utf-8', errors='ignore')
-            
-            file_chunks = []
-            if use_semantic_chunking and fpath.endswith('.py'):
-                try: file_chunks = chunker.chunk_file(fpath)
-                except: file_chunks = [{'content': text}]
-            else:
-                file_chunks = [{'content': text}]
-            
-            return (fpath, rel, checksum, file_chunks)
-        except: return None
-
-    log.info("⚡ Phase 1 : Lecture & Chunking parallèle...")
-    prepared_data = []
-    with ThreadPoolExecutor() as executor:
-        results = executor.map(prepare_file, to_index)
-        for res in results:
-            if res: prepared_data.append(res)
-
-    # --- PHASE 2 : Mode Turbo (>100 fichiers) ---
-    if total_files >= 100:
-        log.info(f"🚀 MODE TURBO ACTIVÉ : Traitement massif de {len(prepared_data)} fichiers")
+    # --- STAGE 3: ENCODER (Thread) ---
+    def encoder_thread():
+        batch_size = 64
+        current_batch_files = []
+        current_batch_texts = []
         
-        # A. Collecte globale des textes pour vectorisation
-        all_chunks_flat = [] # (file_index, chunk_data)
-        all_texts = []
-        
-        for f_idx, (_, _, _, chunks) in enumerate(prepared_data):
+        while True:
+            item = chunk_queue.get()
+            if item is None:
+                if current_batch_texts:
+                    process_encoding_batch(current_batch_files, current_batch_texts)
+                write_queue.put(None)
+                break
+            
+            fpath, rel, checksum, chunks = item
             for ch in chunks:
-                txt = ch.get('content', '')
-                if txt.strip():
-                    all_chunks_flat.append((f_idx, ch))
-                    all_texts.append(txt)
-        
-        # B. Vectorisation Massive (1 seul appel au modèle = 0 overhead)
-        log.info(f"🧠 Vectorisation de {len(all_texts)} segments...")
-        if all_texts:
-            all_vectors = model.encode(all_texts, convert_to_numpy=True, show_progress_bar=True)
-        else:
-            all_vectors = []
+                txt = ch.get('content', '').strip()
+                if txt:
+                    current_batch_texts.append(txt)
+                    current_batch_files.append((fpath, rel, checksum, ch))
+            
+            if len(current_batch_texts) >= batch_size:
+                process_encoding_batch(current_batch_files, current_batch_texts)
+                current_batch_files = []
+                current_batch_texts = []
 
-        # C. Insertion Transactionnelle Unique
-        log.info("💾 Écriture DB massive...")
+    def process_encoding_batch(meta_list, text_list):
+        if not text_list: return
+        try:
+            vectors = model.encode(text_list, batch_size=len(text_list), convert_to_numpy=True, show_progress_bar=False)
+            write_queue.put((meta_list, vectors))
+            stats['chunks_encoded'] += len(vectors)
+            if progress_callback and stats['chunks_encoded'] % 50 == 0:
+                progress_callback(f"Indexation V6 : {stats['chunks_encoded']} chunks...")
+        except Exception as e:
+            log.error(f"Erreur Encodage : {e}")
+
+    # --- STAGE 4: WRITER (Thread) ---
+    def writer_thread():
         conn = get_connection()
         cursor = conn.cursor()
+        file_id_cache = {}
+        cursor.execute("DELETE FROM files") 
+        conn.commit()
         
-        try:
-            # 1. Mise à jour Files (Batch)
-            # On supprime d'abord les anciens fichiers
-            paths_to_delete = [item[1] for item in prepared_data]
-            cursor.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in paths_to_delete])
+        while True:
+            item = write_queue.get()
+            if item is None:
+                conn.commit()
+                conn.close()
+                break
             
-            # On insère les nouveaux et on récupère les IDs
-            # Astuce: On insère un par un pour récupérer l'ID fiable, c'est très rapide en transaction
-            file_ids_map = {} # f_idx -> db_id
-            for f_idx, (_, rel, checksum, _) in enumerate(prepared_data):
-                cursor.execute("INSERT INTO files (path, checksum) VALUES (?, ?)", (rel, checksum))
-                file_ids_map[f_idx] = cursor.lastrowid
-
-            # 2. Préparation Chunks (Batch)
-            chunks_sql_data = []
-            vec_sql_data = []
-            fts_sql_data = []
+            meta_list, vectors = item
             
-            for (f_idx, ch), vec in zip(all_chunks_flat, all_vectors):
-                fid = file_ids_map[f_idx]
-                # On insère le chunk pour avoir son ID
-                # Note: Pour aller vite, on ne peut pas utiliser executemany ET récupérer les IDs générés facilement
-                # Sauf si on insère un par un dans la transaction. C'est le goulot d'étranglement.
-                # Optimisation : On insère un par un mais dans la transaction globale.
+            files_to_insert = {}
+            for _, rel, checksum, _ in meta_list:
+                if rel not in file_id_cache:
+                    files_to_insert[rel] = checksum
+            
+            if files_to_insert:
+                for rel, checksum in files_to_insert.items():
+                    cursor.execute("INSERT INTO files (path, checksum) VALUES (?, ?)", (rel, checksum))
+                    file_id_cache[rel] = cursor.lastrowid
+            
+            for (fpath, rel, checksum, ch), vec in zip(meta_list, vectors):
+                fid = file_id_cache.get(rel)
+                if not fid: continue # Should not happen
                 
                 params = {
-                    'fid': fid, 'idx': 0, # idx simplifié, pas critique
-                    'cnt': ch['content'], 'ast': ch.get('ast_type'),
+                    'fid': fid, 'idx': 0, 'cnt': ch['content'], 'ast': ch.get('ast_type'),
                     'sl': ch.get('start_line'), 'el': ch.get('end_line'),
                     'pc': ch.get('parent_context'), 'meta': ch.get('metadata')
                 }
-                cursor.execute('''
-                    INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata)
-                    VALUES (:fid, :idx, :cnt, :ast, :sl, :el, :pc, :meta)
-                ''', params)
+                cursor.execute('''INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata) VALUES (:fid, :idx, :cnt, :ast, :sl, :el, :pc, :meta)''', params)
                 cid = cursor.lastrowid
-                
-                vec_sql_data.append((cid, vec.tobytes()))
-                fts_sql_data.append((cid, ch['content']))
-
-            # 3. Insertion Vectorielle & FTS (Batch Pur)
-            cursor.executemany("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", vec_sql_data)
-            try: cursor.executemany("INSERT INTO fts_chunks(rowid, content) VALUES (?, ?)", fts_sql_data)
-            except: pass
+                cursor.execute("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", (cid, vec.tobytes()))
+                try: cursor.execute("INSERT INTO fts_chunks(rowid, content) VALUES (?, ?)", (cid, ch['content']))
+                except: pass
             
             conn.commit()
-            
-        except Exception as e:
-            log.error(f"❌ Erreur Transaction Turbo : {e}")
-            conn.rollback()
-        finally:
-            conn.close()
+            stats['db_writes'] += 1
 
-    # --- PHASE 2bis : Mode Séquentiel (<100 fichiers) ---
-    else:
-        log.info("Mode Standard (Séquentiel)")
-        count = 0
-        for fpath, rel, checksum, chunks in prepared_data:
-            try:
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM files WHERE path = ?", (rel,))
-                cursor.execute("INSERT INTO files (path, checksum) VALUES (?, ?)", (rel, checksum))
-                fid = cursor.lastrowid
-                conn.commit()
-                conn.close()
-                _add_chunks_batch(fid, chunks)
-                count += 1
-                if progress_callback: progress_callback(f"Indexation : {rel} ({count}/{total_files})")
-            except: pass
+    # --- ORCHESTRATION ---
+    t_scan = threading.Thread(target=scanner_thread, daemon=True)
+    t_io = threading.Thread(target=io_manager_thread, daemon=True)
+    t_enc = threading.Thread(target=encoder_thread, daemon=True)
+    t_write = threading.Thread(target=writer_thread, daemon=True)
+    
+    t_scan.start()
+    t_io.start()
+    t_enc.start()
+    t_write.start()
+    
+    t_scan.join()
+    t_io.join()
+    t_enc.join()
+    t_write.join()
+    
+    try:
+        state_file = get_path("db/merkle_state_v4.json")
+        MerkleTreeSync(root_path).save_state(state_file)
+    except: pass
 
-    current_tree.save_state(state_file)
-    log.info(f"✅ Indexation terminée : {total_files} fichiers traités.")
-    return f"Indexation réussie : {total_files} fichiers traités."
+    log.info(f"✅ Indexation V6 Terminé : {stats['files_scanned']} fichiers scannés.")
+    return f"Succès V6 : {stats['files_scanned']} fichiers."
 
 # --- Autres Exports ---
 
-def store_memory(text: str, metadata: Dict = None):
-    init_db()
+def _add_chunks_batch(file_id: int, chunks_data: List[Dict]):
+    _ensure_model()
+    if not chunks_data or not model: return 0
+    texts = [c.get('content', '') for c in chunks_data]
+    vectors = model.encode(texts, convert_to_numpy=True)
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO files (path, checksum) VALUES (?, ?)", ("memory://global", "0"))
-    fid = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return _add_chunks_batch(fid, [{'content': text, 'ast_type': 'memory'}])
+    try:
+        count = 0
+        for i, (chunk, vector) in enumerate(zip(chunks_data, vectors)):
+            params = {'file_id': file_id, 'chunk_index': i, 'content': chunk['content'], 'ast_type': chunk.get('ast_type'), 'start_line': chunk.get('start_line'), 'end_line': chunk.get('end_line'), 'parent_context': chunk.get('parent_context'), 'metadata': chunk.get('metadata')}
+            cursor.execute('''INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata) VALUES (:file_id, :chunk_index, :content, :ast_type, :start_line, :end_line, :parent_context, :metadata)''', params)
+            cid = cursor.lastrowid
+            cursor.execute("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", (cid, vector.tobytes()))
+            try: cursor.execute("INSERT INTO fts_chunks(rowid, content) VALUES (?, ?)", (cid, chunk['content']))
+            except: pass
+            count += 1
+        conn.commit()
+        return count
+    finally: conn.close()
 
+def search_hybrid(query: str, db_path_base=None, limit: int = 20, **kwargs):
+    _ensure_model()
+    init_db(db_path_base)
+    if not model: return [], "Modèle non chargé"
+    try:
+        query_vec = model.encode([query])[0]
+        conn = get_connection(db_path_base)
+        cursor = conn.cursor()
+        cursor.execute('SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ? AND k = 50 ORDER BY distance ASC', (query_vec.tobytes(),))
+        vec_results = cursor.fetchall()
+        scores = {}
+        for i, (cid, _) in enumerate(vec_results): scores[cid] = scores.get(cid, 0) + (1.0 / (60 + i + 1))
+        sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+        final = []
+        for cid, score in sorted_ids:
+            cursor.execute('SELECT f.path, c.content, c.ast_type, c.start_line FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?', (cid,))
+            row = cursor.fetchone()
+            if row: final.append((row[0], row[1], score, row[2], row[3]))
+        conn.close()
+        return final, None
+    except Exception as e: return [], str(e)
+
+def search_vector_db(query, db_path_base=None, max_results=5): return search_hybrid(query, db_path_base, limit=max_results)
+def store_memory(text: str, metadata: Dict = None):
+    init_db(); conn = get_connection(); cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO files (path, checksum) VALUES (?, ?)", ("memory://global", "0")); fid = cursor.lastrowid
+    conn.commit(); conn.close()
+    return _add_chunks_batch(fid, [{'content': text, 'ast_type': 'memory'}])
 def search_memories(query: str, n_results=3, **kwargs):
     res, _ = search_hybrid(query, limit=n_results)
     return [r for r in res if r[0] == "memory://global"][:n_results]
-
 def is_model_ready(): return model is not None
 def warmup_model_background(): threading.Thread(target=_ensure_model, daemon=True, name="ModelWarmup").start()
 def delete_local_db():
-    global _db_initialized
-    p = _get_db_path()
+    global _db_initialized; p = _get_db_path()
     if os.path.exists(p): 
         try:
             _db_initialized = False
-            for ext in ['', '-wal', '-shm']:
+            for ext in ['', '-wal', '-shm']: 
                 if os.path.exists(p + ext): os.remove(p + ext)
             return "✅ Base V4 supprimée."
         except Exception as e: return f"❌ Erreur : {e}"

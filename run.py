@@ -17,19 +17,44 @@ import ctypes
 # 1. Configuration du Path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# 2. Gestion High-DPI (Pour éviter l'interface floue ou cassée sur Windows)
+# 2. Gestion High-DPI
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except Exception:
     pass
 
-# 3. Initialisation du Logger
+# --- MONKEY PATCH CTkToolTip (Fix Crash TclError: bad window path name) ---
 try:
-    import config.logs
-    from features.UnifiedLogger import UnifiedLogger
-    UnifiedLogger.write("run", "START", "Lancement...")
+    from CTkToolTip import CTkToolTip
+    
+    def safe_show(self):
+        try:
+            # Appel de la méthode originale (bound method trick not needed here as we replace class method)
+            # Mais on ne peut pas appeler super() ou original facilement si on remplace.
+            # On réimplémente juste la partie critique safe
+            if self.widget.winfo_exists():
+                self.deiconify()
+        except Exception:
+            pass
+
+    # On sécurise la méthode interne qui crash
+    if hasattr(CTkToolTip, "_show"):
+        original_show = CTkToolTip._show
+        def safe_internal_show(self, *args, **kwargs):
+            try:
+                original_show(self, *args, **kwargs)
+            except Exception: # TclError et autres
+                pass
+        CTkToolTip._show = safe_internal_show
+
 except ImportError:
     pass
+# --------------------------------------------------------------------------
+
+# 3. Configuration du Logger
+# On s'assure que le dossier logs existe
+if not os.path.exists("logs"):
+    os.makedirs("logs")
 
 # 3.5. Démarrage du serveur MCP HTTP long-running
 # DÉSACTIVÉ : Le serveur MCP doit être lancé dans un terminal séparé via start_mcp_server.py
