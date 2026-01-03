@@ -208,34 +208,13 @@ class Worker(threading.Thread):
         def fetch_repo_map():
             """Fonction pour récupérer la Repo Map dans un thread séparé."""
             try:
-                from features.context.repo_map import get_cached_repo_map, get_repo_map_generator, _repo_map_cache
+                from features.context.repo_map import get_cached_repo_map
                 
-                # Essayer le cache d'abord (même légèrement périmé < 10 min)
+                # get_cached_repo_map() gère déjà :
+                # - Le cache mémoire
+                # - Le cache persistant (même périmé)
+                # - La régénération asynchrone si nécessaire
                 repo_map = get_cached_repo_map(db_path_base=db_path, max_chars=None)
-                
-                # Si cache absent ou très vieux (> 10 min), lancer régénération en arrière-plan
-                cache_age = 0
-                if _repo_map_cache:
-                    cache_age = time.time() - _repo_map_cache.get('timestamp', 0)
-                
-                if not repo_map or cache_age > 600:  # 10 minutes
-                    # Utiliser le cache actuel si disponible (même périmé)
-                    if _repo_map_cache and _repo_map_cache.get('content'):
-                        repo_map = _repo_map_cache['content']
-                        log.info("⚠️ Utilisation cache Repo Map périmé, régénération en cours...")
-                    
-                    # Lancer régénération en arrière-plan
-                    def regenerate_repo_map_async():
-                        try:
-                            repo_map_gen = get_repo_map_generator(db_path)
-                            new_repo_map = repo_map_gen.generate_repo_map()
-                            # Le cache sera mis à jour automatiquement par generate_repo_map()
-                            log.info("✅ Repo Map régénérée en arrière-plan")
-                        except Exception as e:
-                            log.warning(f"Erreur régénération Repo Map: {e}")
-                    
-                    threading.Thread(target=regenerate_repo_map_async, daemon=True, name="RepoMapRegen").start()
-                
                 return repo_map if repo_map else None
             except Exception as e:
                 log.debug(f"Repo Map non disponible: {e}")

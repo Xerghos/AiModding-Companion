@@ -65,9 +65,9 @@ class MultiModelCacheManager:
             log.warning(f"Erreur Architecture: {e}")
             self.components['arch'] = ""
 
-        # 3. REPO MAP (Structure du Projet) - Nouveau composant statique
+        # 3. REPO MAP (Structure du Projet) - Utilise le cache persistant
         try:
-            from features.context.repo_map import get_repo_map_generator
+            from features.context.repo_map import get_cached_repo_map
             from config import APP_SETTINGS
             
             # Récupérer le chemin de la base de données RAG
@@ -75,8 +75,8 @@ class MultiModelCacheManager:
             if not os.path.isabs(db_path):
                 db_path = get_path(db_path)
             
-            repo_map_gen = get_repo_map_generator(db_path)
-            repo_map = repo_map_gen.get_repo_map()  # Sans limite pour le cache
+            # get_cached_repo_map() utilise le cache persistant et lance la régénération en arrière-plan si nécessaire
+            repo_map = get_cached_repo_map(db_path_base=db_path, max_chars=None)
             if repo_map:
                 self.components['repo_map'] = f"--- 🗺️ REPO MAP (Structure du Projet) ---\n{repo_map}"
                 log.info(f"✅ Repo Map générée: {len(repo_map)} caractères")

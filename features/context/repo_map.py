@@ -7,6 +7,7 @@ import os
 import logging
 import time
 import hashlib
+import threading
 from typing import List, Dict, Optional, Any
 from config import get_logger, get_path
 from config.utils import charger_json_robuste, sauvegarder_json
@@ -152,6 +153,7 @@ class RepoMapGenerator:
     def generate_repo_map(self, top_n: int = 20) -> str:
         """
         Génère la Repo Map en extrayant les signatures des fichiers les plus importants.
+        Utilise le cache même périmé et lance la régénération en arrière-plan si nécessaire.
         
         Args:
             top_n: Nombre de fichiers à inclure (selon PageRank)
@@ -161,13 +163,89 @@ class RepoMapGenerator:
         """
         # Vérifier le cache avec validation complète
         cache_data = self._load_cache()
-        if cache_data and self._is_cache_valid(cache_data):
-            log.debug(f"✅ Repo Map récupérée depuis le cache valide")
-            return cache_data.get('content', '')
         
+        if cache_data:
+            if self._is_cache_valid(cache_data):
+                log.debug("✅ Repo Map récupérée depuis le cache valide")
+                return cache_data.get('content', '')
+            else:
+                # Utiliser le cache périmé et lancer régénération en arrière-plan
+                cached_content = cache_data.get('content', '')
+                if cached_content:
+                    log.info("⚠️ Cache Repo Map périmé, utilisation du cache existant, régénération en cours...")
+                    
+                    # Lancer régénération en arrière-plan
+                    def regenerate_async():
+                        try:
+                            from .symbol_graph import get_symbol_graph
+                            
+                            symbol_graph = get_symbol_graph(self.db_path_base)
+                            top_files = symbol_graph.get_top_files(top_n)
+                            
+                            if not top_files:
+                                log.warning("Aucun fichier trouvé pour la Repo Map")
+                                return
+                            
+                            repo_map_lines = []
+                            repo_map_lines.append("# Repo Map - Fichiers Centraux\n")
+                            
+                            for file_path, pagerank_score in top_files:
+                                abs_path = get_path(file_path) if not os.path.isabs(file_path) else file_path
+                                
+                                if not os.path.exists(abs_path):
+                                    continue
+                                
+                                signatures_data = self._extract_signatures(abs_path)
+                                if signatures_data:
+                                    repo_map_lines.append(f"\n# Fichier: {file_path} (PageRank: {pagerank_score:.4f})")
+                                    
+                                    classes = [s for s in signatures_data if s.get('ast_type') == 'class']
+                                    functions = [s for s in signatures_data if s.get('ast_type') == 'function']
+                                    
+                                    for class_data in classes:
+                                        class_sig = class_data['signature']
+                                        if class_data.get('docstring'):
+                                            class_sig += f"\n    \"\"\"{class_data['docstring']}\"\"\""
+                                        repo_map_lines.append(f"{class_sig}")
+                                        
+                                        methods = class_data.get('methods', [])
+                                        for method_data in methods:
+                                            method_sig = method_data['signature']
+                                            if method_data.get('docstring'):
+                                                method_sig += f"  # {method_data['docstring']}"
+                                            repo_map_lines.append(f"  {method_sig}")
+                                    
+                                    for func_data in functions:
+                                        func_sig = func_data['signature']
+                                        if func_data.get('docstring'):
+                                            func_sig += f"  # {func_data['docstring']}"
+                                        repo_map_lines.append(func_sig)
+                            
+                            repo_map_text = "\n".join(repo_map_lines)
+                            log.info(f"✅ Repo Map générée: {len(top_files)} fichiers, {len(repo_map_text)} caractères")
+                            
+                            self._save_cache(repo_map_text, top_n, self.db_path_base)
+                            project_hash = self._get_project_hash()
+                            self._save_project_hash(project_hash)
+                            
+                            # Mettre à jour le cache mémoire global
+                            global _repo_map_cache
+                            _repo_map_cache = {
+                                'content': repo_map_text,
+                                'timestamp': time.time()
+                            }
+                            
+                            log.info("✅ Repo Map régénérée en arrière-plan")
+                        except Exception as e:
+                            log.warning(f"Erreur régénération Repo Map: {e}")
+                    
+                    threading.Thread(target=regenerate_async, daemon=True, name="RepoMapRegen").start()
+                    return cached_content
+        
+        # Cache absent : générer immédiatement (première fois uniquement)
+        log.warning("⚠️ Cache Repo Map absent, génération initiale...")
         from .symbol_graph import get_symbol_graph
         
-        # Obtenir les fichiers les plus centraux
         symbol_graph = get_symbol_graph(self.db_path_base)
         top_files = symbol_graph.get_top_files(top_n)
         
@@ -188,18 +266,15 @@ class RepoMapGenerator:
             if signatures_data:
                 repo_map_lines.append(f"\n# Fichier: {file_path} (PageRank: {pagerank_score:.4f})")
                 
-                # Organiser par type : classes d'abord, puis fonctions globales
                 classes = [s for s in signatures_data if s.get('ast_type') == 'class']
                 functions = [s for s in signatures_data if s.get('ast_type') == 'function']
                 
-                # Afficher classes avec leurs méthodes
                 for class_data in classes:
                     class_sig = class_data['signature']
                     if class_data.get('docstring'):
                         class_sig += f"\n    \"\"\"{class_data['docstring']}\"\"\""
                     repo_map_lines.append(f"{class_sig}")
                     
-                    # Ajouter méthodes de la classe (indentées)
                     methods = class_data.get('methods', [])
                     for method_data in methods:
                         method_sig = method_data['signature']
@@ -207,7 +282,6 @@ class RepoMapGenerator:
                             method_sig += f"  # {method_data['docstring']}"
                         repo_map_lines.append(f"  {method_sig}")
                 
-                # Afficher fonctions globales
                 for func_data in functions:
                     func_sig = func_data['signature']
                     if func_data.get('docstring'):
@@ -217,10 +291,7 @@ class RepoMapGenerator:
         repo_map_text = "\n".join(repo_map_lines)
         log.info(f"✅ Repo Map générée: {len(top_files)} fichiers, {len(repo_map_text)} caractères")
         
-        # Sauvegarder le cache
         self._save_cache(repo_map_text, top_n, self.db_path_base)
-        
-        # Sauvegarder le hash du projet
         project_hash = self._get_project_hash()
         self._save_project_hash(project_hash)
         
@@ -571,8 +642,8 @@ def get_repo_map_generator(db_path_base=None) -> RepoMapGenerator:
 
 def get_cached_repo_map(db_path_base=None, max_chars: Optional[int] = None) -> str:
     """
-    Récupère la Repo Map depuis le cache si disponible et valide (< 60s),
-    sinon la génère et la met en cache.
+    Récupère la Repo Map depuis le cache persistant si disponible,
+    même périmé. Lance la régénération en arrière-plan si nécessaire.
     
     Args:
         db_path_base: Chemin de base de la base de données
@@ -585,31 +656,57 @@ def get_cached_repo_map(db_path_base=None, max_chars: Optional[int] = None) -> s
     
     current_time = time.time()
     
-    # Vérifier si le cache est valide
+    # 1. Vérifier le cache mémoire d'abord
     if _repo_map_cache is not None:
         cache_age = current_time - _repo_map_cache.get('timestamp', 0)
         if cache_age < REPO_MAP_CACHE_TIMEOUT:
-            log.debug(f"✅ Repo Map récupérée depuis le cache ({cache_age:.1f}s < {REPO_MAP_CACHE_TIMEOUT}s)")
+            log.debug(f"✅ Repo Map récupérée depuis le cache mémoire ({cache_age:.1f}s)")
             cached_map = _repo_map_cache.get('content', '')
-            
-            # Appliquer max_chars si spécifié
             if max_chars is not None and len(cached_map) > max_chars:
                 return cached_map[:max_chars] + "\n... (tronqué)"
             return cached_map
-        else:
-            log.debug(f"🔄 Repo Map expirée du cache ({cache_age:.1f}s > {REPO_MAP_CACHE_TIMEOUT}s), régénération...")
     
-    # Générer la Repo Map
+    # 2. Charger le cache persistant depuis le disque
     repo_map_gen = get_repo_map_generator(db_path_base)
+    cache_data = repo_map_gen._load_cache()
+    
+    if cache_data and cache_data.get('content'):
+        # Utiliser le cache même périmé
+        cached_content = cache_data.get('content', '')
+        
+        # Mettre à jour le cache mémoire
+        _repo_map_cache = {
+            'content': cached_content,
+            'timestamp': cache_data.get('timestamp', current_time)
+        }
+        
+        # Vérifier si le cache est valide
+        if repo_map_gen._is_cache_valid(cache_data):
+            log.debug("✅ Repo Map récupérée depuis le cache persistant valide")
+        else:
+            log.info("⚠️ Utilisation cache Repo Map périmé, régénération en cours...")
+            # Lancer régénération en arrière-plan
+            def regenerate_async():
+                try:
+                    new_repo_map = repo_map_gen.generate_repo_map()
+                    log.info("✅ Repo Map régénérée en arrière-plan")
+                except Exception as e:
+                    log.warning(f"Erreur régénération Repo Map: {e}")
+            threading.Thread(target=regenerate_async, daemon=True, name="RepoMapRegen").start()
+        
+        if max_chars is not None and len(cached_content) > max_chars:
+            return cached_content[:max_chars] + "\n... (tronqué)"
+        return cached_content
+    
+    # 3. Cache absent : générer immédiatement (première fois uniquement)
+    log.warning("⚠️ Cache Repo Map absent, génération initiale...")
     repo_map = repo_map_gen.get_repo_map_for_context(max_chars=max_chars)
     
-    # Mettre en cache
     _repo_map_cache = {
         'content': repo_map,
         'timestamp': current_time
     }
     
-    log.info(f"✅ Repo Map générée et mise en cache ({len(repo_map)} caractères)")
     return repo_map
 
 

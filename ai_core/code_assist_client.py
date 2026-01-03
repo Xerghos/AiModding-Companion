@@ -763,7 +763,7 @@ class CodeAssistClient:
                                 "AI_CORE",
                                 "DEBUG",
                                 f"🔍 Erreur complète (sans details): {json.dumps(error_detail, indent=2, ensure_ascii=False)}"
-                        )
+                            )
                         
                         # Log détaillé de la structure du payload qui a causé l'erreur
                         try:
@@ -903,7 +903,7 @@ class CodeAssistClient:
                                                                 "AI_CORE",
                                                                 "WARNING",
                                                                 f"⚠️ functionCall.id ABSENT mais functionResponse.id={resp_id} présent"
-                                        )
+                                                            )
                                         # Log un extrait du contenu pour voir le format
                                         if output_len > 0:
                                             output_preview = str(resp_content)[:500]
@@ -1591,4 +1591,3 @@ class CodeAssistClient:
             tools=tools,
             **kwargs
         )
-
