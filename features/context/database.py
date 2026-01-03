@@ -52,18 +52,32 @@ def _get_paths(db_path_base=None):
     )
 
 @trace_action(source="database")
-def _ensure_libs():
-    global faiss, SentenceTransformer, model
-    # Vérifier d'abord si déjà initialisé (évite le lock si possible)
-    if faiss is not None and SentenceTransformer is not None and model is not None:
+def _ensure_faiss():
+    """Charge uniquement FAISS (rapide, ~0.1s)."""
+    global faiss
+    
+    if faiss is not None:
         return
     
-    # Protection thread-safe pour éviter les chargements simultanés
     with _ensure_libs_lock:
-        # Double-check après avoir acquis le lock
         if faiss is None:
             import faiss as f
             faiss = f
+
+@trace_action(source="database")
+def _ensure_model():
+    """Charge SentenceTransformer et le modèle (lent, ~2s).
+    Peut être appelé en arrière-plan.
+    """
+    global SentenceTransformer, model
+    
+    # Vérifier d'abord si déjà chargé (évite le lock si possible)
+    if SentenceTransformer is not None and model is not None:
+        return
+    
+    # Protection thread-safe
+    with _ensure_libs_lock:
+        # Double-check après avoir acquis le lock
         if SentenceTransformer is None:
             from sentence_transformers import SentenceTransformer as ST
             SentenceTransformer = ST
@@ -74,9 +88,26 @@ def _ensure_libs():
                 log.info(f"✅ Modèle Embedding chargé: {EMBEDDING_MODEL_NAME}")
             except Exception as e:
                 log.error(f"❌ Erreur chargement SentenceTransformer: {e}")
-                # Réinitialiser pour permettre une nouvelle tentative
                 model = None
                 raise
+
+@trace_action(source="database")
+def is_model_ready() -> bool:
+    """Vérifie si le modèle SentenceTransformer est chargé et prêt.
+    
+    Returns:
+        True si le modèle est chargé, False sinon
+    """
+    global SentenceTransformer, model
+    return SentenceTransformer is not None and model is not None
+
+@trace_action(source="database")
+def _ensure_libs():
+    """Charge FAISS et SentenceTransformer (compatibilité legacy).
+    Pour les nouveaux appels, utiliser _ensure_faiss() ou _ensure_model() selon le besoin.
+    """
+    _ensure_faiss()
+    _ensure_model()
 
 @trace_action(source="database")
 def init_db(db_path_base=None):
@@ -89,7 +120,7 @@ def init_db(db_path_base=None):
     # Vérifier si déjà initialisée (sans lock, rapide)
     if db_key in _initialized_dbs:
         log.debug(f"DB déjà initialisée: {db_key}")
-        _ensure_libs()  # S'assurer que les libs sont chargées
+        _ensure_faiss()  # S'assurer que FAISS est chargé (rapide)
         return
     
     # Protection thread-safe pour l'initialisation
@@ -97,7 +128,7 @@ def init_db(db_path_base=None):
         # Double-check après avoir acquis le lock
         if db_key in _initialized_dbs:
             log.debug(f"DB déjà initialisée (double-check): {db_key}")
-            _ensure_libs()
+            _ensure_faiss()
             return
         
         os.makedirs(os.path.dirname(sqlite_path), exist_ok=True)
@@ -206,7 +237,7 @@ def init_db(db_path_base=None):
     conn.commit()
     conn.close()
     
-    _ensure_libs()
+    _ensure_faiss()  # Charge uniquement FAISS (rapide)
     log.debug(f"Vérification index: {index_path} existe={os.path.exists(index_path)}, {map_path} existe={os.path.exists(map_path)}")
     if os.path.exists(index_path) and os.path.exists(map_path):
         try:
@@ -309,8 +340,8 @@ def add_knowledge(collection, content, metadata=None):
     global faiss_index, id_mapping
     if not content or not content.strip(): return None
     
-    # Sécurité : on s'assure que les libs sont là
-    _ensure_libs()
+    # Sécurité : on s'assure que le modèle est chargé (lazy loading)
+    _ensure_model()
     
     # 1. Calcul du vecteur (coûteux, on le fait une fois avant de toucher à la DB)
     try:
@@ -484,7 +515,7 @@ def search_hybrid(query, db_path_base=None, max_results=50, use_hybrid=True):
     if not query:
         return [], None
     
-    _ensure_libs()
+    _ensure_model()  # Charge uniquement SentenceTransformer (lazy loading)
     if faiss_index is None or faiss_index.ntotal == 0:
         init_db(db_path_base)
         if faiss_index is None or faiss_index.ntotal == 0:
@@ -1116,3 +1147,24 @@ def sync_incremental(root_path: str, progress_callback=None, state_file: str = N
     current_tree.save_state(state_file)
     
     return f"Sync incrémentale terminée. {count} fichiers ré-indexés, {errors} erreurs."
+
+@trace_action(source="database")
+def warmup_model_background():
+    """Préchauffe le modèle SentenceTransformer en arrière-plan.
+    Peut être appelé au démarrage de l'app sans bloquer.
+    Approche "Fire and Forget" : pas de callback pour éviter le couplage.
+    """
+    def warmup_task():
+        try:
+            log.debug("🔥 Démarrage préchauffage SentenceTransformer...")
+            _ensure_model()
+            log.info("✅ Modèle SentenceTransformer préchauffé")
+        except Exception as e:
+            log.warning(f"⚠️ Erreur préchauffage modèle: {e}")
+    
+    # Vérifier si déjà chargé (évite de créer un thread inutile)
+    if SentenceTransformer is not None and model is not None:
+        return
+    
+    # Lancer en arrière-plan
+    threading.Thread(target=warmup_task, daemon=True, name="ModelWarmup").start()

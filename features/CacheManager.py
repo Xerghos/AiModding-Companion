@@ -315,7 +315,7 @@ class MultiModelCacheManager:
         Returns:
             Hash SHA256 du projet
         """
-        from features.context.merkle_sync import MerkleTreeSync
+        from features.context.merkle_sync import MerkleTreeSync, get_ready_merkle_tree
         from features.Documentation import calculate_file_hash
         from config.settings import APP_SETTINGS
         from config.paths import get_path
@@ -364,9 +364,8 @@ class MultiModelCacheManager:
             
             # 1. Arbre Merkle pour TOUT le projet (une seule construction au lieu de 3)
             try:
-                merkle = MerkleTreeSync(project_root)
-                # build_tree() utilise maintenant les exclusions depuis settings
-                root = merkle.build_tree()
+                # Utiliser get_ready_merkle_tree() pour obtenir l'arbre déjà construit (thread-safe)
+                merkle, root = get_ready_merkle_tree(project_root)
                 if root and root.hash:
                     hasher.update(root.hash.encode())
                     log.debug(f"✅ Arbre Merkle projet: {len(merkle.node_map)} nœuds")

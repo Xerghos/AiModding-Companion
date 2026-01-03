@@ -85,6 +85,14 @@ class GeminiApp:
         
         # Polling
         self.check_result_queue()
+        
+        # Préchauffage du modèle SentenceTransformer en arrière-plan
+        from features.context import database
+        database.warmup_model_background()
+        
+        # Déclencher le préchauffage au démarrage (au lieu d'attendre le focus)
+        # 100ms après l'init pour laisser l'UI se charger
+        self.root.after(100, self._prewarm_context_intelligent)
 
     @trace_action(source="main_window")
     def _setup_layout(self):
@@ -655,7 +663,7 @@ class GeminiApp:
             textbox.insert("1.0", text, tag)
             textbox.configure(state="disabled")
             # Ajuster la hauteur après insertion du texte
-            self.after(10, lambda: self._adjust_textbox_height(textbox))
+            self.root.after(10, lambda: self._adjust_textbox_height(textbox))
         
         # Scroll vers le bas
         def scroll_to_bottom():
@@ -878,7 +886,7 @@ class GeminiApp:
                                 textbox.insert("1.0", f"🤖 {self._stream_buffer}", "gemini")
                                 textbox.configure(state="disabled")
                                 # Ajuster la hauteur après insertion du texte
-                                self.after(10, lambda: self._adjust_textbox_height(textbox))
+                                self.root.after(10, lambda: self._adjust_textbox_height(textbox))
                                 del self._stream_buffer
                     elif hasattr(self, '_stream_buffer'):
                         # Buffer vide ou None, mais log pour debug
@@ -1079,38 +1087,48 @@ class GeminiApp:
             log.debug(f"Erreur préchauffage session: {e}")
 
     def _prewarm_rag_db(self):
-        """Préinitialise la base RAG (FAISS + SentenceTransformer)."""
+        """Préinitialise la base RAG (FAISS + SentenceTransformer).
+        Approche "Fire and Forget" : si le modèle n'est pas prêt, on annule silencieusement.
+        Le préchauffage RAG est une optimisation, pas une fonctionnalité critique.
+        """
         try:
             from features.context import database
             from config.settings import APP_SETTINGS
             from config.paths import get_path
             
-            if database:
-                db_path = APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid")
-                if not os.path.isabs(db_path):
-                    db_path = get_path(db_path)
-                database.init_db(db_path)  # Charge FAISS et modèle (maintenant thread-safe et idempotente)
-        except Exception as e:
-            # Ignorer les erreurs silencieuses ou attendues
-            error_msg = str(e) if e else ""
-            error_type = type(e).__name__
+            # Vérifier si le modèle est prêt avant de préchauffer
+            if not database.is_model_ready():
+                # Annuler silencieusement : le préchauffage est une optimisation
+                # L'utilisateur déclenchera le chargement naturel lors de sa première requête
+                log.debug("ℹ️ RAG DB pas encore prête (modèle en cours de chargement), préchauffage reporté")
+                return
             
-            # Ne pas logger comme warning si c'est une erreur attendue ou silencieuse
+            # Modèle prêt, on peut préchauffer
+            db_path = APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid")
+            if not os.path.isabs(db_path):
+                db_path = get_path(db_path)
+            database.init_db(db_path)
+        except Exception as e:
+            # Améliorer les logs d'erreur (capturer traceback complet)
+            error_msg = str(e) if e else "Exception sans message"
+            error_type = type(e).__name__
+            error_traceback = traceback.format_exc()
+            
+            # Ne pas logger comme warning si c'est une erreur attendue
             expected_errors = [
-                "meta tensor",  # Erreur PyTorch lors du chargement parallèle (déjà géré par le lock)
+                "meta tensor",  # Erreur PyTorch lors du chargement parallèle
                 "already initialized",  # Déjà initialisé
                 "already loaded",  # Déjà chargé
             ]
             
-            # Vérifier si c'est une erreur attendue
             is_expected = any(expected in error_msg.lower() for expected in expected_errors)
             
-            # Ne logger que les erreurs inattendues ou si le message est vide (pour debug)
             if not is_expected and error_msg:
                 log.debug(f"Erreur préchauffage RAG ({error_type}): {error_msg}")
+                log.debug(f"Traceback: {error_traceback}")
             elif not error_msg:
-                # Message vide : logger en debug pour investiguer
                 log.debug(f"Erreur préchauffage RAG ({error_type}): exception sans message")
+                log.debug(f"Traceback: {error_traceback}")
             # Si c'est attendu, ne rien logger (c'est normal)
 
     def _prewarm_tree(self):
@@ -1123,18 +1141,29 @@ class GeminiApp:
             log.debug(f"Erreur préchauffage tree: {e}")
 
     def _prewarm_repo_map(self):
-        """Précharge le Repo Map depuis le cache."""
+        """Préinitialise la Repo Map."""
         try:
-            from features.context.repo_map import get_cached_repo_map
+            from features.context.repo_map import get_cached_repo_map, is_repo_map_regenerating, wait_for_repo_map_regeneration
             from config.settings import APP_SETTINGS
             from config.paths import get_path
             
             db_path = APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid")
             if not os.path.isabs(db_path):
                 db_path = get_path(db_path)
-            get_cached_repo_map(db_path_base=db_path)  # Charge depuis cache
+            
+            # Vérifier si une régénération est en cours
+            if is_repo_map_regenerating():
+                log.debug("ℹ️ Repo Map en cours de régénération, attente...")
+                if wait_for_repo_map_regeneration(max_wait=5.0):
+                    # La régénération est terminée, récupérer depuis le cache
+                    get_cached_repo_map(db_path_base=db_path, max_chars=None)
+                else:
+                    log.debug("ℹ️ Timeout attente régénération Repo Map, utilisation cache existant")
+            else:
+                # Pas de régénération en cours, récupérer normalement
+                get_cached_repo_map(db_path_base=db_path, max_chars=None)
         except Exception as e:
-            log.debug(f"Erreur préchauffage Repo Map: {e}")
+            log.debug(f"Erreur préchauffage repo_map: {e}")
 
     def _prewarm_mcp_tools(self):
         """Précharge les outils MCP depuis le cache."""

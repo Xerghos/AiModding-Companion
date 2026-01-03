@@ -184,43 +184,63 @@ def generate_ultimate_graph():
     # Charger .gitignore pour filtrer les fichiers
     try:
         from features.gitignore_parser import load_gitignore_patterns, should_ignore_path
+        from pathspec import PathSpec
         gitignore_spec = load_gitignore_patterns(root)
         if gitignore_spec:
-            log.info("✅ .gitignore chargé pour filtrage")
+            log.info("✅ Filtrage .gitignore activé")
         else:
             log.info("⚠️ .gitignore non disponible, utilisation du fallback")
-    except ImportError:
-        log.warning("⚠️ Module gitignore_parser non disponible, utilisation du fallback")
+    except ImportError as e:
+        log.warning(f"⚠️ Module gitignore_parser non disponible: {e}")
+        log.warning("⚠️ Le scan sera plus lent (pas de filtrage .gitignore)")
         gitignore_spec = None
         should_ignore_path = None
+    
+    # Dossiers par défaut à exclure (fallback si gitignore échoue)
+    default_excluded_dirs = IGNORED_DIRS.union({'.git', '__pycache__', 'venv', 'env', 'node_modules', 
+                             'dist', 'build', '.idea', '.vscode', '.cursor', 'db', 'logs'})
     
     # 1. Recensement
     all_files = []
     all_files_set = set() # Pour lookup rapide
     
-    for r, d, f in os.walk(root):
-        # Filtrer dossiers selon .gitignore ou fallback
+    def should_exclude_directory(dirname: str, parent_path: str, project_root: str, 
+                                  gitignore_spec, default_excluded_dirs: set) -> bool:
+        """Vérifie si un dossier doit être exclu."""
+        # 1. Vérifier les dossiers par défaut
+        if dirname in default_excluded_dirs:
+            return True
+        
+        # 2. Vérifier .gitignore
         if gitignore_spec and should_ignore_path:
-            d[:] = [x for x in d if not should_ignore_path(
-                os.path.join(r, x), root, gitignore_spec
-            )]
-        else:
-            # Fallback : utiliser IGNORED_DIRS
-        d[:] = [x for x in d if x not in IGNORED_DIRS]
+            rel_path = os.path.relpath(os.path.join(parent_path, dirname), project_root).replace('\\', '/')
+            if should_ignore_path(rel_path, project_root, gitignore_spec):
+                return True
+        
+        return False
+    
+    for r, d, f in os.walk(root):
+        # Filtrer les dossiers à exclure AVANT de descendre
+        d[:] = [x for x in d if not should_exclude_directory(x, r, root, gitignore_spec, default_excluded_dirs)]
         
         for file in f:
             if file.endswith('.py') and file not in IGNORED_FILES:
                 full_path = os.path.join(r, file)
+                rel_path = os.path.relpath(full_path, root).replace('\\', '/')
                 
-                # Filtrer selon .gitignore
+                # Vérifier si le fichier doit être exclu
                 if gitignore_spec and should_ignore_path:
-                    if should_ignore_path(full_path, root, gitignore_spec):
+                    if should_ignore_path(rel_path, root, gitignore_spec):
                         continue
                 
-                rel_path = os.path.relpath(full_path, root).replace('\\', '/')
+                # Vérifier les extensions par défaut
+                if file.endswith(('.pyc', '.pyo', '.pyd', '.log', '.tmp', '.cache')):
+                    continue
+                
                 all_files.append(rel_path)
                 all_files_set.add(rel_path)
 
+    log.info(f"📊 Scan terminé : {len(all_files)} fichiers trouvés (filtrage .gitignore: {'✅' if gitignore_spec else '❌'})")
     log.info(f"📂 {len(all_files)} fichiers identifiés. Analyse Rayons-X en cours...")
 
     graph = {}

@@ -7,6 +7,8 @@ import os
 import hashlib
 import logging
 import fnmatch
+import threading
+import time
 from typing import Dict, List, Optional, Tuple
 from config import get_logger
 from features.Decorators import trace_action
@@ -21,6 +23,14 @@ except ImportError:
     PathSpec = None
     PATHSPEC_AVAILABLE = False
 
+# Cache pour les patterns d'exclusion
+import time
+_exclusion_cache = {
+    'timestamp': 0,
+    'data': None,
+    'root_path': None
+}
+EXCLUSION_CACHE_TTL = 10  # 10 secondes
 
 def get_exclusion_patterns(root_path: str) -> Tuple[Optional['PathSpec'], set[str], set[str]]:
     """
@@ -36,6 +46,15 @@ def get_exclusion_patterns(root_path: str) -> Tuple[Optional['PathSpec'], set[st
     Returns:
         (gitignore_spec, excluded_dirs_set, excluded_files_set)
     """
+    global _exclusion_cache
+    current_time = time.time()
+    
+    # Vérifier le cache
+    if (_exclusion_cache['data'] and 
+        _exclusion_cache['root_path'] == root_path and 
+        current_time - _exclusion_cache['timestamp'] < EXCLUSION_CACHE_TTL):
+        return _exclusion_cache['data']
+
     from features.gitignore_parser import load_gitignore_patterns
     from config.settings import APP_SETTINGS
     
@@ -64,7 +83,14 @@ def get_exclusion_patterns(root_path: str) -> Tuple[Optional['PathSpec'], set[st
         if pattern:
             excluded_files.add(pattern.strip())
     
-    return gitignore_spec, excluded_dirs, excluded_files
+    result = (gitignore_spec, excluded_dirs, excluded_files)
+    
+    # Mettre à jour le cache
+    _exclusion_cache['timestamp'] = current_time
+    _exclusion_cache['root_path'] = root_path
+    _exclusion_cache['data'] = result
+    
+    return result
 
 
 def should_exclude_path(file_path: str, root_path: str, 
@@ -173,6 +199,7 @@ class MerkleTreeSync:
         """
         Construit l'arbre de Merkle pour le système de fichiers.
         Utilise .gitignore + settings pour les exclusions.
+        Thread-safe : peut être appelé depuis plusieurs threads.
         
         Args:
             exclude_dirs: Liste optionnelle de dossiers à exclure (s'ajoute aux exclusions depuis settings)
@@ -180,20 +207,31 @@ class MerkleTreeSync:
         Returns:
             Le nœud racine de l'arbre
         """
-        # Charger les exclusions depuis toutes les sources
-        gitignore_spec, excluded_dirs_set, excluded_files_set = get_exclusion_patterns(self.root_path)
+        # Utiliser un lock interne pour protéger la construction
+        if not hasattr(self, '_build_lock'):
+            self._build_lock = threading.Lock()
         
-        # Si exclude_dirs est fourni explicitement, l'ajouter
-        if exclude_dirs:
-            excluded_dirs_set.update(exclude_dirs)
-        
-        # Utiliser excluded_dirs_set au lieu de exclude_dirs hardcodé
-        self.root_node = self._build_node(self.root_path, excluded_dirs_set, 
-                                          gitignore_spec, excluded_files_set)
-        self.root_node.compute_hash()
-        
-        log.info(f"✅ Arbre Merkle construit: {len(self.node_map)} nœuds, hash racine: {self.root_node.hash[:16]}...")
-        return self.root_node
+        with self._build_lock:
+            # Si déjà construit, retourner le root_node existant
+            if self.root_node is not None and self.root_node.hash:
+                return self.root_node
+            
+            # Charger les exclusions depuis toutes les sources
+            gitignore_spec, excluded_dirs_set, excluded_files_set = get_exclusion_patterns(self.root_path)
+            
+            # Si exclude_dirs est fourni explicitement, l'ajouter
+            if exclude_dirs:
+                excluded_dirs_set.update(exclude_dirs)
+            
+            # Utiliser excluded_dirs_set au lieu de exclude_dirs hardcodé
+            self.root_node = self._build_node(self.root_path, excluded_dirs_set, 
+                                              gitignore_spec, excluded_files_set)
+            self.root_node.compute_hash()
+            
+            # Réduire la verbosité : seulement si vraiment nécessaire pour diagnostic
+            if len(self.node_map) > 1000:  # Seulement pour gros arbres
+                log.debug(f"✅ Arbre Merkle construit: {len(self.node_map)} nœuds")
+            return self.root_node
     
     def _build_node(self, path: str, excluded_dirs: set[str], 
                     gitignore_spec: Optional['PathSpec'],
@@ -358,3 +396,65 @@ class MerkleTreeSync:
             log.error(f"Erreur chargement état: {e}")
             return {}
 
+# Variables globales pour le cache partagé
+_merkle_tree_cache = None
+_merkle_tree_root_node = None  # Cache du root_node construit
+_merkle_tree_lock = threading.Lock()
+_merkle_tree_timestamp = 0
+_merkle_tree_hash = None  # Hash du projet pour validation
+_MERKLE_TREE_CACHE_TTL = 10  # 10 secondes de cache
+
+@trace_action(source="merkle_sync")
+def get_ready_merkle_tree(root_path: str, project_hash: str = None, force_rebuild: bool = False) -> Tuple[MerkleTreeSync, MerkleNode]:
+    """Retourne une instance MerkleTreeSync et son root_node déjà construit.
+    
+    Cette fonction garantit que l'arbre est déjà construit et thread-safe.
+    L'appelant n'a pas besoin d'appeler .build_tree().
+    
+    Args:
+        root_path: Chemin racine du projet
+        project_hash: Hash du projet pour validation (optionnel)
+        force_rebuild: Si True, force la reconstruction même si cache valide
+    
+    Returns:
+        Tuple (MerkleTreeSync instance, MerkleNode root_node)
+    """
+    global _merkle_tree_cache, _merkle_tree_root_node, _merkle_tree_timestamp, _merkle_tree_hash
+    
+    current_time = time.time()
+    
+    # Vérifier si le cache est valide
+    if (not force_rebuild and 
+        _merkle_tree_cache is not None and 
+        _merkle_tree_cache.root_path == root_path and
+        _merkle_tree_root_node is not None and
+        current_time - _merkle_tree_timestamp < _MERKLE_TREE_CACHE_TTL):
+        # Vérifier le hash si fourni
+        if project_hash is None or _merkle_tree_hash == project_hash:
+            return _merkle_tree_cache, _merkle_tree_root_node
+    
+    # Acquérir le lock pour créer/mettre à jour l'instance
+    with _merkle_tree_lock:
+        # Double-check après avoir acquis le lock
+        if (not force_rebuild and 
+            _merkle_tree_cache is not None and 
+            _merkle_tree_cache.root_path == root_path and
+            _merkle_tree_root_node is not None and
+            current_time - _merkle_tree_timestamp < _MERKLE_TREE_CACHE_TTL):
+            if project_hash is None or _merkle_tree_hash == project_hash:
+                return _merkle_tree_cache, _merkle_tree_root_node
+        
+        # Créer une nouvelle instance et construire l'arbre (thread-safe)
+        log.debug(f"🔨 Construction arbre Merkle pour {root_path}...")
+        _merkle_tree_cache = MerkleTreeSync(root_path)
+        _merkle_tree_root_node = _merkle_tree_cache.build_tree()  # Construction thread-safe
+        _merkle_tree_timestamp = current_time
+        _merkle_tree_hash = project_hash
+        log.debug(f"✅ Arbre Merkle construit: {len(_merkle_tree_cache.node_map)} nœuds")
+        return _merkle_tree_cache, _merkle_tree_root_node
+
+# Alias pour compatibilité
+def get_merkle_tree(root_path: str, force_rebuild: bool = False) -> MerkleTreeSync:
+    """Alias simplifié qui retourne seulement l'instance (pour compatibilité legacy)."""
+    tree, _ = get_ready_merkle_tree(root_path, force_rebuild=force_rebuild)
+    return tree
