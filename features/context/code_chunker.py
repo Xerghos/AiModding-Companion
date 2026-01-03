@@ -5,6 +5,7 @@ Découpe le code en chunks intelligents basés sur la structure AST.
 
 import os
 import logging
+import threading
 from typing import List, Dict, Optional, Tuple
 from config import get_logger
 from features.Decorators import trace_action
@@ -31,173 +32,52 @@ class SemanticChunker:
     Chunker sémantique utilisant Tree-sitter pour découper le code Python
     en chunks intelligents basés sur la structure AST.
     """
+    _init_done = False # Lock visuel pour les logs
     
     def __init__(self):
-        self.parser = None
-        self.language = None
+        self._local = threading.local()
         self.is_available = False  # Flag pour indiquer si le chunking sémantique est disponible
         self._init_tree_sitter()
     
     def _init_tree_sitter(self):
         """
-        Initialise Tree-sitter pour Python.
-        
-        Stratégie de chargement (selon recommandations Medium article):
-        1. PRIORITÉ : tree-sitter-language-pack (package recommandé, maintenu, évite PyCapsule)
-        2. FALLBACK : tree-sitter-python (ancien package, peut retourner PyCapsule avec Python 3.13+)
-        
-        Détection PyCapsule : Test ultime avec Parser() car isinstance() peut échouer.
-        Un PyCapsule lèvera une TypeError/AttributeError lors de la création du Parser.
+        Initialise Tree-sitter pour Python via le language-pack.
         """
         if not TREE_SITTER_AVAILABLE:
-            log.warning("⚠️ Tree-sitter non disponible. Le chunking sémantique sera désactivé (fallback vers chunking basique).")
-            self.is_available = False
+            if not SemanticChunker._init_done:
+                log.warning("⚠️ Tree-sitter non disponible.")
+                SemanticChunker._init_done = True
             return
         
-        # Liste des méthodes de chargement à essayer (ordre de priorité)
-        load_methods = [
-            ("tree-sitter-language-pack", self._try_load_language_pack),
-            ("tree-sitter-python", self._try_load_python_direct)
-        ]
-        
-        # Essayer chaque méthode jusqu'à ce qu'une fonctionne
-        for method_name, load_method in load_methods:
-            try:
-                if load_method():
-                    # Succès : parser et language sont initialisés
-                    self.is_available = True
-                    log.info(f"✅ Tree-sitter Python initialisé avec {method_name} - Chunking sémantique ACTIVÉ")
-                    return
-            except Exception as e:
-                log.debug(f"Échec {method_name}: {e}")
-                continue
-        
-        # Aucune méthode n'a fonctionné
-        self._log_installation_instructions()
-        self.parser = None
-        self.language = None
-        self.is_available = False
-    
-    def _try_load_language_pack(self) -> bool:
-        """
-        Essaie de charger tree-sitter-language-pack (PRIORITÉ - package recommandé).
-        Retourne True si succès, False sinon.
-        """
         try:
             from tree_sitter_language_pack import get_language
-            
-            candidate_language = get_language('python')
-            
-            if not candidate_language:
-                log.debug("tree-sitter-language-pack.get_language('python') retourne None")
-                return False
-            
-            # Test ultime : essayer de créer le Parser
-            # C'est la seule façon fiable de détecter un PyCapsule
-            # Un PyCapsule lèvera une TypeError/AttributeError lors de la création du Parser
-            test_parser = Parser(candidate_language)
-            
-            # Si on arrive ici, c'est valide - pas de PyCapsule
-            self.language = candidate_language
-            self.parser = test_parser
-            return True
-            
-        except ImportError:
-            # tree-sitter-language-pack non installé
-            log.debug("tree-sitter-language-pack non trouvé.")
-            return False
-        except (TypeError, AttributeError, ValueError) as parser_err:
-            # PyCapsule détecté ou objet non compatible
-            error_msg = str(parser_err).lower()
-            type_name = type(candidate_language).__name__ if 'candidate_language' in locals() else "Unknown"
-            
-            is_pycapsule = (
-                'pycapsule' in error_msg or 
-                'capsule' in error_msg or 
-                'pycapsule' in type_name.lower() or
-                'capsule' in type_name.lower()
-            )
-            
-            if is_pycapsule:
-                log.warning("⚠️ tree-sitter-language-pack retourne un PyCapsule non compatible (rare, mais possible avec Python 3.13+).")
-            else:
-                log.debug(f"tree-sitter-language-pack retourne un objet non compatible: {type_name} ({parser_err})")
-            return False
+            lang = get_language('python')
+            if lang:
+                self._local.language = lang
+                self._local.parser = Parser(lang)
+                self.is_available = True
+                if not SemanticChunker._init_done:
+                    log.info("✅ Tree-sitter prêt (Language Pack)")
+                    SemanticChunker._init_done = True
+                return
         except Exception as e:
-            log.debug(f"Erreur lors du chargement tree-sitter-language-pack: {e}")
-            return False
-    
-    def _try_load_python_direct(self) -> bool:
-        """
-        Essaie de charger tree-sitter-python (FALLBACK - peut retourner PyCapsule).
-        Retourne True si succès, False sinon.
-        """
-        try:
-            from tree_sitter_python import language as python_lang
-            
-            # python_lang peut être une fonction callable qui retourne Language
-            # ou un objet Language directement (ou un PyCapsule dans certaines versions)
-            if callable(python_lang):
-                candidate_language = python_lang()
-            else:
-                candidate_language = python_lang
-            
-            # Test ultime : essayer de créer le Parser
-            # C'est la seule façon fiable de détecter un PyCapsule
-            # Un PyCapsule lèvera une TypeError/AttributeError lors de la création du Parser
-            test_parser = Parser(candidate_language)
-            
-            # Si on arrive ici, c'est valide - pas de PyCapsule
-            self.language = candidate_language
-            self.parser = test_parser
-            return True
-            
-        except ImportError:
-            # tree-sitter-python non installé
-            log.debug("tree-sitter-python non trouvé.")
-            return False
-        except (TypeError, AttributeError, ValueError) as parser_err:
-            # PyCapsule détecté ou objet non compatible
-            error_msg = str(parser_err).lower()
-            type_name = type(candidate_language).__name__ if 'candidate_language' in locals() else "Unknown"
-            
-            # Vérifier si c'est un PyCapsule (plusieurs indices)
-            is_pycapsule = (
-                'pycapsule' in error_msg or 
-                'capsule' in error_msg or 
-                'pycapsule' in type_name.lower() or
-                'capsule' in type_name.lower()
-            )
-            
-            if is_pycapsule:
-                log.warning("⚠️ tree-sitter-python retourne un PyCapsule non compatible (problème connu avec Python 3.13+).")
-                log.info("💡 Solution recommandée : pip install tree-sitter-language-pack")
-            else:
-                log.debug(f"tree-sitter-python retourne un objet non compatible: {type_name} ({parser_err})")
-            return False
-        except Exception as e:
-            log.debug(f"Erreur lors du chargement tree-sitter-python: {e}")
-            return False
-    
-    def _log_installation_instructions(self):
-        """Affiche les instructions d'installation pour Tree-sitter."""
-        log.warning("⚠️ Impossible de charger tree-sitter pour Python. Le chunking sémantique sera désactivé (fallback vers chunking basique).")
-        log.info("💡 Pour activer le chunking sémantique, installez:")
-        log.info("   pip install tree-sitter-language-pack  (RECOMMANDÉ - évite les problèmes PyCapsule)")
-        log.info("   OU")
-        log.info("   pip install tree-sitter tree-sitter-python  (peut avoir des problèmes PyCapsule avec Python 3.13+)")
-        log.info("")
-        log.info("📖 Note: tree-sitter-languages n'est plus maintenu. Utilisez tree-sitter-language-pack.")
+            if not SemanticChunker._init_done:
+                log.debug(f"Échec Language Pack: {e}")
+        
+        self.is_available = False
     
     def _query_ast(self, tree, query_string: str) -> List:
         """Exécute une requête Tree-sitter sur l'AST."""
-        if not self.parser or not self.language:
+        if not hasattr(self._local, "parser") or not self._local.parser:
+            self._init_tree_sitter()
+            
+        if not self._local.parser or not self._local.language:
             return []
         
         try:
             # Utiliser Query() constructor (lang.query() est déprécié)
             from tree_sitter import Query, QueryCursor
-            query = Query(self.language, query_string)
+            query = Query(self._local.language, query_string)
             
             # Utiliser QueryCursor pour exécuter la requête
             cursor = QueryCursor(query)
@@ -428,24 +308,19 @@ class SemanticChunker:
         
         return chunks
     
-    @trace_action(source="code_chunker")
     def chunk_file(self, file_path: str) -> List[Dict]:
         """
         Chunk un fichier Python en utilisant Tree-sitter.
-        
-        Stratégie "Coarse-to-Fine":
-        - Niveau Macro: Signatures de classes avec méthodes (sans corps)
-        - Niveau Micro: Méthodes individuelles complètes
-        
-        Returns:
-            Liste de dictionnaires contenant les chunks avec métadonnées
         """
         if not os.path.exists(file_path):
-            log.warning(f"Fichier introuvable: {file_path}")
             return []
         
+        # Initialisation lazy pour le thread courant
+        if not hasattr(self._local, "parser") or not self._local.parser:
+            self._init_tree_sitter()
+            
         # Fallback si Tree-sitter indisponible
-        if not self.parser or not self.language:
+        if not self._local.parser or not self._local.language:
             return self._chunk_basic(file_path)
         
         try:
@@ -456,7 +331,7 @@ class SemanticChunker:
                 return []
             
             source_bytes = source_code.encode('utf-8')
-            tree = self.parser.parse(source_bytes)
+            tree = self._local.parser.parse(source_bytes)
             
             chunks = []
             
@@ -520,9 +395,7 @@ class SemanticChunker:
                         chunks.append(chunk)
             
             # 3. Code orphelin (imports, constantes globales en haut du fichier)
-            # On capture les imports et assignations globales non dans une classe/fonction
             if not chunks or chunks[0]['start_line'] > 10:
-                # Il y a du code avant la première classe/fonction
                 orphan_text = source_code.split('\n')[:chunks[0]['start_line'] - 1] if chunks else source_code.split('\n')[:50]
                 orphan_content = '\n'.join(orphan_text).strip()
                 if len(orphan_content) >= MIN_CHUNK_SIZE:
@@ -535,11 +408,9 @@ class SemanticChunker:
                         'raw_content': orphan_content
                     })
             
-            log.info(f"✅ Chunking {file_path}: {len(chunks)} chunks créés")
             return chunks
             
         except Exception as e:
-            log.error(f"Erreur chunking {file_path}: {e}")
             # Fallback: chunking basique
             return self._chunk_basic(file_path)
     

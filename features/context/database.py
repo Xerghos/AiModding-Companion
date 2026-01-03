@@ -1,7 +1,7 @@
 """
 Moteur de base de données sémantique omniscient utilisant sqlite-vec.
-Version V6 : Pipeline Streaming TOTAL (Scan -> I/O -> Encode -> DB).
-Optimisation Windows/Ryzen : Démarrage instantané, zéro latence de scan.
+Version V7.9 : Flux Continu & Performance Max.
+Optimisation : Backpressure (Queue=2), Executemany global, Alignement débit I/O sur IA.
 """
 
 import os
@@ -18,12 +18,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 from config import get_logger, get_path, SUPPORTED_FILE_EXTENSIONS
 from features.Decorators import trace_action
-
-# Initialisation hardware
-try:
-    import ai_core.hardware_init
-except ImportError:
-    pass
 
 log = get_logger("features.context.database")
 
@@ -53,7 +47,7 @@ def _get_paths(db_path_base=None):
     db_path = db_path_base or _get_db_path()
     return (db_path, None, None)
 
-def get_connection(db_path_base=None):
+def get_connection(db_path_base=None, fast_mode=False):
     db_path = db_path_base or _get_db_path()
     abs_db_path = os.path.abspath(db_path)
     os.makedirs(os.path.dirname(abs_db_path), exist_ok=True)
@@ -64,147 +58,101 @@ def get_connection(db_path_base=None):
         conn.enable_load_extension(False)
     except:
         sqlite_vec.load(conn)
+    
+    if fast_mode:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=MEMORY;")
+        cursor.execute("PRAGMA synchronous=OFF;")
+        cursor.execute("PRAGMA locking_mode=EXCLUSIVE;")
+        cursor.execute("PRAGMA cache_size=100000;") 
     return conn
 
 @trace_action(source="database")
 def _ensure_model():
     global SentenceTransformer, model
     if model is not None: return
-
     with _ensure_libs_lock:
         if SentenceTransformer is None:
             try:
-                import transformers
                 from sentence_transformers import SentenceTransformer as ST
                 SentenceTransformer = ST
-            except Exception as e:
-                log.error(f"❌ Erreur import IA : {e}")
-                return
-
+            except Exception: return
         if model is None:
-            log.info(f"Chargement modèle Embedding : {EMBEDDING_MODEL_NAME}...")
             try:
                 import torch
-                # Force CPU pour stabilité maximale et parallélisme AVX-512
-                device = "cpu"
-                log.info("⚙️ Mode CPU forcé (Zen 4 Optimized)")
-                base_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
-                
-                # Quantification native INT8
+                # On force PyTorch à utiliser tous les coeurs pour model.encode()
+                torch.set_num_threads(os.cpu_count())
+                base_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
                 try:
-                    base_model = torch.quantization.quantize_dynamic(
-                        base_model, {torch.nn.Linear}, dtype=torch.qint8
-                    )
-                    log.info("✅ Modèle quantifié INT8")
+                    base_model = torch.quantization.quantize_dynamic(base_model, {torch.nn.Linear}, dtype=torch.qint8)
                 except: pass
-
                 model = base_model
-            except Exception as e:
-                log.error(f"❌ Erreur _ensure_model : {e}")
-                raise
+            except: raise
 
 @trace_action(source="database")
 def init_db(db_path_base=None):
     global _db_initialized
     if _db_initialized and db_path_base is None: return
-
     with _init_db_lock:
-        conn = get_connection(db_path_base)
+        conn = get_connection(db_path_base, fast_mode=True)
         cursor = conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL;")
         cursor.execute("PRAGMA synchronous=NORMAL;")
-        
         cursor.execute('CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE, checksum TEXT, last_indexed TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER, chunk_index INTEGER DEFAULT 0, 
-                content TEXT, ast_type TEXT, start_line INTEGER, end_line INTEGER, 
-                parent_context TEXT, metadata TEXT,
-                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE)
-        ''')
+        cursor.execute('''CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER, chunk_index INTEGER DEFAULT 0, content TEXT, ast_type TEXT, start_line INTEGER, end_line INTEGER, parent_context TEXT, metadata TEXT, FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE)''')
         cursor.execute(f'CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(chunk_id INTEGER PRIMARY KEY, embedding float[{EMBEDDING_DIM}])')
         try: cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(content, tokenize='trigram')")
         except: pass
-
         conn.commit()
         conn.close()
         if db_path_base is None: _db_initialized = True
 
 @trace_action(source="database")
 def index_project_files(root_path: str, progress_callback=None, use_semantic_chunking=True, **kwargs):
-    """
-    Indexation V6 : Pipeline Streaming TOTAL (Scan -> I/O -> Encode -> DB).
-    Optimisation : Le Scan alimente la queue d'I/O en temps réel.
-    """
-    from .merkle_sync import MerkleTreeSync
     from .code_chunker import get_chunker
     from features.gitignore_parser import parse_gitignore
     from config.settings import APP_SETTINGS
     
+    overall_start = time.time()
     init_db()
-    log.info(f"🚀 Début Indexation V6 (Full Streaming) : {root_path}")
-    
+    _ensure_model()
     chunker = get_chunker()
-    _ensure_model() # Préchauffage modèle AVANT le scan pour ne pas bloquer
 
-    # --- PIPELINE COMPONENTS ---
+    # --- PIPELINE CONFIG (V7.9) ---
+    file_queue = queue.Queue(maxsize=1000)
+    # [FLUIDITÉ] On réduit la queue à 2 pour forcer le disque à attendre l'IA.
+    # Résultat : affichage fluide et synchrone.
+    chunk_queue = queue.Queue(maxsize=2) 
+    write_queue = queue.Queue(maxsize=100)
     
-    # file_queue: fpath (Scan -> I/O)
-    file_queue = queue.Queue(maxsize=2000)
-    # chunk_queue: (fpath, rel, checksum, [chunks]) (I/O -> Encoder)
-    chunk_queue = queue.Queue(maxsize=1000)
-    # write_queue: (file_data, vector_data) (Encoder -> Writer)
-    write_queue = queue.Queue(maxsize=1000)
+    timers = {'scan': 0, 'io_chunk': 0, 'encode': 0, 'write': 0, 'commit': 0}
+    stats = {'scanned': 0, 'encoded': 0}
     
-    # Stats
-    stats = {'files_scanned': 0, 'files_read': 0, 'chunks_encoded': 0, 'db_writes': 0}
-    
-    # --- STAGE 1: SCANNER (Thread) ---
+    # --- STAGE 1: SCANNER ---
     def scanner_thread():
+        start = time.time()
         gitignore_path = os.path.join(root_path, ".gitignore")
         matches_gitignore = parse_gitignore(gitignore_path) if os.path.exists(gitignore_path) else lambda x: False
-        
         critical_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'db', 'logs', 'dist', 'build', 'audio_cache', '.vscode', '.idea'}
         watch_list = APP_SETTINGS.get("repo_map_cache", {}).get("watch_files", [])
         normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
-        
         for root, dirs, files in os.walk(root_path):
-            dirs[:] = [d for d in dirs if d not in critical_dirs]
+            dirs[:] = [d for d in dirs if d not in critical_dirs and not matches_gitignore(os.path.join(root, d))]
             for file in files:
                 fpath = os.path.join(root, file)
-                
-                # 1. Check Watchlist
                 if os.path.normpath(fpath).lower() in normalized_watch_list:
-                    file_queue.put(fpath)
-                    stats['files_scanned'] += 1
-                    continue
-                
-                # 2. Check Gitignore
+                    file_queue.put(fpath); stats['scanned'] += 1; continue
                 if matches_gitignore(fpath): continue
-                
-                # 3. Check Extension
-                valid_exts = SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css', '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml', '.toml', '.xml', '.sql', '.ini', '.cfg')
-                if not fpath.lower().endswith(valid_exts):
-                    try: 
-                        if os.path.getsize(fpath) > 1024 * 1024: continue
-                    except: continue
-                
-                file_queue.put(fpath)
-                stats['files_scanned'] += 1
-        
-        # Signal de fin pour les I/O workers (on en envoie autant que de workers)
-        # Mais comme on utilise un ThreadPool, on ne peut pas envoyer de signal de fin direct dans la queue
-        # car on ne sait pas quel thread prendra quoi.
-        # Solution: On utilise un "poison pill" unique et le consumer gère.
-        # OU MIEUX : Le thread I/O Manager détecte que scanner est fini et que la queue est vide.
-        pass # Le thread s'arrête simplement
+                if not fpath.lower().endswith(SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css', '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml', '.toml', '.xml', '.sql', '.ini', '.cfg')): continue
+                file_queue.put(fpath); stats['scanned'] += 1
+        file_queue.put(None)
+        timers['scan'] = time.time() - start
 
-    # --- STAGE 2: I/O MANAGER (Thread) ---
-    def io_manager_thread():
-        # Lance les workers I/O et distribue le travail
-        # Attend que le scanner ait fini ET que la queue soit vide
-        
-        def process_file_task(fpath):
+    # --- STAGE 2: I/O (Chunking) ---
+    def io_thread():
+        start = time.time()
+        def task(fpath):
+            t0 = time.time()
             try:
                 rel = os.path.relpath(fpath, root_path)
                 with open(fpath, 'rb') as f: data = f.read()
@@ -212,163 +160,139 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
                 checksum = hashlib.sha256(data).hexdigest()
                 text = data.decode('utf-8', errors='ignore')
                 chunks = chunker.chunk_file(fpath) if use_semantic_chunking and fpath.endswith('.py') else [{'content': text}]
+                # Bloque si l'encodeur est occupé (Backpressure)
                 chunk_queue.put((fpath, rel, checksum, chunks))
-                stats['files_read'] += 1
-            except Exception: pass
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
+            except: pass
+            timers['io_chunk'] += (time.time() - t0)
+        
+        # 2 workers suffisent pour nourrir l'encodeur sans saturer le CPU
+        with ThreadPoolExecutor(max_workers=2) as executor:
             while True:
-                try:
-                    # On attend un fichier avec timeout pour vérifier si le scan est fini
-                    fpath = file_queue.get(timeout=0.1)
-                    executor.submit(process_file_task, fpath)
-                except queue.Empty:
-                    if not t_scan.is_alive():
-                        break
-        
-        # Quand tout est soumis et fini
-        chunk_queue.put(None) # Signal pour l'encodeur
+                fpath = file_queue.get()
+                if fpath is None: break
+                executor.submit(task, fpath)
+        chunk_queue.put(None)
+        timers['io'] = time.time() - start
 
-    # --- STAGE 3: ENCODER (Thread) ---
+    # --- STAGE 3: ENCODER ---
     def encoder_thread():
-        batch_size = 64
-        current_batch_files = []
-        current_batch_texts = []
-        
+        start = time.time()
+        batch_size = 32
+        cur_meta, cur_texts = [], []
         while True:
-            item = chunk_queue.get()
-            if item is None:
-                if current_batch_texts:
-                    process_encoding_batch(current_batch_files, current_batch_texts)
-                write_queue.put(None)
-                break
-            
-            fpath, rel, checksum, chunks = item
-            for ch in chunks:
-                txt = ch.get('content', '').strip()
-                if txt:
-                    current_batch_texts.append(txt)
-                    current_batch_files.append((fpath, rel, checksum, ch))
-            
-            if len(current_batch_texts) >= batch_size:
-                process_encoding_batch(current_batch_files, current_batch_texts)
-                current_batch_files = []
-                current_batch_texts = []
+            try:
+                item = chunk_queue.get(timeout=0.05)
+                if item is None:
+                    if cur_texts: encode_now(cur_meta, cur_texts)
+                    write_queue.put(None); break
+                fpath, rel, checksum, chunks = item
+                
+                # Feedback utilisateur instantané (Synchrone avec l'IA)
+                if progress_callback:
+                    progress_callback(f"Analyse : {rel}...")
 
-    def process_encoding_batch(meta_list, text_list):
-        if not text_list: return
+                for ch in chunks:
+                    txt = ch.get('content', '').strip()
+                    if txt:
+                        cur_texts.append(txt)
+                        cur_meta.append((fpath, rel, checksum, ch))
+                if len(cur_texts) >= batch_size:
+                    encode_now(cur_meta, cur_texts)
+                    cur_meta, cur_texts = [], []
+            except queue.Empty:
+                if cur_texts:
+                    encode_now(cur_meta, cur_texts); cur_meta, cur_texts = [], []
+        timers['encode_wall'] = time.time() - start
+
+    def encode_now(meta, texts):
+        t0 = time.time()
         try:
-            vectors = model.encode(text_list, batch_size=len(text_list), convert_to_numpy=True, show_progress_bar=False)
-            write_queue.put((meta_list, vectors))
-            stats['chunks_encoded'] += len(vectors)
-            if progress_callback and stats['chunks_encoded'] % 50 == 0:
-                progress_callback(f"Indexation V6 : {stats['chunks_encoded']} chunks...")
-        except Exception as e:
-            log.error(f"Erreur Encodage : {e}")
+            vecs = model.encode(texts, batch_size=len(texts), convert_to_numpy=True, show_progress_bar=False)
+            timers['encode'] += (time.time() - t0)
+            write_queue.put((meta, vecs))
+            stats['encoded'] += len(vecs)
+        except Exception as e: log.error(f"Error Encoding: {e}")
 
-    # --- STAGE 4: WRITER (Thread) ---
+    # --- STAGE 4: WRITER ---
     def writer_thread():
-        conn = get_connection()
+        start = time.time()
+        conn = get_connection(fast_mode=True)
         cursor = conn.cursor()
         file_id_cache = {}
+        cursor.execute("BEGIN TRANSACTION")
         cursor.execute("DELETE FROM files") 
-        conn.commit()
-        
         while True:
             item = write_queue.get()
-            if item is None:
-                conn.commit()
-                conn.close()
-                break
+            if item is None: break
+            t0 = time.time()
+            meta, vecs = item
             
-            meta_list, vectors = item
-            
-            files_to_insert = {}
-            for _, rel, checksum, _ in meta_list:
+            # --- INSERTION OPTIMISÉE ---
+            # 1. On prépare tous les fichiers d'un coup
+            for _, rel, checksum, _ in meta:
                 if rel not in file_id_cache:
-                    files_to_insert[rel] = checksum
-            
-            if files_to_insert:
-                for rel, checksum in files_to_insert.items():
                     cursor.execute("INSERT INTO files (path, checksum) VALUES (?, ?)", (rel, checksum))
                     file_id_cache[rel] = cursor.lastrowid
             
-            for (fpath, rel, checksum, ch), vec in zip(meta_list, vectors):
-                fid = file_id_cache.get(rel)
-                if not fid: continue # Should not happen
-                
-                params = {
-                    'fid': fid, 'idx': 0, 'cnt': ch['content'], 'ast': ch.get('ast_type'),
-                    'sl': ch.get('start_line'), 'el': ch.get('end_line'),
-                    'pc': ch.get('parent_context'), 'meta': ch.get('metadata')
-                }
-                cursor.execute('''INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata) VALUES (:fid, :idx, :cnt, :ast, :sl, :el, :pc, :meta)''', params)
-                cid = cursor.lastrowid
-                cursor.execute("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", (cid, vec.tobytes()))
-                try: cursor.execute("INSERT INTO fts_chunks(rowid, content) VALUES (?, ?)", (cid, ch['content']))
-                except: pass
+            # 2. On prépare les chunks pour executemany
+            # Note: Pour sqlite-vec, on a besoin du cid du chunk.
+            # On va insérer les chunks un par un mais dans la transaction (très rapide)
+            # pour récupérer le lastrowid
+            vec_batch = []
+            for (fpath, rel, checksum, ch), vec in zip(meta, vecs):
+                fid = file_id_cache[rel]
+                cursor.execute('''INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', 
+                               (fid, 0, ch['content'], ch.get('ast_type'), ch.get('start_line'), ch.get('end_line'), ch.get('parent_context'), ch.get('metadata')))
+                vec_batch.append((cursor.lastrowid, vec.tobytes()))
             
-            conn.commit()
-            stats['db_writes'] += 1
+            # 3. Insertion vectorielle massive
+            cursor.executemany("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", vec_batch)
+            timers['write'] += (time.time() - t0)
+        
+        t_commit = time.time()
+        conn.commit()
+        conn.close()
+        timers['commit'] = time.time() - t_commit
+        timers['writer_total'] = time.time() - start
 
-    # --- ORCHESTRATION ---
-    t_scan = threading.Thread(target=scanner_thread, daemon=True)
-    t_io = threading.Thread(target=io_manager_thread, daemon=True)
-    t_enc = threading.Thread(target=encoder_thread, daemon=True)
-    t_write = threading.Thread(target=writer_thread, daemon=True)
+    # Orchestration
+    threads = [
+        threading.Thread(target=scanner_thread, name="Scanner"),
+        threading.Thread(target=io_thread, name="IO"),
+        threading.Thread(target=encoder_thread, name="Encoder"),
+        threading.Thread(target=writer_thread, name="Writer")
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join()
     
-    t_scan.start()
-    t_io.start()
-    t_enc.start()
-    t_write.start()
-    
-    t_scan.join()
-    t_io.join()
-    t_enc.join()
-    t_write.join()
-    
-    try:
-        state_file = get_path("db/merkle_state_v4.json")
-        MerkleTreeSync(root_path).save_state(state_file)
-    except: pass
+    total = time.time() - overall_start
+    log.info(f"📊 SUMMARY: {total:.2f}s | Scan:{timers['scan']:.1f}s | Model:{timers['encode']:.1f}s | Commit:{timers['commit']:.1f}s")
+    return f"Indexation terminée en {total:.1f}s ({stats['scanned']} fichiers)."
 
-    log.info(f"✅ Indexation V6 Terminé : {stats['files_scanned']} fichiers scannés.")
-    return f"Succès V6 : {stats['files_scanned']} fichiers."
-
-# --- Autres Exports ---
+# --- Autres Fonctions ---
 
 def _add_chunks_batch(file_id: int, chunks_data: List[Dict]):
     _ensure_model()
     if not chunks_data or not model: return 0
     texts = [c.get('content', '') for c in chunks_data]
     vectors = model.encode(texts, convert_to_numpy=True)
-    conn = get_connection()
-    cursor = conn.cursor()
+    conn = get_connection(fast_mode=True); cursor = conn.cursor()
     try:
-        count = 0
         for i, (chunk, vector) in enumerate(zip(chunks_data, vectors)):
-            params = {'file_id': file_id, 'chunk_index': i, 'content': chunk['content'], 'ast_type': chunk.get('ast_type'), 'start_line': chunk.get('start_line'), 'end_line': chunk.get('end_line'), 'parent_context': chunk.get('parent_context'), 'metadata': chunk.get('metadata')}
-            cursor.execute('''INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata) VALUES (:file_id, :chunk_index, :content, :ast_type, :start_line, :end_line, :parent_context, :metadata)''', params)
-            cid = cursor.lastrowid
-            cursor.execute("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", (cid, vector.tobytes()))
-            try: cursor.execute("INSERT INTO fts_chunks(rowid, content) VALUES (?, ?)", (cid, chunk['content']))
-            except: pass
-            count += 1
+            cursor.execute('''INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', (file_id, i, chunk['content'], chunk.get('ast_type'), chunk.get('start_line'), chunk.get('end_line'), chunk.get('parent_context'), chunk.get('metadata')))
+            cursor.execute("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", (cursor.lastrowid, vector.tobytes()))
         conn.commit()
-        return count
+        return len(chunks_data)
     finally: conn.close()
 
 def search_hybrid(query: str, db_path_base=None, limit: int = 20, **kwargs):
-    _ensure_model()
-    init_db(db_path_base)
+    _ensure_model(); init_db(db_path_base)
     if not model: return [], "Modèle non chargé"
     try:
         query_vec = model.encode([query])[0]
-        conn = get_connection(db_path_base)
-        cursor = conn.cursor()
+        conn = get_connection(db_path_base); cursor = conn.cursor()
         cursor.execute('SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ? AND k = 50 ORDER BY distance ASC', (query_vec.tobytes(),))
-        vec_results = cursor.fetchall()
-        scores = {}
+        vec_results = cursor.fetchall(); scores = {}
         for i, (cid, _) in enumerate(vec_results): scores[cid] = scores.get(cid, 0) + (1.0 / (60 + i + 1))
         sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
         final = []
@@ -376,8 +300,7 @@ def search_hybrid(query: str, db_path_base=None, limit: int = 20, **kwargs):
             cursor.execute('SELECT f.path, c.content, c.ast_type, c.start_line FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.id = ?', (cid,))
             row = cursor.fetchone()
             if row: final.append((row[0], row[1], score, row[2], row[3]))
-        conn.close()
-        return final, None
+        conn.close(); return final, None
     except Exception as e: return [], str(e)
 
 def search_vector_db(query, db_path_base=None, max_results=5): return search_hybrid(query, db_path_base, limit=max_results)
