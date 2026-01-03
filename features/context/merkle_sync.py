@@ -6,11 +6,113 @@ Détecte les fichiers modifiés sans ré-indexer l'intégralité du projet.
 import os
 import hashlib
 import logging
+import fnmatch
 from typing import Dict, List, Optional, Tuple
 from config import get_logger
 from features.Decorators import trace_action
 
 log = get_logger("features.context.merkle_sync")
+
+# Import pour PathSpec (optionnel, géré par gitignore_parser)
+try:
+    from pathspec import PathSpec
+    PATHSPEC_AVAILABLE = True
+except ImportError:
+    PathSpec = None
+    PATHSPEC_AVAILABLE = False
+
+
+def get_exclusion_patterns(root_path: str) -> Tuple[Optional['PathSpec'], set[str], set[str]]:
+    """
+    Récupère tous les patterns d'exclusion depuis :
+    1. .gitignore (via pathspec)
+    2. code_analysis.ignored_folders (settings)
+    3. system_settings.ignored_files (settings)
+    4. Liste de fallback par défaut
+    
+    Args:
+        root_path: Chemin racine du projet
+    
+    Returns:
+        (gitignore_spec, excluded_dirs_set, excluded_files_set)
+    """
+    from features.gitignore_parser import load_gitignore_patterns
+    from config.settings import APP_SETTINGS
+    
+    # 1. Charger .gitignore
+    gitignore_spec = load_gitignore_patterns(root_path)
+    
+    # 2. Charger depuis settings
+    ignored_folders = APP_SETTINGS.get("code_analysis", {}).get("ignored_folders", [])
+    ignored_files = APP_SETTINGS.get("system_settings", {}).get("ignored_files", [])
+    
+    # 3. Fallback par défaut
+    default_dirs = {'.git', '__pycache__', 'venv', 'env', 'node_modules', 
+                   'db', 'logs', 'dist', 'build', 'audio_cache', '.idea', '.vscode', '.cursor'}
+    default_files = {'.pyc', '.pyo', '.pyd', '.log', '.tmp', '.cache'}
+    
+    # Combiner tous les patterns
+    excluded_dirs = set(default_dirs)
+    excluded_files = set(default_files)
+    
+    # Ajouter les patterns depuis settings (supporter wildcards)
+    for pattern in ignored_folders:
+        if pattern:
+            excluded_dirs.add(pattern.strip())
+    
+    for pattern in ignored_files:
+        if pattern:
+            excluded_files.add(pattern.strip())
+    
+    return gitignore_spec, excluded_dirs, excluded_files
+
+
+def should_exclude_path(file_path: str, root_path: str, 
+                        gitignore_spec: Optional['PathSpec'],
+                        excluded_dirs: set[str],
+                        excluded_files: set[str]) -> bool:
+    """
+    Vérifie si un chemin doit être exclu selon toutes les sources.
+    
+    Args:
+        file_path: Chemin absolu du fichier/dossier
+        root_path: Chemin racine du projet
+        gitignore_spec: PathSpec pré-chargé depuis .gitignore
+        excluded_dirs: Set de patterns de dossiers à exclure
+        excluded_files: Set de patterns de fichiers à exclure
+    
+    Returns:
+        True si le chemin doit être exclu
+    """
+    from features.gitignore_parser import should_ignore_path
+    
+    # 1. Vérifier .gitignore
+    if gitignore_spec and should_ignore_path(file_path, root_path, gitignore_spec):
+        return True
+    
+    # 2. Vérifier les patterns de dossiers
+    try:
+        rel_path = os.path.relpath(file_path, root_path).replace('\\', '/')
+        path_segments = rel_path.split('/')
+        
+        for pattern in excluded_dirs:
+            # Support wildcards
+            if fnmatch.fnmatch(rel_path, pattern) or fnmatch.fnmatch(os.path.basename(file_path), pattern):
+                return True
+            # Support segment exact (comme dans Documentation.py)
+            if pattern in path_segments:
+                return True
+        
+        # 3. Vérifier les patterns de fichiers
+        filename = os.path.basename(file_path)
+        for pattern in excluded_files:
+            if fnmatch.fnmatch(filename, pattern) or fnmatch.fnmatch(rel_path, pattern):
+                return True
+    except ValueError:
+        # Chemin hors de root_path
+        pass
+    
+    return False
 
 
 class MerkleNode:
@@ -70,26 +172,48 @@ class MerkleTreeSync:
     def build_tree(self, exclude_dirs: Optional[List[str]] = None) -> MerkleNode:
         """
         Construit l'arbre de Merkle pour le système de fichiers.
+        Utilise .gitignore + settings pour les exclusions.
         
         Args:
-            exclude_dirs: Liste de dossiers à exclure (ex: ['.git', '__pycache__'])
+            exclude_dirs: Liste optionnelle de dossiers à exclure (s'ajoute aux exclusions depuis settings)
         
         Returns:
             Le nœud racine de l'arbre
         """
-        if exclude_dirs is None:
-            exclude_dirs = ['.git', '__pycache__', 'venv', 'env', 'node_modules', 
-                          'db', 'logs', 'dist', 'build', 'audio_cache', '.idea', '.vscode']
+        # Charger les exclusions depuis toutes les sources
+        gitignore_spec, excluded_dirs_set, excluded_files_set = get_exclusion_patterns(self.root_path)
         
-        self.root_node = self._build_node(self.root_path, exclude_dirs)
+        # Si exclude_dirs est fourni explicitement, l'ajouter
+        if exclude_dirs:
+            excluded_dirs_set.update(exclude_dirs)
+        
+        # Utiliser excluded_dirs_set au lieu de exclude_dirs hardcodé
+        self.root_node = self._build_node(self.root_path, excluded_dirs_set, 
+                                          gitignore_spec, excluded_files_set)
         self.root_node.compute_hash()
         
         log.info(f"✅ Arbre Merkle construit: {len(self.node_map)} nœuds, hash racine: {self.root_node.hash[:16]}...")
         return self.root_node
     
-    def _build_node(self, path: str, exclude_dirs: List[str]) -> MerkleNode:
-        """Construit récursivement un nœud et ses enfants."""
+    def _build_node(self, path: str, excluded_dirs: set[str], 
+                    gitignore_spec: Optional['PathSpec'],
+                    excluded_files: set[str]) -> MerkleNode:
+        """Construit récursivement un nœud et ses enfants.
+        
+        Args:
+            path: Chemin du fichier/dossier
+            excluded_dirs: Set de patterns de dossiers à exclure
+            gitignore_spec: PathSpec pré-chargé depuis .gitignore
+            excluded_files: Set de patterns de fichiers à exclure
+        
+        Returns:
+            MerkleNode pour ce chemin
+        """
         if not os.path.exists(path):
+            return MerkleNode(path, is_file=False, hash_value=hashlib.sha256(b"").hexdigest())
+        
+        # Vérifier si le chemin doit être exclu
+        if should_exclude_path(path, self.root_path, gitignore_spec, excluded_dirs, excluded_files):
             return MerkleNode(path, is_file=False, hash_value=hashlib.sha256(b"").hexdigest())
         
         if os.path.isfile(path):
@@ -105,12 +229,13 @@ class MerkleTreeSync:
             try:
                 entries = sorted(os.listdir(path))
                 for entry in entries:
-                    # Exclure certains dossiers
-                    if entry in exclude_dirs:
+                    entry_path = os.path.join(path, entry)
+                    
+                    # Vérifier exclusion avant de descendre
+                    if should_exclude_path(entry_path, self.root_path, gitignore_spec, excluded_dirs, excluded_files):
                         continue
                     
-                    entry_path = os.path.join(path, entry)
-                    child_node = self._build_node(entry_path, exclude_dirs)
+                    child_node = self._build_node(entry_path, excluded_dirs, gitignore_spec, excluded_files)
                     node.add_child(child_node)
             except PermissionError:
                 log.warning(f"Permission refusée pour {path}")

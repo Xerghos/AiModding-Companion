@@ -20,6 +20,10 @@ log = get_logger("features.context.database")
 # Lock pour protéger l'initialisation thread-safe de SentenceTransformer
 _ensure_libs_lock = threading.Lock()
 
+# Lock et cache pour protéger l'initialisation thread-safe de init_db
+_init_db_lock = threading.Lock()
+_initialized_dbs = set()  # Cache des DB déjà initialisées
+
 # --- Constantes ---
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
@@ -77,11 +81,29 @@ def _ensure_libs():
 @trace_action(source="database")
 def init_db(db_path_base=None):
     global faiss_index, id_mapping
-    sqlite_path, index_path, map_path = _get_paths(db_path_base)
-    os.makedirs(os.path.dirname(sqlite_path), exist_ok=True)
     
-    conn = sqlite3.connect(sqlite_path)
-    cursor = conn.cursor()
+    # Calculer la clé unique pour cette DB
+    sqlite_path, index_path, map_path = _get_paths(db_path_base)
+    db_key = os.path.abspath(sqlite_path)
+    
+    # Vérifier si déjà initialisée (sans lock, rapide)
+    if db_key in _initialized_dbs:
+        log.debug(f"DB déjà initialisée: {db_key}")
+        _ensure_libs()  # S'assurer que les libs sont chargées
+        return
+    
+    # Protection thread-safe pour l'initialisation
+    with _init_db_lock:
+        # Double-check après avoir acquis le lock
+        if db_key in _initialized_dbs:
+            log.debug(f"DB déjà initialisée (double-check): {db_key}")
+            _ensure_libs()
+            return
+        
+        os.makedirs(os.path.dirname(sqlite_path), exist_ok=True)
+        
+        conn = sqlite3.connect(sqlite_path)
+        cursor = conn.cursor()
     
     # Table knowledge (legacy, conservée pour compatibilité)
     cursor.execute('''
@@ -277,6 +299,10 @@ def init_db(db_path_base=None):
             conn.close()
         except Exception as e:
             log.warning(f"Erreur reconstruction index depuis DB: {e}", exc_info=True)
+        
+        # Marquer comme initialisée
+        _initialized_dbs.add(db_key)
+        log.debug(f"✅ DB initialisée: {db_key}")
 
 @trace_action(source="database")
 def add_knowledge(collection, content, metadata=None):

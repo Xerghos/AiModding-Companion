@@ -70,6 +70,7 @@ class GeminiApp:
         
         # Variables de préchauffage
         self._prewarm_triggered = False
+        self._prewarm_in_progress = False  # Nouveau : indique si préchauffage en cours
         self._prewarm_thread = None
         self._maintenance_thread = None
         self._cache_lock = threading.Lock()
@@ -1010,6 +1011,13 @@ class GeminiApp:
 
     def _prewarm_context_intelligent(self):
         """Préchauffe intelligemment les composants selon les dépendances."""
+        # Vérifier si déjà en cours pour éviter les doublons
+        with self._cache_lock:
+            if self._prewarm_in_progress:
+                log.debug("⚠️ Préchauffage déjà en cours, ignoré")
+                return
+            self._prewarm_in_progress = True
+        
         def prewarm_task():
             try:
                 log.debug("🔥 Démarrage préchauffage contextuel...")
@@ -1050,6 +1058,10 @@ class GeminiApp:
                 
             except Exception as e:
                 log.warning(f"Erreur préchauffage: {e}")
+            finally:
+                # Libérer le flag
+                with self._cache_lock:
+                    self._prewarm_in_progress = False
         
         self._prewarm_thread = threading.Thread(
             target=prewarm_task, 
@@ -1077,14 +1089,29 @@ class GeminiApp:
                 db_path = APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid")
                 if not os.path.isabs(db_path):
                     db_path = get_path(db_path)
-                database.init_db(db_path)  # Charge FAISS et modèle
+                database.init_db(db_path)  # Charge FAISS et modèle (maintenant thread-safe et idempotente)
         except Exception as e:
-            # Afficher l'erreur complète pour le débogage
-            error_msg = str(e) if e else "Erreur inconnue"
-            log.debug(f"Erreur préchauffage RAG: {error_msg}")
-            # Ne pas logger comme warning si c'est juste un problème de chargement déjà en cours
-            if "meta tensor" not in error_msg.lower():
-                log.warning(f"⚠️ Erreur préchauffage RAG: {error_msg}")
+            # Ignorer les erreurs silencieuses ou attendues
+            error_msg = str(e) if e else ""
+            error_type = type(e).__name__
+            
+            # Ne pas logger comme warning si c'est une erreur attendue ou silencieuse
+            expected_errors = [
+                "meta tensor",  # Erreur PyTorch lors du chargement parallèle (déjà géré par le lock)
+                "already initialized",  # Déjà initialisé
+                "already loaded",  # Déjà chargé
+            ]
+            
+            # Vérifier si c'est une erreur attendue
+            is_expected = any(expected in error_msg.lower() for expected in expected_errors)
+            
+            # Ne logger que les erreurs inattendues ou si le message est vide (pour debug)
+            if not is_expected and error_msg:
+                log.debug(f"Erreur préchauffage RAG ({error_type}): {error_msg}")
+            elif not error_msg:
+                # Message vide : logger en debug pour investiguer
+                log.debug(f"Erreur préchauffage RAG ({error_type}): exception sans message")
+            # Si c'est attendu, ne rien logger (c'est normal)
 
     def _prewarm_tree(self):
         """Préchauffe l'arborescence avec cache Merkle."""
@@ -1135,13 +1162,16 @@ class GeminiApp:
         
         def maintenance_task():
             import time
+            # Démarrer avec un délai plus long pour éviter la surcharge au démarrage
+            time.sleep(300)  # Attendre 5 minutes avant la première vérification
+            
             while True:
                 try:
-                    time.sleep(30)  # Vérification toutes les 30 secondes
+                    time.sleep(600)  # Vérification toutes les 10 minutes au lieu de 30 secondes
                     self._maintain_caches()
                 except Exception as e:
                     log.debug(f"Erreur maintenance: {e}")
-                    time.sleep(60)  # Attendre plus longtemps en cas d'erreur
+                    time.sleep(1200)  # Attendre 20 minutes en cas d'erreur
         
         self._maintenance_thread = threading.Thread(
             target=maintenance_task,
@@ -1149,7 +1179,7 @@ class GeminiApp:
             name="CacheMaintenance"
         )
         self._maintenance_thread.start()
-        log.debug("🔄 Thread de maintenance démarré")
+        log.debug("🔄 Thread de maintenance démarré (vérification toutes les 10 min)")
 
     def _maintain_caches(self):
         """Maintient les caches à jour de manière asynchrone."""

@@ -30,6 +30,12 @@ class MultiModelCacheManager:
         self._tree_hash = None
         self._tree_lock = threading.Lock()  # Thread-safe pour tree cache
         self._components_lock = threading.Lock()  # Thread-safe pour components
+        
+        # Cache pour le hash du projet avec mtimes (évite les recalculs Merkle)
+        self._project_hash_cache = None
+        self._project_hash_mtimes = {}  # {path: mtime}
+        self._project_hash_timestamp = 0
+        self._project_hash_lock = threading.Lock()  # Protection thread-safe
 
     @trace_action(source="CacheManager")
     def prepare_content(self):
@@ -299,41 +305,97 @@ class MultiModelCacheManager:
                     
         return "\n".join(lines)
 
-    def _get_project_hash(self):
-        """Calcule le hash du projet pour invalidation du cache."""
+    def _get_project_hash(self, force_recalculate=False):
+        """Calcule le hash du projet via UN SEUL arbre Merkle (optimisé).
+        Utilise les mtimes pour éviter de reconstruire les arbres Merkle inutilement.
+        
+        Args:
+            force_recalculate: Si True, force le recalcul même si le cache est valide
+        
+        Returns:
+            Hash SHA256 du projet
+        """
         from features.context.merkle_sync import MerkleTreeSync
         from features.Documentation import calculate_file_hash
         from config.settings import APP_SETTINGS
+        from config.paths import get_path
         import hashlib
+        import time
         
-        hasher = hashlib.sha256()
-        
-        # Utiliser la même logique que Repo Map pour cohérence
-        cache_config = APP_SETTINGS.get("repo_map_cache", {})
-        watch_dirs = cache_config.get("watch_directories", ["features/", "ai_core/", "worker/"])
-        watch_files = cache_config.get("watch_files", ["config/architecture_map.json"])
-        
-        # Utiliser MerkleTreeSync pour chaque dossier surveillé
-        for dir_path in watch_dirs:
-            abs_dir = get_path(dir_path) if not os.path.isabs(dir_path) else dir_path
-            if os.path.exists(abs_dir):
-                try:
-                    merkle = MerkleTreeSync(abs_dir)
-                    root = merkle.build_tree()
-                    if root and root.hash:
-                        hasher.update(root.hash.encode())
-                except Exception as e:
-                    log.debug(f"Erreur hash projet {dir_path}: {e}")
-        
-        # Ajouter les fichiers surveillés individuellement
-        for file_path in watch_files:
-            abs_file = get_path(file_path) if not os.path.isabs(file_path) else file_path
-            if os.path.exists(abs_file):
-                file_hash = calculate_file_hash(abs_file)
-                if file_hash:
-                    hasher.update(file_hash.encode())
-        
-        return hasher.hexdigest()
+        with self._project_hash_lock:
+            # Vérifier si on peut utiliser le cache (évite les reconstructions Merkle)
+            if not force_recalculate and self._project_hash_cache:
+                cache_config = APP_SETTINGS.get("repo_map_cache", {})
+                watch_dirs = cache_config.get("watch_directories", ["features/", "ai_core/", "worker/"])
+                watch_files = cache_config.get("watch_files", ["config/architecture_map.json"])
+                
+                # Vérifier les mtimes pour détecter les changements (rapide, pas de scan)
+                all_paths = list(watch_dirs) + list(watch_files)
+                paths_changed = False
+                
+                for path in all_paths:
+                    abs_path = get_path(path) if not os.path.isabs(path) else path
+                    if os.path.exists(abs_path):
+                        try:
+                            current_mtime = os.path.getmtime(abs_path)
+                            cached_mtime = self._project_hash_mtimes.get(abs_path)
+                            if cached_mtime != current_mtime:
+                                paths_changed = True
+                                break
+                        except Exception:
+                            paths_changed = True
+                            break
+                
+                # Si rien n'a changé, retourner le cache (évite les reconstructions Merkle)
+                if not paths_changed:
+                    return self._project_hash_cache
+            
+            # Recalculer le hash (seulement si nécessaire)
+            hasher = hashlib.sha256()
+            
+            # OPTIMISATION : Construire UN SEUL arbre Merkle pour la racine du projet
+            project_root = os.path.dirname(get_path("."))  # Racine du projet
+            
+            # Enregistrer le mtime de la racine
+            try:
+                self._project_hash_mtimes[project_root] = os.path.getmtime(project_root)
+            except Exception:
+                pass
+            
+            # 1. Arbre Merkle pour TOUT le projet (une seule construction au lieu de 3)
+            try:
+                merkle = MerkleTreeSync(project_root)
+                # build_tree() utilise maintenant les exclusions depuis settings
+                root = merkle.build_tree()
+                if root and root.hash:
+                    hasher.update(root.hash.encode())
+                    log.debug(f"✅ Arbre Merkle projet: {len(merkle.node_map)} nœuds")
+            except Exception as e:
+                log.warning(f"Erreur construction Merkle projet: {e}")
+            
+            # 2. Ajouter les fichiers surveillés individuellement (si en dehors de l'arbre)
+            cache_config = APP_SETTINGS.get("repo_map_cache", {})
+            watch_files = cache_config.get("watch_files", ["config/architecture_map.json"])
+            for file_path in watch_files:
+                abs_file = get_path(file_path) if not os.path.isabs(file_path) else file_path
+                if os.path.exists(abs_file):
+                    try:
+                        # Enregistrer le mtime
+                        self._project_hash_mtimes[abs_file] = os.path.getmtime(abs_file)
+                        
+                        # Le fichier est déjà dans l'arbre Merkle, mais on peut l'ajouter pour cohérence
+                        # OU on peut le skip car il est déjà inclus dans le hash racine
+                        file_hash = calculate_file_hash(abs_file)
+                        if file_hash:
+                            hasher.update(file_hash.encode())
+                    except Exception as e:
+                        log.debug(f"Erreur hash fichier {file_path}: {e}")
+            
+            project_hash = hasher.hexdigest()
+            self._project_hash_cache = project_hash
+            self._project_hash_timestamp = time.time()
+            
+            return project_hash
 
     def prepare_tree_only(self):
         """Prépare uniquement l'arborescence avec cache Merkle."""
@@ -502,7 +564,15 @@ class MultiModelCacheManager:
         """
         if not self.components:
             self.prepare_content()
-        return self.components
+        with self._components_lock:
+            return self.components.copy()  # Retourne une copie pour thread-safety
+    
+    def invalidate_project_hash_cache(self):
+        """Invalide le cache du hash du projet (force le recalcul au prochain appel)."""
+        with self._project_hash_lock:
+            self._project_hash_cache = None
+            self._project_hash_mtimes = {}
+            self._project_hash_timestamp = 0
 
     @trace_action(source="CacheManager")
     def get_context_payload(self):
