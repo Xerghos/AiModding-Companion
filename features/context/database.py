@@ -75,22 +75,31 @@ def _ensure_model():
             from sentence_transformers import SentenceTransformer as ST
             SentenceTransformer = ST
         if model is None:
-            log.info(f"Chargement modèle Embedding: {EMBEDDING_MODEL_NAME} (Optimisation INT8)...")
+            log.info(f"Chargement modèle Embedding: {EMBEDDING_MODEL_NAME}...")
             try:
-                import torch
                 # Charger le modèle original (float32)
                 base_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
                 
-                # Appliquer la quantification dynamique pour CPU
-                # Réduit l'empreinte RAM de ~4x et accélère l'inférence sur CPU
-                model = torch.quantization.quantize_dynamic(
-                    base_model, 
-                    {torch.nn.Linear}, 
-                    dtype=torch.qint8
-                )
-                log.info(f"✅ Modèle Embedding chargé et quantifié (INT8): {EMBEDDING_MODEL_NAME}")
+                # Tentative de quantification avec torchao (nouvelle API PyTorch)
+                try:
+                    from torchao.quantization import quantize_, int8_dynamic_activation_int8_weight
+                    
+                    # quantize_ modifie le modèle in-place
+                    quantize_(base_model, int8_dynamic_activation_int8_weight())
+                    model = base_model
+                    log.info(f"✅ Modèle Embedding chargé et quantifié (INT8) avec torchao: {EMBEDDING_MODEL_NAME}")
+                except ImportError:
+                    # Fallback : torchao non installé, utiliser le modèle float32 standard
+                    log.warning(f"⚠️ torchao non disponible. Utilisation du modèle float32 standard (pas de quantification).")
+                    log.warning(f"   Pour activer la quantification INT8, installez : pip install torchao")
+                    model = base_model
+                except Exception as quant_error:
+                    # Erreur lors de la quantification, fallback sur float32
+                    log.warning(f"⚠️ Erreur quantification torchao: {quant_error}. Utilisation du modèle float32 standard.")
+                    model = base_model
+                    
             except Exception as e:
-                log.error(f"❌ Erreur chargement/quantification SentenceTransformer: {e}")
+                log.error(f"❌ Erreur chargement SentenceTransformer: {e}")
                 model = None
                 raise
 
@@ -1129,20 +1138,35 @@ def index_project_files(root_path, progress_callback=None, use_semantic_chunking
         # B. Encodage Parallèle (CPU Bound -> Multiprocessing)
         log.info(f"Phase 2/3: Encodage parallèle de {len(flat_chunks_text)} segments...")
         pool = None
+        temp_model_for_pool = None
         try:
-            # Démarrer le pool
-            pool = model.start_multi_process_pool()
+            # Créer un modèle non-quantifié temporaire pour le multiprocessing
+            # Les modèles quantifiés ne peuvent pas être picklés correctement sur Windows
+            log.debug("Création modèle non-quantifié temporaire pour multiprocessing...")
+            temp_model_for_pool = SentenceTransformer(EMBEDDING_MODEL_NAME)
             
-            # Encoder
-            vectors = model.encode_multi_process(flat_chunks_text, pool)
+            # Démarrer le pool avec le modèle non-quantifié
+            pool = temp_model_for_pool.start_multi_process_pool()
             
-            # Arrêter le pool
-            model.stop_multi_process_pool(pool)
+            # Encoder avec le modèle temporaire
+            vectors = temp_model_for_pool.encode_multi_process(flat_chunks_text, pool)
+            
+            # Arrêter le pool et nettoyer
+            temp_model_for_pool.stop_multi_process_pool(pool)
             pool = None
+            del temp_model_for_pool
+            temp_model_for_pool = None
             
         except Exception as e:
-            if pool: model.stop_multi_process_pool(pool)
+            if pool and temp_model_for_pool:
+                try:
+                    temp_model_for_pool.stop_multi_process_pool(pool)
+                except:
+                    pass
+            if temp_model_for_pool:
+                del temp_model_for_pool
             log.error(f"Erreur multiprocessing: {e}. Fallback séquentiel.")
+            # Fallback : utiliser le modèle quantifié en séquentiel (fonctionne même quantifié)
             vectors = model.encode(flat_chunks_text, show_progress_bar=True, convert_to_numpy=True)
 
         # C. Insertion Massive (Batch SQL + FAISS)
@@ -1258,7 +1282,7 @@ def index_project_files(root_path, progress_callback=None, use_semantic_chunking
                     total_chunks += added
                 count += 1
                 if progress_callback and i % 5 == 0:
-                    progress_callback(f"Indexation: {rel_path} ({i}/{total})")
+                    progress_callback(f"Indexation: {rel_path} ({i}/{total_files})")
             except Exception as e:
                 errors += 1
                 log.warning(f"Erreur {file_path}: {e}")

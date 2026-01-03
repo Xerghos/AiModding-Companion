@@ -159,26 +159,43 @@ class RepoMapGenerator:
     
     def _regenerate_and_save(self, top_n: int) -> str:
         """Exécute la régénération effective (synchrone)."""
+        import time
+        total_start = time.time()
+        
         try:
             from .symbol_graph import get_symbol_graph
             
+            step_start = time.time()
             symbol_graph = get_symbol_graph(self.db_path_base)
+            log.info(f"  ⏱️  get_symbol_graph: {time.time() - step_start:.2f}s")
+            
+            step_start = time.time()
             top_files = symbol_graph.get_top_files(top_n)
+            log.info(f"  ⏱️  get_top_files({top_n}): {time.time() - step_start:.2f}s")
             
             if not top_files:
                 log.warning("Aucun fichier trouvé pour la Repo Map")
                 return ""
             
+            log.info(f"  📝 Extraction signatures de {len(top_files)} fichiers...")
+            step_start = time.time()
+            
             repo_map_lines = []
             repo_map_lines.append("# Repo Map - Fichiers Centraux\n")
             
-            for file_path, pagerank_score in top_files:
+            for idx, (file_path, pagerank_score) in enumerate(top_files, 1):
                 abs_path = get_path(file_path) if not os.path.isabs(file_path) else file_path
                 
                 if not os.path.exists(abs_path):
                     continue
                 
+                file_start = time.time()
                 signatures_data = self._extract_signatures(abs_path)
+                file_elapsed = time.time() - file_start
+                
+                if file_elapsed > 1.0:  # Log seulement si > 1s
+                    log.info(f"    ⚠️  {os.path.basename(file_path)}: {file_elapsed:.2f}s")
+                
                 if signatures_data:
                     repo_map_lines.append(f"\n# Fichier: {file_path} (PageRank: {pagerank_score:.4f})")
                     
@@ -204,13 +221,19 @@ class RepoMapGenerator:
                             func_sig += f"  # {func_data['docstring']}"
                         repo_map_lines.append(func_sig)
             
+            extraction_elapsed = time.time() - step_start
+            log.info(f"  ⏱️  Extraction signatures: {extraction_elapsed:.2f}s")
+            
             repo_map_text = "\n".join(repo_map_lines)
             # Log seulement en cas de régénération (pas pour utilisation silencieuse du cache)
             log.info(f"✅ Repo Map régénérée: {len(top_files)} fichiers, {len(repo_map_text)} caractères")
             
+            step_start = time.time()
             self._save_cache(repo_map_text, top_n, self.db_path_base)
             project_hash = self._get_project_hash()
             self._save_project_hash(project_hash)
+            cache_elapsed = time.time() - step_start
+            log.info(f"  ⏱️  Sauvegarde cache: {cache_elapsed:.2f}s")
             
             # Mettre à jour le cache mémoire global
             global _repo_map_cache
@@ -219,9 +242,14 @@ class RepoMapGenerator:
                 'timestamp': time.time()
             }
             
+            total_elapsed = time.time() - total_start
+            log.info(f"  ⏱️  Total régénération: {total_elapsed:.2f}s")
+            
             return repo_map_text
         except Exception as e:
             log.warning(f"Erreur régénération Repo Map: {e}")
+            import traceback
+            log.debug(traceback.format_exc())
             return ""
 
     @trace_action(source="repo_map")
@@ -296,9 +324,15 @@ class RepoMapGenerator:
             return signatures_data
         
         try:
+            import time
+            chunk_start = time.time()
             from .code_chunker import get_chunker
             
             chunker = get_chunker()
+            chunk_elapsed = time.time() - chunk_start
+            if chunk_elapsed > 0.5:  # Log seulement si > 0.5s (initialisation tree-sitter)
+                log.info(f"    🔧 get_chunker(): {chunk_elapsed:.2f}s")
+            
             if not chunker.parser:
                 # Fallback: extraction basique
                 return self._extract_signatures_basic_enriched(file_path)
