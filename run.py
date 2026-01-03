@@ -1,5 +1,15 @@
 import os
 import sys
+import logging
+import multiprocessing
+
+# 1. Initialisation Hardware (Patches compatibilité AMD/DirectML/TorchAO)
+try:
+    import ai_core.hardware_init
+except ImportError:
+    pass
+
+from config import get_logger, get_path
 import customtkinter as ctk
 import traceback
 import ctypes

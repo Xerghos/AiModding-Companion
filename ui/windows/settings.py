@@ -56,7 +56,7 @@ class Tooltip:
             y = self.widget.winfo_rooty() + 25
             self.tooltip_window = tw = tk.Toplevel(self.widget)
             tw.wm_overrideredirect(True)
-            tw.wm_geometry(f"+{x}+{y}")
+            tw.wm_geometry(f"{x}+{y}")
             label = tk.Label(tw, text=self.text, justify='left',
                              background="#ffffe0", relief='solid', borderwidth=1,
                              font=("tahoma", "8", "normal"), fg="black")
@@ -88,7 +88,7 @@ class KeyCaptureDialog(BaseWindow):
         if event.state & 131072: parts.append("Alt")
         if event.state & 1: parts.append("Shift")
         parts.append(event.keysym)
-        final = f"<{'-'.join(parts)}>"
+        final = f"<{'-'.join(parts)}>")
         self.lbl_current.configure(text=final)
         self.after(300, lambda: self._confirm(final))
 
@@ -122,6 +122,103 @@ class ModelEditorWindow(BaseWindow):
         except Exception as e:
             show_messagebox("Erreur JSON", f"Format invalide : {e}", icon="error", parent=self)
 
+class PathListEditor(ctk.CTkFrame):
+    """
+    Widget réutilisable pour gérer une liste de chemins (fichiers/dossiers).
+    Affiche une liste scrollable avec boutons de suppression et options d'ajout.
+    """
+    def __init__(self, master, initial_items=None, title="Liste des chemins"):
+        super().__init__(master, fg_color="transparent")
+        self.items = initial_items if initial_items else []
+        
+        # Titre
+        ctk.CTkLabel(self, text=title, font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 5))
+        
+        # Zone de liste scrollable
+        self.scroll_frame = ctk.CTkScrollableFrame(self, height=150, fg_color=COLORS["BG_WIDGET"])
+        self.scroll_frame.pack(fill="x", expand=True, pady=(0, 5))
+        
+        # Zone d'ajout manuel
+        self.entry_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.entry_frame.pack(fill="x")
+        
+        self.entry = ctk.CTkEntry(self.entry_frame, placeholder_text="Chemin relatif ou pattern (ex: *.log)")
+        self.entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.entry.bind("<Return>", lambda e: self._add_manual())
+        
+        ctk.CTkButton(self.entry_frame, text="➕", width=30, command=self._add_manual).pack(side="right")
+        
+        # Boutons d'ajout rapide (Fichier / Dossier)
+        self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.btn_frame.pack(fill="x", pady=5)
+        
+        ctk.CTkButton(self.btn_frame, text="📄 Ajouter Fichier", command=self._add_file, 
+                      fg_color=COLORS["BG_SECONDARY"], height=24).pack(side="left", padx=(0, 5), expand=True, fill="x")
+        ctk.CTkButton(self.btn_frame, text="📁 Ajouter Dossier", command=self._add_folder, 
+                      fg_color=COLORS["BG_SECONDARY"], height=24).pack(side="left", padx=5, expand=True, fill="x")
+
+        self._refresh_list()
+
+    def _refresh_list(self):
+        # Vider la liste
+        for widget in self.scroll_frame.winfo_children():
+            widget.destroy()
+            
+        # Repeupler
+        for item in self.items:
+            row = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            
+            lbl = ctk.CTkLabel(row, text=item, anchor="w")
+            lbl.pack(side="left", fill="x", expand=True, padx=5)
+            
+            del_btn = ctk.CTkButton(row, text="❌", width=25, height=20, 
+                                    fg_color=COLORS["ERROR"], 
+                                    command=lambda i=item: self._remove_item(i))
+            del_btn.pack(side="right")
+
+    def _remove_item(self, item):
+        if item in self.items:
+            self.items.remove(item)
+            self._refresh_list()
+
+    def _add_manual(self):
+        txt = self.entry.get().strip()
+        if txt and txt not in self.items:
+            self.items.append(txt)
+            self.entry.delete(0, "end")
+            self._refresh_list()
+
+    def _add_file(self):
+        files = fd.askopenfilenames()
+        if files:
+            self._process_paths(files)
+
+    def _add_folder(self):
+        folder = fd.askdirectory()
+        if folder:
+            self._process_paths([folder])
+
+    def _process_paths(self, paths):
+        cwd = os.getcwd()
+        for p in paths:
+            try:
+                # Tenter de rendre relatif
+                rel = os.path.relpath(p, cwd).replace("\", "/")
+                if not rel.startswith(".."):
+                    val = rel
+                else:
+                    val = p # Hors projet, on garde absolu
+            except:
+                val = p
+            
+            if val not in self.items:
+                self.items.append(val)
+        self._refresh_list()
+
+    def get_data(self):
+        return self.items
+
 # --- FENÊTRE PRINCIPALE SETTINGS ---
 
 class SettingsWindow(BaseWindow):
@@ -142,6 +239,8 @@ class SettingsWindow(BaseWindow):
 
         self.vars = {}
         self.model_selectors = [] 
+        # Stockage des widgets complexes pour récupération des données
+        self.custom_widgets = {}
 
         # UI Layout
         self.grid_columnconfigure(0, weight=1)
@@ -348,19 +447,10 @@ class SettingsWindow(BaseWindow):
         self._add_entry(scroll, "general_settings.api_cooldown_seconds", "Cooldown API (sec)", "60")
         self._add_entry(scroll, "general_settings.audit_interval_seconds", "Vitesse Audit (sec)", "0.1")
         
-        # Section Cache Repo Map
+        # Section Repo Map Cache (TTL uniquement)
+        # La liste des fichiers surveillés a été déplacée dans l'onglet Système
         self._add_header(scroll, "🗺️ Cache Repo Map")
         self._add_slider(scroll, "repo_map_cache.ttl_seconds", "TTL Cache (secondes)", 60, 3600, 300)
-        
-        # Watch directories
-        watch_dirs = self._get_val("repo_map_cache.watch_directories", ["features/", "ai_core/", "worker/"])
-        watch_dirs_text = "\n".join(watch_dirs) if isinstance(watch_dirs, list) else str(watch_dirs)
-        self._add_text(scroll, "repo_map_cache.watch_directories", "Dossiers surveillés (un par ligne)", watch_dirs_text)
-        
-        # Watch files
-        watch_files = self._get_val("repo_map_cache.watch_files", ["config/architecture_map.json"])
-        watch_files_text = "\n".join(watch_files) if isinstance(watch_files, list) else str(watch_files)
-        self._add_text(scroll, "repo_map_cache.watch_files", "Fichiers surveillés (un par ligne)", watch_files_text)
         
         # Bouton Invalider Cache
         invalidate_btn = ctk.CTkButton(scroll, text="🗑️ Invalider le Cache", 
@@ -422,7 +512,7 @@ class SettingsWindow(BaseWindow):
         
         # REGISTRY : On mappe un Concept (FAST) vers un Modèle Réel (Gemini-Flash)
         for role in self.registry_keys:
-            self._add_combo(scroll, f"ai_engine.cloud_models_registry.{role}", f"Profil '{role.upper()}'", self.available_models, reg.get(role, ""))
+            self._add_combo(scroll, f"ai_engine.cloud_models_registry.{role}", f"Profil '{role.upper()}'.", self.available_models, reg.get(role, ""))
 
     def _build_swarm_tab(self):
         scroll = self._add_scroll_frame(self.tab_swarm)
@@ -487,7 +577,7 @@ class SettingsWindow(BaseWindow):
             "Google AI Pro (60 req/min, 1000/jour) sans API key.\n\n"
             "Cliquez sur le bouton pour ouvrir le navigateur et vous connecter avec votre compte Google."
         )
-        ctk.CTkLabel(adc_info_frame, text=adc_info_text, justify="left", font=("Arial", 10), text_color=COLORS["FG_SECONDARY"]).pack(padx=10, pady=10, anchor="w")
+        ctk.CTkLabel(adc_info_frame, text=adc_info_text, justify="left", font=("Arial", 10), text_color=COLORS["FG_SECONDARY"])
         
         self._add_header(scroll, "🌉 Pont CLI (Bridge)")
         self._add_switch(scroll, "cli_bridge.enabled", "Activer le Mode Hybride CLI", False)
@@ -501,7 +591,7 @@ class SettingsWindow(BaseWindow):
             "Installation: npm install -g @google/gemini-cli\n"
             "Authentification: gemini auth login"
         )
-        ctk.CTkLabel(info_frame, text=info_text, justify="left", font=("Arial", 10), text_color=COLORS["FG_SECONDARY"]).pack(padx=10, pady=10, anchor="w")
+        ctk.CTkLabel(info_frame, text=info_text, justify="left", font=("Arial", 10), text_color=COLORS["FG_SECONDARY"])
         
         # Liste des modèles routés vers le CLI
         self._add_header(scroll, "Modèles Routés vers le CLI")
@@ -520,7 +610,7 @@ class SettingsWindow(BaseWindow):
             "Exemple: gemini-3-flash, gemini-3-pro, gemini-exp-1206\n"
             "Les modèles listés seront automatiquement routés vers le CLI si activé."
         )
-        ctk.CTkLabel(format_frame, text=format_text, justify="left", font=("Arial", 9), text_color=COLORS["FG_SECONDARY"]).pack(padx=10, pady=5, anchor="w")
+        ctk.CTkLabel(format_frame, text=format_text, justify="left", font=("Arial", 9), text_color=COLORS["FG_SECONDARY"])
         
         # Vérification du CLI
         check_frame = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -686,13 +776,11 @@ class SettingsWindow(BaseWindow):
                     UnifiedLogger.write(
                         "AI_CORE",
                         "DEBUG",
-                        f"OAuth Client ID: {client_id[:30]}... (longueur: {len(client_id)})"
-                    )
+                        f"OAuth Client ID: {client_id[:30]}... (longueur: {len(client_id)})")
                     UnifiedLogger.write(
                         "AI_CORE",
                         "DEBUG",
-                        f"OAuth Client Secret: {client_secret[:15]}... (longueur: {len(client_secret)})"
-                    )
+                        f"OAuth Client Secret: {client_secret[:15]}... (longueur: {len(client_secret)})")
                     # Vérifier que le Client ID correspond à celui de gemini-cli
                     expected_id = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
                     if client_id == expected_id:
@@ -758,8 +846,7 @@ class SettingsWindow(BaseWindow):
                         UnifiedLogger.write(
                             "AI_CORE",
                             "WARNING",
-                            f"⚠️ Client ID différent de gemini-cli attendu. Reçu: {client_id}, Attendu: {expected_id}"
-                        )
+                            f"⚠️ Client ID différent de gemini-cli attendu. Reçu: {client_id}, Attendu: {expected_id}")
                     except:
                         pass
                 
@@ -780,8 +867,7 @@ class SettingsWindow(BaseWindow):
                     UnifiedLogger.write(
                         "AI_CORE",
                         "DEBUG",
-                        f"Client config créé avec Client ID: {client_config['installed']['client_id'][:30]}..."
-                    )
+                        f"Client config créé avec Client ID: {client_config['installed']['client_id'][:30]}...")
                 except:
                     pass
                 
@@ -797,8 +883,7 @@ class SettingsWindow(BaseWindow):
                             UnifiedLogger.write(
                                 "AI_CORE",
                                 "AUTH",
-                                "Ancien token OAuth supprimé pour éviter les conflits de scopes"
-                            )
+                                "Ancien token OAuth supprimé pour éviter les conflits de scopes")
                         except:
                             pass
                     except Exception as e:
@@ -807,8 +892,7 @@ class SettingsWindow(BaseWindow):
                             UnifiedLogger.write(
                                 "AI_CORE",
                                 "DEBUG",
-                                f"Impossible de supprimer l'ancien token: {e}"
-                            )
+                                f"Impossible de supprimer l'ancien token: {e}")
                         except:
                             pass
                 
@@ -840,8 +924,7 @@ class SettingsWindow(BaseWindow):
                     UnifiedLogger.write(
                         "AI_CORE",
                         "AUTH",
-                        f"✅ Credentials OAuth obtenus avec scopes: {', '.join(obtained_scopes)}"
-                    )
+                        f"✅ Credentials OAuth obtenus avec scopes: {', '.join(obtained_scopes)}")
                     
                     # Vérifier si le scope cloud-platform est présent
                     has_cloud_platform = any('cloud-platform' in scope for scope in obtained_scopes)
@@ -849,8 +932,7 @@ class SettingsWindow(BaseWindow):
                         UnifiedLogger.write(
                             "AI_CORE",
                             "WARNING",
-                            "⚠️ Le scope 'cloud-platform' n'est pas présent dans les credentials. L'accès à l'API Gemini peut échouer."
-                        )
+                            "⚠️ Le scope 'cloud-platform' n'est pas présent dans les credentials. L'accès à l'API Gemini peut échouer.")
                 except:
                     pass
                 
@@ -879,7 +961,7 @@ class SettingsWindow(BaseWindow):
                 obtained_scopes_str = ", ".join(list(credentials.scopes) if credentials.scopes else [])
                 self.after(0, lambda: show_messagebox(
                     "Authentification réussie",
-                    "L'authentification Google (Login with Google) a été configurée avec succès!\n\n"
+                    f"L'authentification Google (Login with Google) a été configurée avec succès!\n\n"
                     f"Scopes obtenus: {obtained_scopes_str}\n\n"
                     "Vous pouvez maintenant utiliser les tokens gratuits Google AI Pro\n"
                     "(60 req/min, 1000/jour) sans API key.\n\n"
@@ -935,31 +1017,23 @@ class SettingsWindow(BaseWindow):
         
         # --- Exclusions (Fichiers & Dossiers) ---
         self._add_header(scroll, "Exclusions (Fichiers & Dossiers ignorés)")
-
-        # Récupération de la configuration actuelle
+        
+        # Widget PathListEditor pour les exclusions
         ignored_list = self.settings.get("code_analysis", {}).get("ignored_folders", [])
-        if isinstance(ignored_list, list):
-            ignored_str = ", ".join(ignored_list)
-        else:
-            ignored_str = str(ignored_list)
+        self.exclusion_editor = PathListEditor(scroll, initial_items=ignored_list, title="")
+        self.exclusion_editor.pack(fill="x", padx=10, pady=5)
+        # On enregistre une référence pour la sauvegarde
+        self.custom_widgets["code_analysis.ignored_folders"] = self.exclusion_editor
 
-        # Frame conteneur pour aligner l'entrée et le bouton
-        self.frame_ignore = ctk.CTkFrame(scroll, fg_color="transparent")
-        self.frame_ignore.pack(pady=(5, 10), padx=10, fill="x")
-
-        # Champ de texte (stocké dans self.ignore_entry pour être accessible par _append_ignore_paths)
-        self.ignore_entry = ctk.CTkEntry(self.frame_ignore, placeholder_text="ex: node_modules, .git, *.pyc, secret.json")
-        self.ignore_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        self.ignore_entry.insert(0, ignored_str)
-
-        # Bouton "+" qui ouvre le menu contextuel (Fichiers / Dossiers)
-        self.btn_add_ignore = ctk.CTkButton(
-            self.frame_ignore, 
-            text="➕", 
-            width=30, 
-            command=self._show_exclusion_menu
-        )
-        self.btn_add_ignore.pack(side="right")
+        # --- Surveillance (Repo Map & Indexation) ---
+        self._add_header(scroll, "Surveillance (Exceptions Prioritaires)")
+        
+        # Widget PathListEditor pour les fichiers à surveiller (Repo Map Cache)
+        # On récupère depuis repo_map_cache.watch_files
+        watch_list = self.settings.get("repo_map_cache", {}).get("watch_files", ["config/architecture_map.json"])
+        self.watch_editor = PathListEditor(scroll, initial_items=watch_list, title="Fichiers/Dossiers à inclure (Outrepasse les exclusions)")
+        self.watch_editor.pack(fill="x", padx=10, pady=5)
+        self.custom_widgets["repo_map_cache.watch_files"] = self.watch_editor
 
         self._add_header(scroll, "Maintenance & Logs")
         self._add_switch(scroll, "system_settings.debug_mode", "Mode Debug Global", False)
@@ -1132,35 +1206,14 @@ class SettingsWindow(BaseWindow):
             if new_data:
                 self.settings = new_data
             else:
+                # Sauvegarde des widgets standards
                 for key, var in self.vars.items():
                     if "_WIDGET" in key: continue
                     
-                    # Gestion spéciale pour la liste d'exclusions
-                    if key == "code_analysis.ignored_folders_STR":
-                        val_str = var.get()
-                        val_list = [x.strip() for x in val_str.split(",") if x.strip()]
-                        if "code_analysis" not in self.settings: self.settings["code_analysis"] = {}
-                        self.settings["code_analysis"]["ignored_folders"] = val_list
-                        continue
-                    
-                    # Gestion spéciale pour la liste des modèles CLI
-                    if key == "cli_bridge.models":
-                        val_str = var.get()
-                        # Nettoyage des caractères parasites (évite la corruption accumulée)
-                        # On retire [], ', " qui pourraient provenir d'une mauvaise sérialisation
-                        val_str_clean = val_str.replace("[", "").replace("]", "").replace("'", "").replace('"', "")
-                        val_list = [x.strip() for x in val_str_clean.split(",") if x.strip()]
-                        if "cli_bridge" not in self.settings: self.settings["cli_bridge"] = {}
-                        self.settings["cli_bridge"]["models"] = val_list
-                        # On force la mise à jour immédiate pour que factory.py le voie
-                        APP_SETTINGS["cli_bridge"] = self.settings["cli_bridge"]
-                        continue
-                    
-                    # Gestion spéciale pour les widgets texte multi-lignes (CTkTextbox)
+                    # Gestion spéciale pour les widgets texte multi-lignes
                     if isinstance(var, ctk.CTkTextbox):
                         val_str = var.get("1.0", "end-1c")
-                        # Convertir en liste si c'est watch_directories ou watch_files
-                        if "watch_directories" in key or "watch_files" in key:
+                        if "watch_directories" in key: # watch_files est géré par PathListEditor
                             val_list = [x.strip() for x in val_str.split("\n") if x.strip()]
                             parts = key.split(".")
                             if len(parts) >= 2:
@@ -1186,7 +1239,19 @@ class SettingsWindow(BaseWindow):
                         if p not in d: d[p] = {}
                         d = d[p]
                     d[parts[-1]] = val
-            
+                
+                # Sauvegarde des widgets custom (PathListEditor)
+                if hasattr(self, 'custom_widgets'):
+                    for key, widget in self.custom_widgets.items():
+                        if hasattr(widget, 'get_data'):
+                            val_list = widget.get_data()
+                            parts = key.split(".")
+                            d = self.settings
+                            for p in parts[:-1]:
+                                if p not in d: d[p] = {}
+                                d = d[p]
+                            d[parts[-1]] = val_list
+
             # Reconstruction du dictionnaire simple api_keys pour le backend (compatibilité)
             final_keys_map = {}
             for item in self.settings.get("api_keys_list", []):
@@ -1212,77 +1277,7 @@ class SettingsWindow(BaseWindow):
         except Exception as e:
             log.error(f"Erreur Save: {e}")
             show_messagebox("Erreur Critique", str(e), icon="error", parent=self)
-    # --- NOUVELLES MÉTHODES POUR L'EXCLUSION ---
-
-    def _show_exclusion_menu(self):
-        """Affiche un menu contextuel pour choisir entre Fichier(s) et Dossier."""
-        import tkinter as tk
-        
-        # Création du menu Tkinter standard
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="📄 Ajouter Fichier(s)...", command=self._add_ignore_files)
-        menu.add_command(label="📁 Ajouter Dossier...", command=self._add_ignore_folder)
-        
-        try:
-            # Affiche le menu à la position de la souris
-            menu.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
-        finally:
-            # Relâche le focus proprement
-            menu.grab_release()
-
-    def _add_ignore_files(self):
-        """Ouvre l'explorateur pour sélectionner des fichiers."""
-        files = fd.askopenfilenames(title="Sélectionner des fichiers à exclure")
-        if files:
-            self._append_ignore_paths(files)
-
-    def _add_ignore_folder(self):
-        """Ouvre l'explorateur pour sélectionner un dossier."""
-        folder = fd.askdirectory(title="Sélectionner un dossier à exclure")
-        if folder:
-            self._append_ignore_paths([folder])
-
-    def _append_ignore_paths(self, abs_paths):
-        """
-        Convertit les chemins absolus en relatifs (si dans le projet)
-        et les ajoute à la zone de texte.
-        """
-        # [CORRECTION] Gestion robuste du chemin projet (fallback sur cwd car le widget n'existe pas ici)
-        try:
-            if hasattr(self, 'project_path_entry'):
-                project_root = self.project_path_entry.get().strip()
-            else:
-                project_root = os.getcwd() # Utilise le dossier de l'app comme racine
-        except:
-            project_root = ""
-
-        current_text = self.ignore_entry.get().strip()
-        
-        # On récupère déjà les éléments existants
-        items = [x.strip() for x in current_text.split(',') if x.strip()]
-        
-        for p in abs_paths:
-            final_path = p
-            # Tentative de conversion en relatif si le projet est défini
-            if project_root and os.path.exists(project_root):
-                try:
-                    rel = os.path.relpath(p, project_root)
-                    # Si le chemin relatif ne commence pas par '..', c'est qu'on est dedans
-                    if not rel.startswith('..'):
-                        final_path = rel
-                except ValueError:
-                    pass # Disques différents sous Windows, on garde l'absolu
-            
-            # Normalisation
-            final_path = final_path.replace('\\', '/') 
-            
-            if final_path not in items:
-                items.append(final_path)
-        
-        # Mise à jour de l'UI
-        self.ignore_entry.delete(0, "end")
-        self.ignore_entry.insert(0, ", ".join(items))
-        
+    
 class ApiKeyManager(BaseWindow):
     """Classe Wrapper pour compatibilité ascendante."""
     def __init__(self, master, task_queue=None):

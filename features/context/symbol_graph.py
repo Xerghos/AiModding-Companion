@@ -67,9 +67,6 @@ class SymbolGraph:
         file_size = 0
         try:
             file_size = os.path.getsize(file_path)
-            if file_size > 1024 * 1024: # 1MB limit
-                log.debug(f"Skipping dependency extraction for large file: {file_path} ({file_size} bytes)")
-                return imports, function_calls
         except Exception:
             pass
         
@@ -169,6 +166,7 @@ class SymbolGraph:
             return
         
         self.graph = nx.DiGraph()
+        conn = None
         
         try:
             conn = sqlite3.connect(sqlite_path)
@@ -177,7 +175,10 @@ class SymbolGraph:
             # Récupérer tous les fichiers
             cursor.execute("SELECT id, path FROM files")
             files = cursor.fetchall()
-            conn.close() 
+            
+            # On peut fermer la connexion dès qu'on a les données
+            conn.close()
+            conn = None
             
             log.info(f"📂 {len(files)} fichiers à analyser pour le graphe")
             
@@ -225,7 +226,10 @@ class SymbolGraph:
             log.info(f"✅ Graphe construit: {len(self.graph.nodes)} nœuds, {len(self.graph.edges)} arêtes ({elapsed:.2f}s)")
         
         except Exception as e:
-            log.error(f"Erreur construction graphe: {e}", exc_info=True)
+            log.error(f"Erreur construction graphe: {e}")
+        finally:
+            if conn:
+                conn.close()
     
     @trace_action(source="symbol_graph")
     def calculate_pagerank(self, damping: float = 0.85, max_iter: int = 100) -> Dict[str, float]:

@@ -1,1476 +1,457 @@
-import logging
+"""
+Moteur de base de données sémantique omniscient utilisant sqlite-vec.
+Version ultra-stable V4 optimisée pour Ryzen AI (GPU Radeon 780M).
+Correction : Autorisations SQLite, Signatures API et Robustesse.
+"""
+
 import os
+import logging
 import sqlite3
-import pickle
+import sqlite_vec
 import numpy as np
-import shutil
-import traceback
 import threading
 import hashlib
 import time
 import json
-import glob
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Any
 
 from config import get_logger, get_path, SUPPORTED_FILE_EXTENSIONS
 from features.Decorators import trace_action
 
+# Initialisation hardware (Filtres warnings)
+try:
+    import ai_core.hardware_init
+except ImportError:
+    pass
+
 log = get_logger("features.context.database")
-
-# Lock pour protéger l'initialisation thread-safe de SentenceTransformer
-_ensure_libs_lock = threading.Lock()
-
-# Lock et cache pour protéger l'initialisation thread-safe de init_db
-_init_db_lock = threading.Lock()
-_initialized_dbs = set()  # Cache des DB déjà initialisées
 
 # --- Constantes ---
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 DB_DIR = "db"
-DB_NAME = "knowledge_base_hybrid_V2"
+DB_NAME = "knowledge_base_omniscient_V4"
 
 # --- Variables Globales ---
-faiss_index = None
-id_mapping = {} 
-faiss = None
+_ensure_libs_lock = threading.Lock()
+_init_db_lock = threading.Lock()
 SentenceTransformer = None
 model = None
+_db_initialized = False
+
+# --- Fonctions de compatibilité API (Fix ImportError) ---
+
+@trace_action(source="database")
+def _get_db_path():
+    base = get_path(DB_DIR)
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, f"{DB_NAME}.sqlite")
 
 @trace_action(source="database")
 def _get_paths(db_path_base=None):
-    if not db_path_base:
-        base = get_path(DB_DIR)
-        name = DB_NAME
-    else:
-        base = os.path.dirname(db_path_base)
-        name = os.path.basename(db_path_base).replace(".sqlite", "")
-    return (
-        os.path.join(base, f"{name}.sqlite"),
-        os.path.join(base, f"{name}.index"),
-        os.path.join(base, f"{name}.pkl")
-    )
+    """Restauré pour assurer la compatibilité avec symbol_graph et repo_map."""
+    db_path = db_path_base or _get_db_path()
+    return (db_path, None, None)
 
-@trace_action(source="database")
-def _ensure_faiss():
-    """Charge uniquement FAISS (rapide, ~0.1s)."""
-    global faiss
+def get_connection(db_path_base=None):
+    """Crée une connexion SQLite avec l'extension vec chargée."""
+    db_path = db_path_base or _get_db_path()
+    abs_db_path = os.path.abspath(db_path)
+    os.makedirs(os.path.dirname(abs_db_path), exist_ok=True)
     
-    if faiss is not None:
-        return
+    # Timeout 60s pour éviter les verrous
+    conn = sqlite3.connect(abs_db_path, timeout=60.0)
     
-    with _ensure_libs_lock:
-        if faiss is None:
-            import faiss as f
-            faiss = f
+    try:
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except Exception as e:
+        log.warning(f"⚠️ Autorisation extension SQLite dégradée : {e}")
+        try:
+            sqlite_vec.load(conn)
+        except:
+            log.error("❌ Échec critique chargement sqlite-vec")
+            
+    return conn
+
+# --- Gestion du Modèle et Accélération ---
 
 @trace_action(source="database")
 def _ensure_model():
     global SentenceTransformer, model
-    if SentenceTransformer is not None and model is not None:
+    if model is not None:
         return
 
     with _ensure_libs_lock:
         if SentenceTransformer is None:
-            from sentence_transformers import SentenceTransformer as ST
-            SentenceTransformer = ST
-        if model is None:
-            log.info(f"Chargement modèle Embedding: {EMBEDDING_MODEL_NAME}...")
             try:
-                # Charger le modèle original (float32)
-                base_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-                
-                # Tentative de quantification avec torchao (nouvelle API PyTorch)
-                try:
-                    from torchao.quantization import quantize_, int8_dynamic_activation_int8_weight
-                    
-                    # quantize_ modifie le modèle in-place
-                    quantize_(base_model, int8_dynamic_activation_int8_weight())
-                    model = base_model
-                    log.info(f"✅ Modèle Embedding chargé et quantifié (INT8) avec torchao: {EMBEDDING_MODEL_NAME}")
-                except ImportError:
-                    # Fallback : torchao non installé, utiliser le modèle float32 standard
-                    log.warning(f"⚠️ torchao non disponible. Utilisation du modèle float32 standard (pas de quantification).")
-                    log.warning(f"   Pour activer la quantification INT8, installez : pip install torchao")
-                    model = base_model
-                except Exception as quant_error:
-                    # Erreur lors de la quantification, fallback sur float32
-                    log.warning(f"⚠️ Erreur quantification torchao: {quant_error}. Utilisation du modèle float32 standard.")
-                    model = base_model
-                    
+                import transformers
+                from sentence_transformers import SentenceTransformer as ST
+                SentenceTransformer = ST
             except Exception as e:
-                log.error(f"❌ Erreur chargement SentenceTransformer: {e}")
-                model = None
+                log.error(f"❌ Échec import IA : {e}")
+                return
+
+        if model is None:
+            log.info(f"Chargement modèle Embedding : {EMBEDDING_MODEL_NAME}...")
+            try:
+                import torch
+                # [PLAN STABILISATION] Forcer CPU pour éviter le bug "Inference Tensor" de DirectML
+                device = "cpu"
+                log.info(f"⚙️ Mode CPU forcé pour stabilité indexation (Zen 4 Optimized)")
+                
+                base_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
+
+                # Optimisation CPU Native (INT8)
+                log.info("🔍 Application quantification dynamique native (INT8)...")
+                try:
+                    base_model = torch.quantization.quantize_dynamic(
+                        base_model, {torch.nn.Linear}, dtype=torch.qint8
+                    )
+                    log.info("✅ Modèle quantifié INT8 (Performance Max CPU)")
+                except Exception as q_e:
+                    log.warning(f"⚠️ Echec quantification : {q_e}")
+
+                model = base_model
+                log.info(f"✅ Modèle prêt sur CPU")
+                
+            except Exception as e:
+                log.error(f"❌ Erreur _ensure_model : {e}")
                 raise
 
-@trace_action(source="database")
-def is_model_ready() -> bool:
-    """Vérifie si le modèle SentenceTransformer est chargé et prêt.
-    
-    Returns:
-        True si le modèle est chargé, False sinon
-    """
-    global SentenceTransformer, model
-    return SentenceTransformer is not None and model is not None
-
-@trace_action(source="database")
-def _ensure_libs():
-    """Charge FAISS et SentenceTransformer (compatibilité legacy).
-    Pour les nouveaux appels, utiliser _ensure_faiss() ou _ensure_model() selon le besoin.
-    """
-    _ensure_faiss()
-    _ensure_model()
+# --- Opérations Base de Données ---
 
 @trace_action(source="database")
 def init_db(db_path_base=None):
-    global faiss_index, id_mapping
-    
-    # Calculer la clé unique pour cette DB
-    sqlite_path, index_path, map_path = _get_paths(db_path_base)
-    db_key = os.path.abspath(sqlite_path)
-    
-    # Vérifier si déjà initialisée (sans lock, rapide)
-    if db_key in _initialized_dbs:
-        log.debug(f"DB déjà initialisée: {db_key}")
-        _ensure_faiss()  # S'assurer que FAISS est chargé (rapide)
-        return
-    
-    # Protection thread-safe pour l'initialisation
+    """Initialise le schéma de la base de données."""
+    global _db_initialized
+    if _db_initialized and db_path_base is None: return
+
     with _init_db_lock:
-        # Double-check après avoir acquis le lock
-        if db_key in _initialized_dbs:
-            log.debug(f"DB déjà initialisée (double-check): {db_key}")
-            _ensure_faiss()
-            return
-        
-        os.makedirs(os.path.dirname(sqlite_path), exist_ok=True)
-        
-        conn = sqlite3.connect(sqlite_path)
+        conn = get_connection(db_path_base)
         cursor = conn.cursor()
-        
-        # Optimisations SQLite
         cursor.execute("PRAGMA journal_mode=WAL;")
         cursor.execute("PRAGMA synchronous=NORMAL;")
-        cursor.execute("PRAGMA cache_size=-64000;")
-    
-    # Table knowledge (legacy, conservée pour compatibilité)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS knowledge (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            collection TEXT,
-            content TEXT,
-            content_hash TEXT UNIQUE,
-            metadata TEXT,
-            embedding BLOB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Table files : Suivi des fichiers indexés avec hachages SHA-256
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT UNIQUE NOT NULL,
-            checksum TEXT NOT NULL,
-            last_indexed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Table chunks : Chunks sémantiques avec métadonnées AST
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id INTEGER NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            start_line INTEGER,
-            end_line INTEGER,
-            content TEXT NOT NULL,
-            ast_type TEXT,
-            parent_context TEXT,
-            content_hash TEXT,
-            embedding BLOB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    # Index pour recherche rapide
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_chunks_ast_type ON chunks(ast_type)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)')
-    
-    # Table virtuelle FTS5 pour recherche plein texte
-    try:
+        
+        # 1. Table des fichiers
         cursor.execute('''
-            CREATE VIRTUAL TABLE IF NOT EXISTS fts_code USING fts5(
-                content,
-                path UNINDEXED,
-                chunk_id UNINDEXED,
-                ast_type UNINDEXED,
-                tokenize='trigram'
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                path TEXT UNIQUE NOT NULL, 
+                checksum TEXT NOT NULL, 
+                last_indexed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        # Triggers pour synchronisation automatique FTS5
-        # Trigger INSERT
+        # 2. Table des chunks (SCHEMA BLINDÉ V4)
         cursor.execute('''
-            CREATE TRIGGER IF NOT EXISTS chunks_ai_fts5 AFTER INSERT ON chunks BEGIN
-                INSERT INTO fts_code(rowid, content, path, chunk_id, ast_type)
-                VALUES (
-                    new.id,
-                    new.content,
-                    (SELECT path FROM files WHERE id=new.file_id),
-                    new.id,
-                    new.ast_type
-                );
-            END
-        ''')
-        
-        # Trigger UPDATE
-        cursor.execute('''
-            CREATE TRIGGER IF NOT EXISTS chunks_au_fts5 AFTER UPDATE ON chunks BEGIN
-                UPDATE fts_code SET
-                    content = new.content,
-                    path = (SELECT path FROM files WHERE id=new.file_id),
-                    ast_type = new.ast_type
-                WHERE rowid = new.id;
-            END
-        ''')
-        
-        # Trigger DELETE
-        cursor.execute('''
-            CREATE TRIGGER IF NOT EXISTS chunks_ad_fts5 AFTER DELETE ON chunks BEGIN
-                DELETE FROM fts_code WHERE rowid = old.id;
-            END
-        ''')
-        
-        log.info("✅ Table FTS5 et triggers créés")
-    except sqlite3.OperationalError as e:
-        # FTS5 peut ne pas être disponible sur certaines versions SQLite
-        log.warning(f"FTS5 non disponible: {e}")
-    except Exception as e:
-        log.warning(f"Erreur création triggers FTS5: {e}")
-    
-    conn.commit()
-    conn.close()
-    
-    _ensure_faiss()  # Charge uniquement FAISS (rapide)
-    log.debug(f"Vérification index: {index_path} existe={os.path.exists(index_path)}, {map_path} existe={os.path.exists(map_path)}")
-    if os.path.exists(index_path) and os.path.exists(map_path):
-        try:
-            log.debug(f"Chargement index depuis {index_path}...")
-            loaded_index = faiss.read_index(index_path)
-            with open(map_path, 'rb') as f: id_mapping = pickle.load(f)
-            
-            # Vérifier si c'est un IndexIDMap ou un IndexFlatL2
-            if isinstance(loaded_index, faiss.IndexIDMap):
-                faiss_index = loaded_index
-                log.info(f"✅ DB Chargée (IndexIDMap) : {faiss_index.ntotal} vecteurs dans l'index, {len(id_mapping)} dans le mapping.")
-                if faiss_index.ntotal == 0:
-                    log.warning(f"⚠️ Index chargé mais vide (ntotal=0). Vérification reconstruction...")
-            else:
-                # Migration: convertir IndexFlatL2 en IndexIDMap
-                log.info("Migration vers IndexIDMap...")
-                base_index = faiss.IndexFlatL2(EMBEDDING_DIM)
-                faiss_index = faiss.IndexIDMap(base_index)
-                
-                # Transférer les vecteurs avec leurs IDs
-                if loaded_index.ntotal > 0:
-                    vectors = loaded_index.reconstruct_n(0, loaded_index.ntotal)
-                    # Utiliser les IDs depuis id_mapping (inversé)
-                    ids = list(id_mapping.keys()) if id_mapping else list(range(loaded_index.ntotal))
-                    faiss_index.add_with_ids(vectors, np.array(ids, dtype='int64'))
-                
-                # Sauvegarder le nouvel index
-                faiss.write_index(faiss_index, index_path)
-                log.info(f"Migration terminée : {faiss_index.ntotal} vecteurs migrés.")
-        except Exception as e:
-            log.warning(f"Erreur chargement index, création nouveau: {e}", exc_info=True)
-            base_index = faiss.IndexFlatL2(EMBEDDING_DIM)
-            faiss_index = faiss.IndexIDMap(base_index)
-            id_mapping = {}
-    else:
-        # Nouveau: utiliser IndexIDMap dès le départ
-        log.debug(f"Index ou mapping n'existe pas, création nouveau index vide")
-        base_index = faiss.IndexFlatL2(EMBEDDING_DIM)
-        faiss_index = faiss.IndexIDMap(base_index)
-        id_mapping = {}
-    
-    # Si l'index est vide mais que des chunks existent dans la DB, reconstruire l'index
-    if faiss_index.ntotal == 0:
-        try:
-            conn = sqlite3.connect(sqlite_path)
-            cursor = conn.cursor()
-            
-            # Compter les chunks et knowledge existants
-            cursor.execute("SELECT COUNT(*) FROM chunks")
-            chunks_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM knowledge")
-            knowledge_count = cursor.fetchone()[0]
-            
-            if chunks_count > 0 or knowledge_count > 0:
-                log.info(f"🔄 Reconstruction index FAISS depuis DB ({chunks_count} chunks, {knowledge_count} knowledge)...")
-                
-                # Collecter tous les vecteurs et IDs avant d'ajouter en batch (optimisation)
-                all_vectors = []
-                all_ids = []
-                
-                # Reconstruire depuis chunks (collecter pour batch)
-                if chunks_count > 0:
-                    cursor.execute("SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL")
-                    for chunk_id, embedding_blob in cursor.fetchall():
-                        if embedding_blob:
-                            vector = np.frombuffer(embedding_blob, dtype='float32')
-                            if len(vector) == EMBEDDING_DIM:
-                                all_vectors.append(vector)
-                                all_ids.append(chunk_id)
-                                id_mapping[chunk_id] = chunk_id
-                
-                # Reconstruire depuis knowledge (legacy, collecter pour batch)
-                if knowledge_count > 0:
-                    cursor.execute("SELECT id, embedding FROM knowledge WHERE embedding IS NOT NULL")
-                    for know_id, embedding_blob in cursor.fetchall():
-                        if embedding_blob:
-                            vector = np.frombuffer(embedding_blob, dtype='float32')
-                            if len(vector) == EMBEDDING_DIM:
-                                all_vectors.append(vector)
-                                all_ids.append(know_id)
-                                id_mapping[know_id] = know_id
-                
-                # Ajouter tous les vecteurs en batch (beaucoup plus rapide qu'un par un)
-                if all_vectors:
-                    vectors_matrix = np.vstack(all_vectors).astype('float32')
-                    ids_array = np.array(all_ids, dtype='int64')
-                    if isinstance(faiss_index, faiss.IndexIDMap):
-                        faiss_index.add_with_ids(vectors_matrix, ids_array)
-                    else:
-                        # Fallback si pas IndexIDMap (ne devrait pas arriver)
-                        for vector, vec_id in zip(all_vectors, all_ids):
-                            faiss_index.add(np.array([vector], dtype='float32'))
-                            faiss_id = faiss_index.ntotal - 1
-                            id_mapping[faiss_id] = vec_id
-                
-                # Sauvegarder l'index reconstruit
-                if faiss_index.ntotal > 0:
-                    faiss.write_index(faiss_index, index_path)
-                    with open(map_path, 'wb') as f:
-                        pickle.dump(id_mapping, f)
-                    log.info(f"✅ Index FAISS reconstruit : {faiss_index.ntotal} vecteurs")
-            
-            conn.close()
-        except Exception as e:
-            log.warning(f"Erreur reconstruction index depuis DB: {e}", exc_info=True)
-        
-        # Marquer comme initialisée
-        _initialized_dbs.add(db_key)
-        log.debug(f"✅ DB initialisée: {db_key}")
-
-@trace_action(source="database")
-def add_knowledge(collection, content, metadata=None):
-    global faiss_index, id_mapping
-    if not content or not content.strip(): return None
-    
-    # Sécurité : on s'assure que le modèle est chargé (lazy loading)
-    _ensure_model()
-    
-    # 1. Calcul du vecteur (coûteux, on le fait une fois avant de toucher à la DB)
-    try:
-        vector = model.encode([content])[0]
-        blob_embedding = vector.tobytes()
-        content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
-    except Exception as e:
-        log.error(f"Erreur Encoding: {e}")
-        return None
-    
-    # 2. Tentative d'insertion avec Auto-Réparation SQL
-    sqlite_path, index_path, map_path = _get_paths()
-    
-    for attempt in range(2): # On essaie 2 fois : Normal, puis après Réparation
-        conn = None
-        try:
-            conn = sqlite3.connect(sqlite_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT OR IGNORE INTO knowledge (collection, content, content_hash, metadata, embedding)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (collection, content, content_hash, json.dumps(metadata or {}, ensure_ascii=False), blob_embedding))
-            
-            conn.commit()
-            sql_id = cursor.lastrowid
-            
-            # Si doublon (sql_id est None ou 0), on arrête là sans erreur
-            if not sql_id: 
-                return None 
-
-            # Mise à jour Index Vectoriel (Mémoire)
-            if faiss_index is None: 
-                init_db() # Cas rare : Faiss pas init mais SQL oui
-            
-            faiss_index.add(np.array([vector], dtype='float32'))
-            faiss_id = faiss_index.ntotal - 1
-            id_mapping[faiss_id] = sql_id
-            
-            # Sauvegarde Index Disque
-            faiss.write_index(faiss_index, index_path)
-            with open(map_path, 'wb') as f: pickle.dump(id_mapping, f)
-            
-            return sql_id
-
-        except sqlite3.OperationalError as e:
-            # [FIX] C'est ici qu'on gère le "no such table"
-            if "no such table" in str(e) and attempt == 0:
-                log.warning("⚠️ Table 'knowledge' manquante. Tentative de reconstruction immédiate...")
-                if conn: conn.close()
-                init_db() # On force la création de la table
-                continue # On réessaye la boucle (attempt 1)
-            else:
-                log.error(f"Erreur SQL critique: {e}")
-                return None
-        except Exception as e:
-            log.error(f"Erreur insertion DB générique: {e}")
-            return None
-        finally:
-            if conn: conn.close()
-            
-    return None
-
-@trace_action(source="database")
-def reciprocal_rank_fusion(vector_results: List[Tuple], fts_results: List[Tuple], k: int = 60) -> Dict[int, float]:
-    """
-    Algorithme Reciprocal Rank Fusion (RRF) pour fusionner résultats de recherche.
-    
-    Args:
-        vector_results: Liste de (chunk_id, score) de la recherche vectorielle
-        fts_results: Liste de (chunk_id, score) de la recherche FTS5
-        k: Constante de lissage (défaut: 60)
-    
-    Returns:
-        Dictionnaire {chunk_id: score_rrf}
-    """
-    rrf_scores = {}
-    
-    # Traiter résultats vectoriels (distance, donc plus petit = mieux)
-    # On inverse pour avoir un rang (1 = meilleur)
-    for rank, (chunk_id, distance) in enumerate(vector_results, 1):
-        if chunk_id not in rrf_scores:
-            rrf_scores[chunk_id] = 0.0
-        rrf_scores[chunk_id] += 1.0 / (k + rank)
-    
-    # Traiter résultats FTS5 (score BM25, plus grand = mieux)
-    # On inverse aussi pour avoir un rang
-    for rank, (chunk_id, score) in enumerate(fts_results, 1):
-        if chunk_id not in rrf_scores:
-            rrf_scores[chunk_id] = 0.0
-        rrf_scores[chunk_id] += 1.0 / (k + rank)
-    
-    return rrf_scores
-
-
-@trace_action(source="database")
-def search_vector_db(query, db_path_base=None, max_results=5):
-    """Recherche vectorielle uniquement (legacy, pour compatibilité)."""
-    results, _ = search_hybrid(query, db_path_base, max_results, use_hybrid=False)
-    return results, None
-
-
-def _sanitize_fts5_query(query: str) -> str:
-    """
-    Nettoie et échappe la requête pour FTS5.
-    FTS5 a une syntaxe spéciale : certains caractères doivent être échappés.
-    Pour les requêtes multi-mots, on filtre les stop words et utilise OR pour élargir la recherche.
-    """
-    if not query:
-        return ""
-    
-    # Caractères spéciaux FTS5 qui nécessitent un échappement
-    special_chars = ['"', ',', ':', '\\', '(', ')', '{', '}', '[', ']', '^', '*', '?', '+', '-', '|', '&']
-    
-    # Si la requête contient des opérateurs FTS5 (AND, OR, NOT), on la retourne telle quelle
-    if any(op in query.upper() for op in [' AND ', ' OR ', ' NOT ']):
-        # La requête contient déjà des opérateurs FTS5, on ne fait que l'échapper si nécessaire
-        if any(char in query for char in special_chars):
-            escaped_query = query.replace('"', '""')
-            return f'"{escaped_query}"'
-        return query
-    
-    # Stop words français à exclure (articles, prépositions, pronoms courants)
-    stop_words = {'le', 'la', 'les', 'de', 'du', 'des', 'un', 'une', 'et', 'ou', 'à', 'au', 'aux',
-                  'pour', 'avec', 'sans', 'sur', 'sous', 'dans', 'par', 'est', 'sont', 'être',
-                  'avoir', 'il', 'elle', 'ils', 'elles', 'ce', 'cet', 'cette', 'ces', 'se', 'te',
-                  'me', 'nous', 'vous', 'que', 'qui', 'quoi', 'où', 'quand', 'comment', 'pourquoi'}
-    
-    # Séparer les mots (garder seulement les caractères alphanumériques et accents)
-    import re
-    words = re.findall(r'\b\w+\b', query.lower(), re.UNICODE)
-    
-    # Filtrer les stop words et les mots trop courts (< 2 caractères sauf si mot technique)
-    significant_words = [w for w in words if w not in stop_words and (len(w) >= 3 or w.isdigit())]
-    
-    if len(significant_words) > 1:
-        # Utiliser OR pour élargir la recherche (meilleur pour FTS5)
-        # Les documents contenant plusieurs mots auront un meilleur score BM25
-        return ' OR '.join(significant_words)
-    elif len(significant_words) == 1:
-        # Un seul mot significatif, retourner tel quel
-        return significant_words[0]
-    elif len(words) > 0:
-        # Pas de mots significatifs après filtrage, utiliser tous les mots avec OR
-        return ' OR '.join(words[:5])  # Limiter à 5 mots max
-    else:
-        # Pas de mots trouvés, retourner la requête originale (peut contenir des caractères spéciaux)
-        # Échapper si nécessaire
-        if any(char in query for char in special_chars):
-            escaped_query = query.replace('"', '""')
-            return f'"{escaped_query}"'
-        return query
-
-
-@trace_action(source="database")
-def search_hybrid(query, db_path_base=None, max_results=50, use_hybrid=True):
-    """
-    Recherche hybride combinant recherche dense (FAISS) et sparse (FTS5).
-    
-    Args:
-        query: Requête de recherche
-        db_path_base: Chemin de base de la DB
-        max_results: Nombre maximum de résultats
-        use_hybrid: Si False, utilise uniquement la recherche vectorielle
-    
-    Returns:
-        Tuple (results, error) où results est une liste de (source, content, score)
-    """
-    global faiss_index, id_mapping
-    
-    if not query:
-        return [], None
-    
-    _ensure_model()  # Charge uniquement SentenceTransformer (lazy loading)
-    if faiss_index is None or faiss_index.ntotal == 0:
-        init_db(db_path_base)
-        if faiss_index is None or faiss_index.ntotal == 0:
-            log.warning("FAISS index non initialisé ou vide après init_db.")
-            return [], None
-    
-    sqlite_path, _, _ = _get_paths(db_path_base)
-    
-    try:
-        # 1. Recherche Dense (FAISS)
-        query_vector = model.encode([query])[0]
-        
-        # Rechercher plus de résultats pour la fusion
-        search_k = min(max_results * 3, faiss_index.ntotal)
-        D, I = faiss_index.search(np.array([query_vector], dtype='float32'), search_k)
-        
-        vector_results = []
-        conn = sqlite3.connect(sqlite_path)
-        cursor = conn.cursor()
-        
-        for i, result_id in enumerate(I[0]):
-            if result_id == -1:
-                continue
-            
-            # Avec IndexIDMap, result_id est directement le chunk_id ou knowledge_id
-            chunk_id = int(result_id)
-            distance = float(D[0][i])
-            
-            # Récupérer le contenu depuis chunks ou knowledge avec métadonnées AST
-            cursor.execute('''
-                SELECT c.content, f.path, c.ast_type, c.parent_context, c.start_line, c.end_line
-                FROM chunks c
-                JOIN files f ON c.file_id = f.id
-                WHERE c.id = ?
-            ''', (chunk_id,))
-            row = cursor.fetchone()
-            
-            if not row:
-                # Essayer knowledge (legacy)
-                cursor.execute("SELECT collection, content FROM knowledge WHERE id=?", (chunk_id,))
-                row = cursor.fetchone()
-                if row:
-                    vector_results.append((chunk_id, distance, row[1], row[0], None, None, None, None))
-            else:
-                content, path, ast_type, parent_context, start_line, end_line = row
-                source = f"{path}" if path else f"chunk_{chunk_id}"
-                vector_results.append((chunk_id, distance, content, source, ast_type, parent_context, start_line, end_line))
-        
-        # 2. Recherche Sparse (FTS5)
-        fts_results = []
-        if use_hybrid:
-            try:
-                # Vérifier si FTS5 est disponible
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='fts_code'")
-                if cursor.fetchone():
-                    # Recherche FTS5 avec BM25
-                    # Note: FTS5 utilise rowid comme clé primaire (mappé à chunk.id via trigger)
-                    try:
-                        # Nettoyer la requête pour éviter les erreurs de syntaxe FTS5
-                        fts5_query = _sanitize_fts5_query(query)
-                        # Récupérer les métadonnées depuis chunks via jointure
-                        cursor.execute('''
-                            SELECT fts.rowid, bm25(fts_code) as score, fts.content, fts.path, fts.ast_type,
-                                   c.parent_context, c.start_line, c.end_line
-                            FROM fts_code fts
-                            LEFT JOIN chunks c ON c.id = fts.rowid
-                            WHERE fts_code MATCH ?
-                            ORDER BY score
-                            LIMIT ?
-                        ''', (fts5_query, search_k))
-                        
-                        rows = cursor.fetchall()
-                        log.debug(f"FTS5 BM25: {len(rows)} résultats trouvés")
-                        for row in rows:
-                            chunk_id, score, content, path, ast_type, parent_context, start_line, end_line = row
-                            source = path if path else f"chunk_{chunk_id}"
-                            fts_results.append((chunk_id, -score, content, source, ast_type, parent_context, start_line, end_line))  # Négatif car BM25 plus grand = mieux
-                    except sqlite3.OperationalError as bm25_err:
-                        if "no such function: bm25" in str(bm25_err):
-                            # BM25 non disponible, utiliser MATCH simple avec rowid
-                            # Nettoyer la requête pour éviter les erreurs de syntaxe FTS5
-                            fts5_query = _sanitize_fts5_query(query)
-                            cursor.execute('''
-                                SELECT fts.rowid, fts.content, fts.path, fts.ast_type,
-                                       c.parent_context, c.start_line, c.end_line
-                                FROM fts_code fts
-                                LEFT JOIN chunks c ON c.id = fts.rowid
-                                WHERE fts_code MATCH ?
-                                LIMIT ?
-                            ''', (fts5_query, search_k))
-                            
-                            for rank, row in enumerate(cursor.fetchall(), 1):
-                                chunk_id, content, path, ast_type, parent_context, start_line, end_line = row
-                                source = path if path else f"chunk_{chunk_id}"
-                                # Utiliser le rang comme score (plus petit = mieux)
-                                fts_results.append((chunk_id, rank, content, source, ast_type, parent_context, start_line, end_line))
-                        else:
-                            raise
-                else:
-                    log.debug("FTS5 table non trouvée, recherche hybride dégradée en recherche vectorielle uniquement")
-            except Exception as e:
-                log.warning(f"Erreur recherche FTS5: {e}", exc_info=True)
-        
-        conn.close()
-        
-        # 3. Fusion RRF
-        if use_hybrid and fts_results:
-            # Préparer les listes pour RRF (chunk_id, score)
-            # IMPORTANT: Trier les résultats par pertinence avant RRF
-            # Pour vector_results: distance (plus petit = mieux) → tri croissant
-            vector_list = [(cid, dist) for cid, dist, _, _, _, _, _, _ in vector_results]
-            vector_list = sorted(vector_list, key=lambda x: x[1])  # Trier par distance croissante
-            
-            # Pour fts_results: score BM25 négatif (plus négatif = mieux) → tri croissant
-            fts_list = [(cid, score) for cid, score, _, _, _, _, _, _ in fts_results]
-            fts_list = sorted(fts_list, key=lambda x: x[1])  # Trier par score croissant (car négatif)
-            
-            log.debug(f"RRF: {len(vector_list)} résultats vectoriels, {len(fts_list)} résultats FTS5")
-            rrf_scores = reciprocal_rank_fusion(vector_list, fts_list)
-            log.debug(f"RRF: {len(rrf_scores)} scores RRF calculés")
-            
-            # Créer un dictionnaire de résultats complets avec métadonnées
-            results_dict = {}
-            for cid, dist, content, source, ast_type, parent_context, start_line, end_line in vector_results:
-                if cid not in results_dict:
-                    results_dict[cid] = {
-                        'content': content,
-                        'source': source,
-                        'ast_type': ast_type,
-                        'parent_context': parent_context,
-                        'start_line': start_line,
-                        'end_line': end_line,
-                        'rrf_score': rrf_scores.get(cid, 0.0)
-                    }
-            
-            for cid, score, content, source, ast_type, parent_context, start_line, end_line in fts_results:
-                if cid not in results_dict:
-                    results_dict[cid] = {
-                        'content': content,
-                        'source': source,
-                        'ast_type': ast_type,
-                        'parent_context': parent_context,
-                        'start_line': start_line,
-                        'end_line': end_line,
-                        'rrf_score': rrf_scores.get(cid, 0.0)
-                    }
-            
-            # Trier par score RRF décroissant
-            sorted_results = sorted(
-                results_dict.items(),
-                key=lambda x: x[1]['rrf_score'],
-                reverse=True
-            )[:max_results]
-            
-            # Formater les résultats avec métadonnées
-            results = [
-                (
-                    item['source'],
-                    item['content'],
-                    item['rrf_score'],
-                    item['ast_type'],
-                    item['parent_context'],
-                    item['start_line'],
-                    item['end_line']
-                )
-                for _, item in sorted_results
-            ]
-        else:
-            # Pas de fusion, utiliser uniquement résultats vectoriels
-            results = [
-                (
-                    source,
-                    content,
-                    distance,
-                    ast_type,
-                    parent_context,
-                    start_line,
-                    end_line
-                )
-                for _, distance, content, source, ast_type, parent_context, start_line, end_line in vector_results[:max_results]
-            ]
-        
-        return results, None
-        
-    except Exception as e:
-        log.error(f"Erreur recherche hybride: {e}", exc_info=True)
-        import traceback
-        error_msg = f"{str(e)}\n{traceback.format_exc()}"
-        return [], error_msg
-
-# --- [FIX ISSUE 1] COMMANDES MANQUANTES ---
-
-@trace_action(source="database")
-def _get_or_create_file_id(file_path: str, checksum: str, db_path_base=None) -> int:
-    """Récupère ou crée l'ID d'un fichier dans la table files."""
-    sqlite_path, _, _ = _get_paths(db_path_base)
-    conn = sqlite3.connect(sqlite_path)
-    cursor = conn.cursor()
-    
-    try:
-        # Chercher le fichier existant
-        cursor.execute("SELECT id FROM files WHERE path=?", (file_path,))
-        row = cursor.fetchone()
-        
-        if row:
-            file_id = row[0]
-            # Mettre à jour le checksum et timestamp
-            cursor.execute(
-                "UPDATE files SET checksum=?, last_indexed=CURRENT_TIMESTAMP WHERE id=?",
-                (checksum, file_id)
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                file_id INTEGER NOT NULL, 
+                chunk_index INTEGER DEFAULT 0, 
+                content TEXT NOT NULL, 
+                ast_type TEXT, 
+                start_line INTEGER, 
+                end_line INTEGER, 
+                parent_context TEXT,
+                metadata TEXT,
+                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
             )
-            conn.commit()
-        else:
-            # Créer nouveau fichier
-            cursor.execute(
-                "INSERT INTO files (path, checksum) VALUES (?, ?)",
-                (file_path, checksum)
+        ''')
+        
+        # 3. Table Vectorielle
+        cursor.execute(f'''
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
+                chunk_id INTEGER PRIMARY KEY, 
+                embedding float[{EMBEDDING_DIM}]
             )
-            file_id = cursor.lastrowid
-            conn.commit()
+        ''')
         
-        return file_id
-    finally:
-        conn.close()
-
-
-@trace_action(source="database")
-def _save_faiss_index(db_path_base=None):
-    """Sauvegarde l'index FAISS sur disque.
-    
-    Args:
-        db_path_base: Chemin de base de la DB (optionnel)
-    
-    Returns:
-        True si sauvegarde réussie, False sinon
-    """
-    global faiss_index, id_mapping
-    
-    if faiss_index is None or faiss_index.ntotal == 0:
-        return False
-    
-    try:
-        sqlite_path, index_path, map_path = _get_paths(db_path_base)
-        faiss.write_index(faiss_index, index_path)
-        if not isinstance(faiss_index, faiss.IndexIDMap):
-            with open(map_path, 'wb') as f:
-                pickle.dump(id_mapping, f)
-        log.debug(f"Index FAISS sauvegardé : {faiss_index.ntotal} vecteurs")
-        return True
-    except Exception as e:
-        log.error(f"Erreur sauvegarde index FAISS: {e}")
-        return False
-
-
-@trace_action(source="database")
-def _add_chunk_to_db(file_id: int, chunk_index: int, chunk_data: Dict, db_path_base=None, save_immediately=False) -> Optional[int]:
-    """Ajoute un chunk à la base de données et retourne son ID.
-    
-    Args:
-        file_id: ID du fichier
-        chunk_index: Index du chunk dans le fichier
-        chunk_data: Données du chunk
-        db_path_base: Chemin de base de la DB
-        save_immediately: Si True, sauvegarde l'index immédiatement (par défaut False pour optimiser)
-    """
-    global faiss_index, id_mapping
-    
-    _ensure_libs()
-    sqlite_path, index_path, map_path = _get_paths(db_path_base)
-    
-    content = chunk_data.get('content', '')
-    if not content or not content.strip():
-        return None
-    
-    try:
-        # Calculer le vecteur
-        vector = model.encode([content])[0]
-        blob_embedding = vector.tobytes()
-        content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
-        
-        conn = sqlite3.connect(sqlite_path)
-        cursor = conn.cursor()
-        
+        # 4. Table FTS5
         try:
-            # Insérer le chunk
-            cursor.execute('''
-                INSERT INTO chunks (file_id, chunk_index, start_line, end_line, 
-                                 content, ast_type, parent_context, content_hash, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                file_id,
-                chunk_index,
-                chunk_data.get('start_line'),
-                chunk_data.get('end_line'),
-                content,
-                chunk_data.get('ast_type'),
-                chunk_data.get('parent_context'),
-                content_hash,
-                blob_embedding
-            ))
-            
-            chunk_id = cursor.lastrowid
-            conn.commit()
-            
-            # Ajouter au index FAISS avec l'ID du chunk
-            if faiss_index is None:
-                init_db(db_path_base)
-            
-            # Utiliser add_with_ids pour IndexIDMap
-            if isinstance(faiss_index, faiss.IndexIDMap):
-                faiss_index.add_with_ids(
-                    np.array([vector], dtype='float32'),
-                    np.array([chunk_id], dtype='int64')
-                )
-            else:
-                # Fallback si pas IndexIDMap (ne devrait pas arriver)
-                faiss_index.add(np.array([vector], dtype='float32'))
-                faiss_id = faiss_index.ntotal - 1
-                id_mapping[faiss_id] = chunk_id
-            
-            # Sauvegarder index uniquement si demandé (pour optimiser les batch)
-            if save_immediately:
-                _save_faiss_index(db_path_base)
-            
-            return chunk_id
-            
-        finally:
-            conn.close()
-            
-    except Exception as e:
-        log.error(f"Erreur ajout chunk: {e}")
-        return None
+            cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(content, tokenize='trigram')")
+        except: pass
 
-
-@trace_action(source="database")
-def _add_chunks_batch(file_id: int, chunks_data: List[Dict], db_path_base=None, save_immediately=False) -> int:
-    """Ajoute plusieurs chunks à la base de données en batch (optimisé).
-    
-    Cette fonction optimise l'indexation en traitant tous les chunks d'un fichier
-    en une seule opération : batch encoding, batch SQL insertion, batch FAISS addition.
-    
-    Args:
-        file_id: ID du fichier
-        chunks_data: Liste de dictionnaires contenant les données de chaque chunk
-        db_path_base: Chemin de base de la DB
-        save_immediately: Si True, sauvegarde l'index immédiatement (par défaut False)
-    
-    Returns:
-        Nombre de chunks ajoutés avec succès
-    """
-    global faiss_index, id_mapping
-    
-    if not chunks_data:
-        return 0
-    
-    _ensure_libs()
-    sqlite_path, index_path, map_path = _get_paths(db_path_base)
-    
-    # Filtrer les chunks vides
-    valid_chunks = []
-    for idx, chunk_data in enumerate(chunks_data):
-        content = chunk_data.get('content', '')
-        if content and content.strip():
-            valid_chunks.append((idx, chunk_data))
-    
-    if not valid_chunks:
-        return 0
-    
-    try:
-        # 1. Batch encoding : Encoder tous les chunks en une seule fois (10-100x plus rapide)
-        contents = [chunk_data.get('content', '') for _, chunk_data in valid_chunks]
-        vectors = model.encode(contents, show_progress_bar=False, convert_to_numpy=True)
-        
-        # Préparer les données pour l'insertion SQL
-        sql_data = []
-        for (chunk_idx, chunk_data), vector in zip(valid_chunks, vectors):
-            blob_embedding = vector.tobytes()
-            content_hash = hashlib.sha256(chunk_data.get('content', '').encode('utf-8')).hexdigest()
-            sql_data.append((
-                file_id,
-                chunk_idx,
-                chunk_data.get('start_line'),
-                chunk_data.get('end_line'),
-                chunk_data.get('content', ''),
-                chunk_data.get('ast_type'),
-                chunk_data.get('parent_context'),
-                content_hash,
-                blob_embedding
-            ))
-        
-        conn = sqlite3.connect(sqlite_path)
-        cursor = conn.cursor()
-        
-        try:
-            # 2. Batch SQL insertion : Insérer tous les chunks dans une transaction
-            cursor.executemany('''
-                INSERT INTO chunks (file_id, chunk_index, start_line, end_line, 
-                                 content, ast_type, parent_context, content_hash, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', sql_data)
-            
-            # Récupérer les IDs générés (nécessaire pour FAISS)
-            # SQLite ne retourne pas automatiquement les IDs avec executemany,
-            # donc on récupère les IDs basés sur file_id et chunk_index dans l'ordre
-            cursor.execute("SELECT id FROM chunks WHERE file_id=? ORDER BY chunk_index ASC", (file_id,))
-            chunk_ids = [row[0] for row in cursor.fetchall()]
-            
-            # Filtrer pour ne garder que les IDs des chunks qu'on vient d'insérer
-            # (on prend les N derniers IDs correspondant au nombre de chunks insérés)
-            if len(chunk_ids) >= len(valid_chunks):
-                chunk_ids = chunk_ids[-len(valid_chunks):]
-            
-            conn.commit()
-            
-            # 3. Ajouter au index FAISS en batch
-            if faiss_index is None:
-                init_db(db_path_base)
-            
-            # Utiliser add_with_ids pour IndexIDMap (tous les vecteurs en une fois)
-            if isinstance(faiss_index, faiss.IndexIDMap) and len(chunk_ids) == len(vectors):
-                faiss_index.add_with_ids(
-                    vectors.astype('float32'),
-                    np.array(chunk_ids, dtype='int64')
-                )
-            else:
-                # Fallback si pas IndexIDMap ou si nombre d'IDs ne correspond pas
-                for vector, chunk_id in zip(vectors, chunk_ids):
-                    if isinstance(faiss_index, faiss.IndexIDMap):
-                        faiss_index.add_with_ids(
-                            np.array([vector], dtype='float32'),
-                            np.array([chunk_id], dtype='int64')
-                        )
-                    else:
-                        faiss_index.add(np.array([vector], dtype='float32'))
-                        faiss_id = faiss_index.ntotal - 1
-                        id_mapping[faiss_id] = chunk_id
-            
-            # Sauvegarder index uniquement si demandé
-            if save_immediately:
-                _save_faiss_index(db_path_base)
-            
-            return len(valid_chunks)
-            
-        finally:
-            conn.close()
-            
-    except Exception as e:
-        log.error(f"Erreur ajout batch chunks: {e}", exc_info=True)
-        return 0
-
-
-@trace_action(source="database")
-def _delete_file_chunks(file_id: int, db_path_base=None, save_immediately=False):
-    """Supprime tous les chunks d'un fichier.
-    
-    Args:
-        file_id: ID du fichier
-        db_path_base: Chemin de base de la DB
-        save_immediately: Si True, sauvegarde l'index immédiatement (par défaut False pour optimiser)
-    """
-    global faiss_index, id_mapping
-    
-    sqlite_path, index_path, map_path = _get_paths(db_path_base)
-    
-    try:
-        conn = sqlite3.connect(sqlite_path)
-        cursor = conn.cursor()
-        
-        # Récupérer les IDs des chunks à supprimer
-        cursor.execute("SELECT id FROM chunks WHERE file_id=?", (file_id,))
-        chunk_ids = [row[0] for row in cursor.fetchall()]
-        
-        # Supprimer de FAISS si IndexIDMap
-        if chunk_ids and isinstance(faiss_index, faiss.IndexIDMap):
-            faiss_index.remove_ids(np.array(chunk_ids, dtype='int64'))
-            # Sauvegarder index uniquement si demandé (pour optimiser les batch)
-            if save_immediately:
-                _save_faiss_index(db_path_base)
-        
-        # Supprimer de SQLite (CASCADE supprimera automatiquement)
-        cursor.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
         conn.commit()
         conn.close()
-        
-        log.info(f"Supprimé {len(chunk_ids)} chunks pour file_id={file_id}")
-        
-    except Exception as e:
-        log.error(f"Erreur suppression chunks: {e}")
-
+        if db_path_base is None: _db_initialized = True
+        log.info("✅ Schéma DB Omni-V4 initialisé.")
 
 @trace_action(source="database")
-def index_project_files(root_path, progress_callback=None, use_semantic_chunking=True):
-    """
-    Scan et indexe tous les fichiers du projet.
-    Version optimisée avec Multiprocessing pour les gros volumes (>100 fichiers).
-    """
-    from .code_chunker import get_chunker
-    from concurrent.futures import ThreadPoolExecutor
+def _add_chunks_batch(file_id: int, chunks_data: List[Dict]):
+    _ensure_model()
+    if not chunks_data or not model: return 0
     
-    # Initialiser la DB au début
-    init_db()
+    texts = [c.get('content', '') for c in chunks_data]
+    vectors = model.encode(texts, convert_to_numpy=True)
     
-    # Extensions supportées
-    exts = SUPPORTED_FILE_EXTENSIONS
-    
-    # 1. SCANNING (Rapide)
-    files_to_index = []
-    for root, _, files in os.walk(root_path):
-        if any(x in root for x in [".git", "__pycache__", "venv", "env", "node_modules", "db", "logs", "dist", "build", "audio_cache"]):
-            continue
-        for file in files:
-            f_low = file.lower()
-            if f_low.endswith(('.json', '.log', '.lock', '.sqlite', '.pkl', '.index', '.csv')): continue
-            if any(k in f_low for k in ['debug', 'payload', 'usage', 'history', 'chat', 'action_log']): continue
-            if f_low.endswith(exts):
-                files_to_index.append(os.path.join(root, file))
-    
-    total_files = len(files_to_index)
-    log.info(f"Début indexation : {total_files} fichiers trouvés")
-    
-    # Initialiser chunker
-    chunker = get_chunker() if use_semantic_chunking else None
-    
-    # --- STRATÉGIE PARALLÈLE (> 100 fichiers) ---
-    if total_files > 100:
-        log.info(f"🚀 Mode Turbo activé (Multiprocessing) pour {total_files} fichiers")
-        _ensure_model()
-        
-        all_chunks_data = [] # Liste de (file_id, chunk_data)
-        
-        # A. Lecture et Chunking (I/O Bound -> ThreadPool)
-        # On prépare les données avant de lancer le lourd calcul vectoriel
-        def process_file_prep(file_path):
-            try:
-                rel_path = os.path.relpath(file_path, root_path)
-                with open(file_path, 'rb') as f: content_bytes = f.read()
-                checksum = hashlib.sha256(content_bytes).hexdigest()
-                
-                # Récup/Création ID (Rapide car SQLite WAL gère bien la concurrence lecture/écriture légère)
-                # Mais pour être sûr, on pourrait le faire en batch, mais ici on le fait un par un, c'est acceptable
-                # car _get_or_create_file_id est rapide.
-                # Pour éviter les locks, on pourrait pré-calculer tous les IDs, mais restons simple.
-                file_id = _get_or_create_file_id(rel_path, checksum)
-                
-                # Suppression anciens chunks (Rapide)
-                _delete_file_chunks(file_id, save_immediately=False)
-                
-                # Chunking
-                is_python = file_path.lower().endswith('.py')
-                file_chunks = []
-                
-                if use_semantic_chunking and is_python and chunker and chunker.parser:
-                    file_chunks = chunker.chunk_file(file_path)
-                else:
-                    # Fallback
-                    content = content_bytes.decode('utf-8', errors='ignore')
-                    if len(content) > 10:
-                        file_chunks = [{
-                            'content': f"Fichier: {os.path.basename(file_path)}\n{content}",
-                            'start_line': 1,
-                            'end_line': len(content.split('\n')),
-                            'ast_type': 'text_block',
-                            'parent_context': f"Fichier: {os.path.basename(file_path)}",
-                            'raw_content': content
-                        }]
-                
-                return file_id, file_chunks
-            except Exception as e:
-                return None
-        
-        log.info("Phase 1/3: Lecture et découpage des fichiers...")
-        with ThreadPoolExecutor(max_workers=os.cpu_count() * 2) as executor:
-            results = list(executor.map(process_file_prep, files_to_index))
-        
-        # Aplatir la liste pour l'encodage
-        flat_chunks_text = []
-        flat_chunks_meta = []
-        
-        for res in results:
-            if res:
-                fid, chunks = res
-                for idx, ch in enumerate(chunks):
-                    if ch.get('content', '').strip():
-                        flat_chunks_text.append(ch['content'])
-                        flat_chunks_meta.append((fid, idx, ch))
-        
-        if not flat_chunks_text:
-            return "Aucun contenu à indexer."
-
-        # B. Encodage Parallèle (CPU Bound -> Multiprocessing)
-        log.info(f"Phase 2/3: Encodage parallèle de {len(flat_chunks_text)} segments...")
-        pool = None
-        temp_model_for_pool = None
+    max_retries = 5
+    for attempt in range(max_retries):
         try:
-            # Créer un modèle non-quantifié temporaire pour le multiprocessing
-            # Les modèles quantifiés ne peuvent pas être picklés correctement sur Windows
-            log.debug("Création modèle non-quantifié temporaire pour multiprocessing...")
-            temp_model_for_pool = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            conn = get_connection()
+            cursor = conn.cursor()
+            inserted_count = 0
             
-            # Démarrer le pool avec le modèle non-quantifié
-            pool = temp_model_for_pool.start_multi_process_pool()
+            for i, (chunk, vector) in enumerate(zip(chunks_data, vectors)):
+                params = {
+                    'file_id': file_id,
+                    'chunk_index': i,
+                    'content': chunk['content'],
+                    'ast_type': chunk.get('ast_type'),
+                    'start_line': chunk.get('start_line'),
+                    'end_line': chunk.get('end_line'),
+                    'parent_context': chunk.get('parent_context'),
+                    'metadata': chunk.get('metadata')
+                }
+                
+                cursor.execute('''
+                    INSERT INTO chunks (
+                        file_id, chunk_index, content, ast_type, 
+                        start_line, end_line, parent_context, metadata
+                    )
+                    VALUES (
+                        :file_id, :chunk_index, :content, :ast_type, 
+                        :start_line, :end_line, :parent_context, :metadata
+                    )
+                ''', params)
+                
+                cid = cursor.lastrowid
+                cursor.execute("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", (cid, vector.tobytes()))
+                try: 
+                    cursor.execute("INSERT INTO fts_chunks(rowid, content) VALUES (?, ?)", (cid, chunk['content']))
+                except: pass
+                inserted_count += 1
             
-            # Encoder avec le modèle temporaire
-            vectors = temp_model_for_pool.encode_multi_process(flat_chunks_text, pool)
+            conn.commit()
+            conn.close()
+            return inserted_count
             
-            # Arrêter le pool et nettoyer
-            temp_model_for_pool.stop_multi_process_pool(pool)
-            pool = None
-            del temp_model_for_pool
-            temp_model_for_pool = None
-            
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            else:
+                log.error(f"Erreur SQL finale : {e}")
+                if 'conn' in locals(): conn.close()
+                return 0
         except Exception as e:
-            if pool and temp_model_for_pool:
-                try:
-                    temp_model_for_pool.stop_multi_process_pool(pool)
-                except:
-                    pass
-            if temp_model_for_pool:
-                del temp_model_for_pool
-            log.error(f"Erreur multiprocessing: {e}. Fallback séquentiel.")
-            # Fallback : utiliser le modèle quantifié en séquentiel (fonctionne même quantifié)
-            vectors = model.encode(flat_chunks_text, show_progress_bar=True, convert_to_numpy=True)
+            log.error(f"Erreur insertion batch : {e}")
+            if 'conn' in locals(): conn.close()
+            return 0
+    return 0
 
-        # C. Insertion Massive (Batch SQL + FAISS)
-        log.info("Phase 3/3: Insertion en base de données...")
-        
-        global faiss_index, id_mapping
-        sqlite_path, index_path, map_path = _get_paths()
-        conn = sqlite3.connect(sqlite_path)
+@trace_action(source="database")
+def search_hybrid(query: str, db_path_base=None, limit: int = 20, use_hybrid=True, **kwargs) -> Tuple[List, Optional[str]]:
+    _ensure_model()
+    init_db(db_path_base)
+    if not model: return [], "Modèle non chargé"
+    
+    try:
+        query_vec = model.encode([query])[0]
+        conn = get_connection(db_path_base)
         cursor = conn.cursor()
         
-        try:
-            # Préparer données SQL
-            sql_data = []
-            chunk_vectors = []
-            
-            for (fid, c_idx, c_data), vector in zip(flat_chunks_meta, vectors):
-                blob_emb = vector.tobytes()
-                c_hash = hashlib.sha256(c_data.get('content', '').encode('utf-8')).hexdigest()
-                
-                sql_data.append((
-                    fid, c_idx, 
-                    c_data.get('start_line'), c_data.get('end_line'),
-                    c_data.get('content'), c_data.get('ast_type'),
-                    c_data.get('parent_context'), c_hash, blob_emb
-                ))
-                chunk_vectors.append(vector)
-
-            # Insertion SQL en une seule transaction géante (ou par lots de 1000 pour être gentil avec la RAM)
-            BATCH_SIZE = 5000
-            total_inserted = 0
-            
-            # On doit insérer et récupérer les IDs pour FAISS
-            # Astuce: SQLite autoincrement est prévisible si on insère séquentiellement
-            # Mais executemany ne rend pas les IDs.
-            # Solution: On insère, puis on récupère les IDs des fichiers concernés.
-            
-            # Pour faire simple et robuste : boucle d'insertion par fichier ou par petits lots ?
-            # Non, executemany est le plus rapide.
-            
-            cursor.executemany('''
-                INSERT INTO chunks (file_id, chunk_index, start_line, end_line, 
-                                 content, ast_type, parent_context, content_hash, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', sql_data)
-            conn.commit()
-            
-            # Récupérer les IDs générés (C'est là que c'est tricky pour mapper Vecteur <-> ID)
-            # On va supposer que l'ordre d'insertion est respecté (c'est le cas avec SQLite)
-            # On récupère les IDs des derniers N chunks insérés
-            inserted_count = len(sql_data)
-            cursor.execute("SELECT id FROM chunks ORDER BY id DESC LIMIT ?", (inserted_count,))
-            # Les IDs reviennent en ordre DESC, on les inverse
-            ids_reversed = [r[0] for r in cursor.fetchall()]
-            chunk_ids = list(reversed(ids_reversed))
-            
-            if len(chunk_ids) != len(chunk_vectors):
-                log.error(f"Mismatch IDs/Vectors: {len(chunk_ids)} vs {len(chunk_vectors)}")
-                # Fallback critique ou gestion d'erreur
-            else:
-                # Mise à jour FAISS
-                if faiss_index is None: init_db()
-                
-                vectors_matrix = np.vstack(chunk_vectors).astype('float32')
-                ids_array = np.array(chunk_ids, dtype='int64')
-                
-                if isinstance(faiss_index, faiss.IndexIDMap):
-                    faiss_index.add_with_ids(vectors_matrix, ids_array)
-                else:
-                    faiss_index.add(vectors_matrix)
-                    # Update mapping manuel pour IndexFlatL2
-                    start_idx = faiss_index.ntotal - len(chunk_ids)
-                    for i, real_id in enumerate(chunk_ids):
-                        id_mapping[start_idx + i] = real_id
-                
-                _save_faiss_index()
-                
-            return f"Indexation Turbo terminée. {total_files} fichiers, {len(sql_data)} chunks."
-            
-        finally:
-            conn.close()
-
-    # --- STRATÉGIE SÉQUENTIELLE (< 100 fichiers ou fallback) ---
-    else:
-        count = 0
-        errors = 0
-        total_chunks = 0
+        cursor.execute('''
+            SELECT chunk_id, distance 
+            FROM vec_chunks 
+            WHERE embedding MATCH ? AND k = 50 
+            ORDER BY distance ASC
+        ''', (query_vec.tobytes(),))
+        vec_results = cursor.fetchall()
         
-        for i, file_path in enumerate(files_to_index):
-            try:
-                rel_path = os.path.relpath(file_path, root_path)
-                with open(file_path, 'rb') as f: file_content = f.read()
-                checksum = hashlib.sha256(file_content).hexdigest()
-                file_id = _get_or_create_file_id(rel_path, checksum)
-                _delete_file_chunks(file_id, save_immediately=False)
-                
-                is_python = file_path.lower().endswith('.py')
-                if use_semantic_chunking and is_python and chunker and chunker.parser:
-                    chunks = chunker.chunk_file(file_path)
-                else:
-                    content = file_content.decode('utf-8', errors='ignore')
-                    if len(content) < 10: continue
-                    chunks = [{
-                        'content': f"Fichier: {os.path.basename(file_path)}\n{content}",
-                        'start_line': 1,
-                        'end_line': len(content.split('\n')),
-                        'ast_type': 'text_block',
-                        'parent_context': f"Fichier: {os.path.basename(file_path)}",
-                        'raw_content': content
-                    }]
-                
-                if chunks:
-                    added = _add_chunks_batch(file_id, chunks, save_immediately=False)
-                    total_chunks += added
-                count += 1
-                if progress_callback and i % 5 == 0:
-                    progress_callback(f"Indexation: {rel_path} ({i}/{total_files})")
-            except Exception as e:
-                errors += 1
-                log.warning(f"Erreur {file_path}: {e}")
+        scores = {}
+        for i, (cid, _) in enumerate(vec_results): 
+            scores[cid] = scores.get(cid, 0) + (1.0 / (60 + i + 1))
         
-        _save_faiss_index()
-        return f"Indexation terminée. {count} fichiers, {total_chunks} chunks."
-
-@trace_action(source="database")
-def delete_local_db():
-    """Supprime physiquement les fichiers de la base de données."""
-    global faiss_index, id_mapping
-    
-    sqlite_path, index_path, map_path = _get_paths()
-    deleted = []
-    
-    try:
-        # Reset mémoire
-        faiss_index = None
-        id_mapping = {}
-        
-        # Suppression disque
-        for p in [sqlite_path, index_path, map_path]:
-            if os.path.exists(p):
-                os.remove(p)
-                deleted.append(os.path.basename(p))
-                
-        # Réinit immédiate pour éviter crash si appel suivant
-        init_db()
-        return f"Base supprimée : {', '.join(deleted)}"
+        sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+        final_results = []
+        for cid, score in sorted_ids:
+            cursor.execute('''
+                SELECT f.path, c.content, c.ast_type, c.start_line 
+                FROM chunks c 
+                JOIN files f ON f.id = c.file_id 
+                WHERE c.id = ?
+            ''', (cid,))
+            row = cursor.fetchone()
+            if row: final_results.append((row[0], row[1], score, row[2], row[3]))
+            
+        conn.close()
+        return final_results, None
     except Exception as e:
-        return f"Erreur suppression : {e}"
+        log.error(f"Erreur recherche : {e}")
+        return [], str(e)
 
-# --- Support Mémoire Sémantique ---
-@trace_action(source="database")
-def store_memory(text_content, metadata=None):
-    try:
-        mem_id = hashlib.md5(f"{text_content}{time.time()}".encode()).hexdigest()[:8]
-        if not metadata: metadata = {}
-        metadata.update({"type": "memory", "memory_id": mem_id})
-        
-        success = add_knowledge(f"memory://{mem_id}", text_content, metadata=metadata)
-        if success: log.info(f"🧠 Souvenir ancré : {mem_id}")
-        return success
-    except Exception as e:
-        log.error(f"Erreur mémoire: {e}")
-        return False
+def search_vector_db(query, db_path_base=None, max_results=5):
+    results, err = search_hybrid(query, db_path_base, limit=max_results)
+    return results, err
 
 @trace_action(source="database")
-def search_memories(query, n_results=3):
-    try:
-        raw_results, _ = search_vector_db(query, max_results=n_results * 4)
-        memories = []
-        for path, content, score in raw_results:
-            if path and path.startswith("memory://"):
-                memories.append((path, content, score))
-                if len(memories) >= n_results: break
-        return memories
-    except Exception: return []
-
-
-@trace_action(source="database")
-def sync_incremental(root_path: str, progress_callback=None, state_file: str = None):
-    """
-    Synchronisation incrémentale: ré-indexe uniquement les fichiers modifiés.
-    
-    Utilise Merkle Tree pour détecter les changements en O(log n).
-    
-    Args:
-        root_path: Chemin racine du projet
-        progress_callback: Fonction de callback pour le progrès
-        state_file: Chemin du fichier de sauvegarde d'état (optionnel)
-    
-    Returns:
-        Message de résultat
-    """
+def index_project_files(root_path: str, progress_callback=None, use_semantic_chunking=True, **kwargs):
+    """Indexation complète avec filtrage robuste (.gitignore) et exceptions prioritaires."""
     from .merkle_sync import MerkleTreeSync
+    from .code_chunker import get_chunker
+    from features.gitignore_parser import parse_gitignore
+    from config.settings import APP_SETTINGS # Import pour les settings dynamiques
     
-    # Initialiser la DB au début
     init_db()
     
-    if state_file is None:
-        state_file = get_path("db/merkle_state.json")
+    log.info(f"🚀 Début indexation (Mode Smart Filter) : {root_path}")
     
-    # Construire l'arbre Merkle actuel
+    # 1. Chargement des règles .gitignore
+    gitignore_path = os.path.join(root_path, ".gitignore")
+    matches_gitignore = lambda x: False
+    if os.path.exists(gitignore_path):
+        try:
+            matches_gitignore = parse_gitignore(gitignore_path)
+            log.info("✅ Règles .gitignore chargées.")
+        except Exception as e:
+            log.warning(f"⚠️ Erreur chargement .gitignore : {e}")
+
+    # 2. Vérification DB vide
+    db_is_empty = True
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM files")
+        count = cursor.fetchone()[0]
+        db_is_empty = (count == 0)
+        conn.close()
+    except: pass
+
+    # 3. Synchronisation Merkle (pour la détection de modifs)
+    state_file = get_path("db/merkle_state_v4.json")
     current_tree = MerkleTreeSync(root_path)
     current_tree.build_tree()
     
-    # Charger l'état précédent
     previous_hashes = MerkleTreeSync.load_state(state_file)
-    
-    # Construire un arbre minimal pour la comparaison
     from .merkle_sync import MerkleNode
+    prev_tree = MerkleTreeSync(root_path)
+    for p, h in previous_hashes.items(): prev_tree.node_map[p] = MerkleNode(p, is_file=True, hash_value=h)
     
-    previous_tree = MerkleTreeSync(root_path)
-    for file_path, file_hash in previous_hashes.items():
-        if os.path.exists(file_path):
-            node = MerkleNode(file_path, is_file=True, hash_value=file_hash)
-            previous_tree.node_map[file_path] = node
+    modified = current_tree.compare_trees(prev_tree)
     
-    # Comparer les arbres
-    modified_files = current_tree.compare_trees(previous_tree)
+    # Force si DB vide
+    if db_is_empty and not modified:
+        log.info("🔄 DB vide détectée : Forçage de l'indexation complète...")
+        modified = [n.path for n in current_tree.node_map.values() if n.is_file]
+    elif not modified:
+        log.info("✅ Aucun fichier modifié détecté et DB déjà peuplée.")
+        return "Base déjà à jour."
+
+    chunker = get_chunker()
+    _ensure_model()
     
-    if not modified_files:
-        log.info("✅ Aucun fichier modifié détecté")
-        return "Aucun fichier modifié. Index à jour."
+    # 4. Filtrage "Logique Parfaite"
+    # On combine .gitignore + exclusions système critiques
+    critical_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'db', 'logs', 'dist', 'build', 'audio_cache', '.vscode', '.idea'}
     
-    log.info(f"📝 {len(modified_files)} fichiers modifiés détectés")
+    # Chargement de la liste de surveillance (Exceptions prioritaires)
+    watch_list = APP_SETTINGS.get("repo_map_cache", {}).get("watch_files", [])
+    # Normalisation des chemins surveillés
+    normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
     
-    # Ré-indexer uniquement les fichiers modifiés
+    to_index = []
+    for fpath in modified:
+        # Check Prioritaire : Liste de surveillance
+        # Si le fichier est dans la liste de surveillance, on l'indexe DIRECTEMENT
+        # sans vérifier gitignore ou les dossiers critiques.
+        if os.path.normpath(fpath).lower() in normalized_watch_list:
+            to_index.append(fpath)
+            continue
+
+        rel_path = os.path.relpath(fpath, root_path)
+        
+        # A. Filtre Dossiers Système (Bloquant)
+        parts = rel_path.split(os.sep)
+        if any(p in critical_dirs for p in parts):
+            continue
+            
+        # B. Filtre Gitignore (Logique métier)
+        if matches_gitignore(fpath):
+            continue
+            
+        # C. Filtre Extensions (On veut du texte/code)
+        # On accepte tout ce qui ressemble à du texte, pas de binaire
+        # Liste blanche élargie pour attraper tout le code source
+        valid_exts = SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css', '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml', '.toml', '.xml', '.sql', '.ini', '.cfg')
+        if not fpath.lower().endswith(valid_exts):
+            # Petit check heuristique : si c'est pas dans la liste mais < 1MB, on tente de lire
+            try:
+                if os.path.getsize(fpath) > 1024 * 1024: continue # Skip gros fichiers inconnus
+            except: continue
+        
+        to_index.append(fpath)
+
+    log.info(f"📂 {len(to_index)} fichiers qualifiés pour indexation.")
+    
+    # 5. Indexation
     count = 0
-    errors = 0
+    total = len(to_index)
     
-    for file_path in modified_files:
+    for fpath in to_index:
         try:
-            rel_path = os.path.relpath(file_path, root_path)
-            
-            # Calculer le checksum
-            with open(file_path, 'rb') as f:
-                file_content = f.read()
-            checksum = hashlib.sha256(file_content).hexdigest()
-            
-            # Récupérer ou créer l'ID du fichier
-            file_id = _get_or_create_file_id(rel_path, checksum)
-            
-            # Supprimer les anciens chunks (sans sauvegarde immédiate)
-            _delete_file_chunks(file_id, save_immediately=False)
-            
-            # Chunking et indexation (utiliser la même logique que index_project_files)
-            from .code_chunker import get_chunker
-            
-            chunker = get_chunker()
-            is_python = file_path.lower().endswith('.py')
-            
-            if is_python and chunker.parser:
-                chunks = chunker.chunk_file(file_path)
-            else:
-                # Fallback chunking basique
-                content = file_content.decode('utf-8', errors='ignore')
-                if len(content) < 10:
-                    continue
+            rel = os.path.relpath(fpath, root_path)
+            with open(fpath, 'rb') as f: data = f.read()
+            # Détection binaire basique (null byte)
+            if b'\0' in data[:8000]: 
+                continue 
                 
-                chunks = [{
-                    'content': f"Fichier: {os.path.basename(file_path)}\n{content}",
-                    'start_line': 1,
-                    'end_line': len(content.split('\n')),
-                    'ast_type': 'text_block',
-                    'parent_context': f"Fichier: {os.path.basename(file_path)}",
-                    'raw_content': content
-                }]
+            checksum = hashlib.sha256(data).hexdigest()
             
-            # Ajouter les chunks en batch (optimisé)
-            if chunks:
-                _add_chunks_batch(file_id, chunks, save_immediately=False)
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM files WHERE path = ?", (rel,))
+            row = cursor.fetchone()
+            if row: cursor.execute("DELETE FROM files WHERE id = ?", (row[0],))
+            
+            cursor.execute("INSERT INTO files (path, checksum) VALUES (?, ?)", (rel, checksum))
+            fid = cursor.lastrowid
+            conn.commit()
+            conn.close()
+            
+            text = data.decode('utf-8', errors='ignore')
+            chunks = chunker.chunk_file(fpath) if use_semantic_chunking and fpath.endswith('.py') else [{'content': text}]
+            
+            _add_chunks_batch(fid, chunks)
             
             count += 1
-            
-            if progress_callback:
-                progress_callback(f"Sync: {rel_path} ({count}/{len(modified_files)})")
+            if progress_callback and count % 5 == 0: 
+                progress_callback(f"Indexation : {rel} ({count}/{total})")
                 
         except Exception as e:
-            errors += 1
-            log.warning(f"⚠️ Échec sync {os.path.basename(file_path)}: {e}")
-    
-    # Sauvegarder l'index FAISS une seule fois à la fin
-    _save_faiss_index()
-    
-    # Sauvegarder le nouvel état
+            log.warning(f"⚠️ Échec sur {fpath} : {e}")
+        
     current_tree.save_state(state_file)
-    
-    return f"Sync incrémentale terminée. {count} fichiers ré-indexés, {errors} erreurs."
+    log.info(f"✅ Indexation terminée : {count} fichiers mis à jour.")
+    return f"Indexation réussie : {count} fichiers traités."
 
-@trace_action(source="database")
-def warmup_model_background():
-    """Préchauffe le modèle SentenceTransformer en arrière-plan.
-    Peut être appelé au démarrage de l'app sans bloquer.
-    Approche "Fire and Forget" : pas de callback pour éviter le couplage.
-    """
-    def warmup_task():
+# --- Autres Exports ---
+
+def store_memory(text: str, metadata: Dict = None):
+    init_db()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO files (path, checksum) VALUES (?, ?)", ("memory://global", "0"))
+    fid = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return _add_chunks_batch(fid, [{'content': text, 'ast_type': 'memory'}])
+
+def search_memories(query: str, n_results=3, **kwargs):
+    res, _ = search_hybrid(query, limit=n_results)
+    return [r for r in res if r[0] == "memory://global"][:n_results]
+
+def is_model_ready(): return model is not None
+def warmup_model_background(): threading.Thread(target=_ensure_model, daemon=True, name="ModelWarmup").start()
+def delete_local_db():
+    global _db_initialized
+    p = _get_db_path()
+    if os.path.exists(p): 
         try:
-            log.debug("🔥 Démarrage préchauffage SentenceTransformer...")
-            _ensure_model()
-            log.info("✅ Modèle SentenceTransformer préchauffé")
-        except Exception as e:
-            log.warning(f"⚠️ Erreur préchauffage modèle: {e}")
-    
-    # Vérifier si déjà chargé (évite de créer un thread inutile)
-    if SentenceTransformer is not None and model is not None:
-        return
-    
-    # Lancer en arrière-plan
-    threading.Thread(target=warmup_task, daemon=True, name="ModelWarmup").start()
+            _db_initialized = False
+            for ext in ['', '-wal', '-shm']:
+                if os.path.exists(p + ext): os.remove(p + ext)
+            return "✅ Base V4 supprimée."
+        except Exception as e: return f"❌ Erreur : {e}"
+    return "Néant."
