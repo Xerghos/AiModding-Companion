@@ -66,28 +66,31 @@ def _ensure_faiss():
 
 @trace_action(source="database")
 def _ensure_model():
-    """Charge SentenceTransformer et le modèle (lent, ~2s).
-    Peut être appelé en arrière-plan.
-    """
     global SentenceTransformer, model
-    
-    # Vérifier d'abord si déjà chargé (évite le lock si possible)
     if SentenceTransformer is not None and model is not None:
         return
-    
-    # Protection thread-safe
+
     with _ensure_libs_lock:
-        # Double-check après avoir acquis le lock
         if SentenceTransformer is None:
             from sentence_transformers import SentenceTransformer as ST
             SentenceTransformer = ST
         if model is None:
-            log.info(f"Chargement modèle Embedding: {EMBEDDING_MODEL_NAME}...")
+            log.info(f"Chargement modèle Embedding: {EMBEDDING_MODEL_NAME} (Optimisation INT8)...")
             try:
-                model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-                log.info(f"✅ Modèle Embedding chargé: {EMBEDDING_MODEL_NAME}")
+                import torch
+                # Charger le modèle original (float32)
+                base_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+                
+                # Appliquer la quantification dynamique pour CPU
+                # Réduit l'empreinte RAM de ~4x et accélère l'inférence sur CPU
+                model = torch.quantization.quantize_dynamic(
+                    base_model, 
+                    {torch.nn.Linear}, 
+                    dtype=torch.qint8
+                )
+                log.info(f"✅ Modèle Embedding chargé et quantifié (INT8): {EMBEDDING_MODEL_NAME}")
             except Exception as e:
-                log.error(f"❌ Erreur chargement SentenceTransformer: {e}")
+                log.error(f"❌ Erreur chargement/quantification SentenceTransformer: {e}")
                 model = None
                 raise
 
@@ -135,6 +138,11 @@ def init_db(db_path_base=None):
         
         conn = sqlite3.connect(sqlite_path)
         cursor = conn.cursor()
+        
+        # Optimisations SQLite
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.execute("PRAGMA cache_size=-64000;")
     
     # Table knowledge (legacy, conservée pour compatibilité)
     cursor.execute('''
@@ -1023,150 +1031,240 @@ def _delete_file_chunks(file_id: int, db_path_base=None, save_immediately=False)
 def index_project_files(root_path, progress_callback=None, use_semantic_chunking=True):
     """
     Scan et indexe tous les fichiers du projet.
-    
-    Args:
-        root_path: Chemin racine du projet
-        progress_callback: Fonction de callback pour le progrès
-        use_semantic_chunking: Si True, utilise le chunking sémantique Tree-sitter
+    Version optimisée avec Multiprocessing pour les gros volumes (>100 fichiers).
     """
     from .code_chunker import get_chunker
+    from concurrent.futures import ThreadPoolExecutor
     
-    # Initialiser la DB au début pour éviter les initialisations multiples
+    # Initialiser la DB au début
     init_db()
     
-    count = 0
-    errors = 0
-    total_chunks = 0
-    
-    # Extensions supportées (importées de config)
+    # Extensions supportées
     exts = SUPPORTED_FILE_EXTENSIONS
     
-    # Initialiser le chunker si nécessaire
-    chunker = None
-    semantic_chunking_active = False
-    if use_semantic_chunking:
-        try:
-            chunker = get_chunker()
-            # Vérifier si le chunking sémantique est réellement disponible
-            if chunker and hasattr(chunker, 'is_available') and chunker.is_available:
-                semantic_chunking_active = True
-                log.info("✅ Chunking sémantique activé pour les fichiers Python")
-            else:
-                log.info("ℹ️ Chunking sémantique demandé mais non disponible - utilisation du chunking basique")
-        except Exception as e:
-            log.warning(f"Impossible d'initialiser le chunker sémantique: {e}")
-            use_semantic_chunking = False
-    
+    # 1. SCANNING (Rapide)
     files_to_index = []
     for root, _, files in os.walk(root_path):
-        # Exclusions Dossiers (Système & Cache)
         if any(x in root for x in [".git", "__pycache__", "venv", "env", "node_modules", "db", "logs", "dist", "build", "audio_cache"]):
             continue
-            
         for file in files:
             f_low = file.lower()
-            
-            # 1. Exclusion par extension "bruit"
-            if f_low.endswith(('.json', '.log', '.lock', '.sqlite', '.pkl', '.index', '.csv')):
-                continue
-                
-            # 2. Exclusion par mots-clés (Anti-Auto-Inclusion)
-            if any(k in f_low for k in ['debug', 'payload', 'usage', 'history', 'chat', 'action_log']):
-                continue
-
-            # 3. Inclusion sélective (Python pour chunking sémantique, autres pour fallback)
+            if f_low.endswith(('.json', '.log', '.lock', '.sqlite', '.pkl', '.index', '.csv')): continue
+            if any(k in f_low for k in ['debug', 'payload', 'usage', 'history', 'chat', 'action_log']): continue
             if f_low.endswith(exts):
                 files_to_index.append(os.path.join(root, file))
     
-    total = len(files_to_index)
-    semantic_status = "ACTIF" if semantic_chunking_active else "INACTIF (fallback basique)"
-    log.info(f"Début indexation : {total} fichiers trouvés | Chunking sémantique: {semantic_status}")
+    total_files = len(files_to_index)
+    log.info(f"Début indexation : {total_files} fichiers trouvés")
     
-    for i, file_path in enumerate(files_to_index):
-        try:
-            rel_path = os.path.relpath(file_path, root_path)
-            
-            # Calculer le checksum SHA-256
-            with open(file_path, 'rb') as f:
-                file_content = f.read()
-            checksum = hashlib.sha256(file_content).hexdigest()
-            
-            # Récupérer ou créer l'ID du fichier
-            file_id = _get_or_create_file_id(rel_path, checksum)
-            
-            # Supprimer les anciens chunks de ce fichier (sans sauvegarde immédiate)
-            _delete_file_chunks(file_id, save_immediately=False)
-            
-            # Chunking sémantique pour Python, fallback pour autres
-            is_python = file_path.lower().endswith('.py')
-            
-            if use_semantic_chunking and is_python and chunker and semantic_chunking_active:
-                # Utiliser le chunker sémantique
-                chunks = chunker.chunk_file(file_path)
-                log.debug(f"Chunking sémantique utilisé pour {rel_path}: {len(chunks)} chunks créés")
-            else:
-                # Fallback: chunking basique
-                try:
-                    content = file_content.decode('utf-8', errors='ignore')
-                    if len(content) < 10:
-                        continue
-                    
-                    # Chunking simple par taille
-                    chunk_size = 1500
-                    chunks = []
-                    lines = content.split('\n')
-                    current_chunk = []
-                    current_start = 1
-                    
-                    for line_num, line in enumerate(lines, 1):
-                        current_chunk.append(line)
-                        if len('\n'.join(current_chunk)) >= chunk_size:
-                            chunk_text = '\n'.join(current_chunk)
-                            chunks.append({
-                                'content': f"Fichier: {os.path.basename(file_path)}\n{chunk_text}",
-                                'start_line': current_start,
-                                'end_line': line_num,
-                                'ast_type': 'text_block',
-                                'parent_context': f"Fichier: {os.path.basename(file_path)}",
-                                'raw_content': chunk_text
-                            })
-                            current_chunk = []
-                            current_start = line_num + 1
-                    
-                    # Dernier chunk
-                    if current_chunk:
-                        chunk_text = '\n'.join(current_chunk)
-                        chunks.append({
-                            'content': f"Fichier: {os.path.basename(file_path)}\n{chunk_text}",
-                            'start_line': current_start,
-                            'end_line': len(lines),
+    # Initialiser chunker
+    chunker = get_chunker() if use_semantic_chunking else None
+    
+    # --- STRATÉGIE PARALLÈLE (> 100 fichiers) ---
+    if total_files > 100:
+        log.info(f"🚀 Mode Turbo activé (Multiprocessing) pour {total_files} fichiers")
+        _ensure_model()
+        
+        all_chunks_data = [] # Liste de (file_id, chunk_data)
+        
+        # A. Lecture et Chunking (I/O Bound -> ThreadPool)
+        # On prépare les données avant de lancer le lourd calcul vectoriel
+        def process_file_prep(file_path):
+            try:
+                rel_path = os.path.relpath(file_path, root_path)
+                with open(file_path, 'rb') as f: content_bytes = f.read()
+                checksum = hashlib.sha256(content_bytes).hexdigest()
+                
+                # Récup/Création ID (Rapide car SQLite WAL gère bien la concurrence lecture/écriture légère)
+                # Mais pour être sûr, on pourrait le faire en batch, mais ici on le fait un par un, c'est acceptable
+                # car _get_or_create_file_id est rapide.
+                # Pour éviter les locks, on pourrait pré-calculer tous les IDs, mais restons simple.
+                file_id = _get_or_create_file_id(rel_path, checksum)
+                
+                # Suppression anciens chunks (Rapide)
+                _delete_file_chunks(file_id, save_immediately=False)
+                
+                # Chunking
+                is_python = file_path.lower().endswith('.py')
+                file_chunks = []
+                
+                if use_semantic_chunking and is_python and chunker and chunker.parser:
+                    file_chunks = chunker.chunk_file(file_path)
+                else:
+                    # Fallback
+                    content = content_bytes.decode('utf-8', errors='ignore')
+                    if len(content) > 10:
+                        file_chunks = [{
+                            'content': f"Fichier: {os.path.basename(file_path)}\n{content}",
+                            'start_line': 1,
+                            'end_line': len(content.split('\n')),
                             'ast_type': 'text_block',
                             'parent_context': f"Fichier: {os.path.basename(file_path)}",
-                            'raw_content': chunk_text
-                        })
-                except Exception as e:
-                    log.warning(f"Erreur chunking basique {file_path}: {e}")
-                    continue
-            
-            # Ajouter les chunks à la base en batch (optimisé)
-            if chunks:
-                added_count = _add_chunks_batch(file_id, chunks, save_immediately=False)
-                total_chunks += added_count
-            
-            count += 1
+                            'raw_content': content
+                        }]
                 
-            if progress_callback and i % 5 == 0:
-                progress_callback(f"Indexation: {rel_path} ({i}/{total}) - {len(chunks)} chunks")
-                
+                return file_id, file_chunks
+            except Exception as e:
+                return None
+        
+        log.info("Phase 1/3: Lecture et découpage des fichiers...")
+        with ThreadPoolExecutor(max_workers=os.cpu_count() * 2) as executor:
+            results = list(executor.map(process_file_prep, files_to_index))
+        
+        # Aplatir la liste pour l'encodage
+        flat_chunks_text = []
+        flat_chunks_meta = []
+        
+        for res in results:
+            if res:
+                fid, chunks = res
+                for idx, ch in enumerate(chunks):
+                    if ch.get('content', '').strip():
+                        flat_chunks_text.append(ch['content'])
+                        flat_chunks_meta.append((fid, idx, ch))
+        
+        if not flat_chunks_text:
+            return "Aucun contenu à indexer."
+
+        # B. Encodage Parallèle (CPU Bound -> Multiprocessing)
+        log.info(f"Phase 2/3: Encodage parallèle de {len(flat_chunks_text)} segments...")
+        pool = None
+        try:
+            # Démarrer le pool
+            pool = model.start_multi_process_pool()
+            
+            # Encoder
+            vectors = model.encode_multi_process(flat_chunks_text, pool)
+            
+            # Arrêter le pool
+            model.stop_multi_process_pool(pool)
+            pool = None
+            
         except Exception as e:
-            errors += 1
-            log.warning(f"⚠️ Échec indexation {os.path.basename(file_path)}: {e}")
-    
-    # Sauvegarder l'index FAISS une seule fois à la fin de l'indexation complète
-    # Ceci évite des milliers d'écritures d'index pendant l'indexation
-    _save_faiss_index()
-    
-    return f"Indexation terminée. {count} fichiers indexés, {total_chunks} chunks créés, {errors} erreurs."
+            if pool: model.stop_multi_process_pool(pool)
+            log.error(f"Erreur multiprocessing: {e}. Fallback séquentiel.")
+            vectors = model.encode(flat_chunks_text, show_progress_bar=True, convert_to_numpy=True)
+
+        # C. Insertion Massive (Batch SQL + FAISS)
+        log.info("Phase 3/3: Insertion en base de données...")
+        
+        global faiss_index, id_mapping
+        sqlite_path, index_path, map_path = _get_paths()
+        conn = sqlite3.connect(sqlite_path)
+        cursor = conn.cursor()
+        
+        try:
+            # Préparer données SQL
+            sql_data = []
+            chunk_vectors = []
+            
+            for (fid, c_idx, c_data), vector in zip(flat_chunks_meta, vectors):
+                blob_emb = vector.tobytes()
+                c_hash = hashlib.sha256(c_data.get('content', '').encode('utf-8')).hexdigest()
+                
+                sql_data.append((
+                    fid, c_idx, 
+                    c_data.get('start_line'), c_data.get('end_line'),
+                    c_data.get('content'), c_data.get('ast_type'),
+                    c_data.get('parent_context'), c_hash, blob_emb
+                ))
+                chunk_vectors.append(vector)
+
+            # Insertion SQL en une seule transaction géante (ou par lots de 1000 pour être gentil avec la RAM)
+            BATCH_SIZE = 5000
+            total_inserted = 0
+            
+            # On doit insérer et récupérer les IDs pour FAISS
+            # Astuce: SQLite autoincrement est prévisible si on insère séquentiellement
+            # Mais executemany ne rend pas les IDs.
+            # Solution: On insère, puis on récupère les IDs des fichiers concernés.
+            
+            # Pour faire simple et robuste : boucle d'insertion par fichier ou par petits lots ?
+            # Non, executemany est le plus rapide.
+            
+            cursor.executemany('''
+                INSERT INTO chunks (file_id, chunk_index, start_line, end_line, 
+                                 content, ast_type, parent_context, content_hash, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', sql_data)
+            conn.commit()
+            
+            # Récupérer les IDs générés (C'est là que c'est tricky pour mapper Vecteur <-> ID)
+            # On va supposer que l'ordre d'insertion est respecté (c'est le cas avec SQLite)
+            # On récupère les IDs des derniers N chunks insérés
+            inserted_count = len(sql_data)
+            cursor.execute("SELECT id FROM chunks ORDER BY id DESC LIMIT ?", (inserted_count,))
+            # Les IDs reviennent en ordre DESC, on les inverse
+            ids_reversed = [r[0] for r in cursor.fetchall()]
+            chunk_ids = list(reversed(ids_reversed))
+            
+            if len(chunk_ids) != len(chunk_vectors):
+                log.error(f"Mismatch IDs/Vectors: {len(chunk_ids)} vs {len(chunk_vectors)}")
+                # Fallback critique ou gestion d'erreur
+            else:
+                # Mise à jour FAISS
+                if faiss_index is None: init_db()
+                
+                vectors_matrix = np.vstack(chunk_vectors).astype('float32')
+                ids_array = np.array(chunk_ids, dtype='int64')
+                
+                if isinstance(faiss_index, faiss.IndexIDMap):
+                    faiss_index.add_with_ids(vectors_matrix, ids_array)
+                else:
+                    faiss_index.add(vectors_matrix)
+                    # Update mapping manuel pour IndexFlatL2
+                    start_idx = faiss_index.ntotal - len(chunk_ids)
+                    for i, real_id in enumerate(chunk_ids):
+                        id_mapping[start_idx + i] = real_id
+                
+                _save_faiss_index()
+                
+            return f"Indexation Turbo terminée. {total_files} fichiers, {len(sql_data)} chunks."
+            
+        finally:
+            conn.close()
+
+    # --- STRATÉGIE SÉQUENTIELLE (< 100 fichiers ou fallback) ---
+    else:
+        count = 0
+        errors = 0
+        total_chunks = 0
+        
+        for i, file_path in enumerate(files_to_index):
+            try:
+                rel_path = os.path.relpath(file_path, root_path)
+                with open(file_path, 'rb') as f: file_content = f.read()
+                checksum = hashlib.sha256(file_content).hexdigest()
+                file_id = _get_or_create_file_id(rel_path, checksum)
+                _delete_file_chunks(file_id, save_immediately=False)
+                
+                is_python = file_path.lower().endswith('.py')
+                if use_semantic_chunking and is_python and chunker and chunker.parser:
+                    chunks = chunker.chunk_file(file_path)
+                else:
+                    content = file_content.decode('utf-8', errors='ignore')
+                    if len(content) < 10: continue
+                    chunks = [{
+                        'content': f"Fichier: {os.path.basename(file_path)}\n{content}",
+                        'start_line': 1,
+                        'end_line': len(content.split('\n')),
+                        'ast_type': 'text_block',
+                        'parent_context': f"Fichier: {os.path.basename(file_path)}",
+                        'raw_content': content
+                    }]
+                
+                if chunks:
+                    added = _add_chunks_batch(file_id, chunks, save_immediately=False)
+                    total_chunks += added
+                count += 1
+                if progress_callback and i % 5 == 0:
+                    progress_callback(f"Indexation: {rel_path} ({i}/{total})")
+            except Exception as e:
+                errors += 1
+                log.warning(f"Erreur {file_path}: {e}")
+        
+        _save_faiss_index()
+        return f"Indexation terminée. {count} fichiers, {total_chunks} chunks."
 
 @trace_action(source="database")
 def delete_local_db():
