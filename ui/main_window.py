@@ -93,6 +93,7 @@ class GeminiApp:
         # Déclencher le préchauffage au démarrage (au lieu d'attendre le focus)
         # 100ms après l'init pour laisser l'UI se charger
         self.root.after(100, self._prewarm_context_intelligent)
+        self._prewarm_triggered = True  # Marquer comme déclenché pour éviter le doublon au focus
 
     @trace_action(source="main_window")
     def _setup_layout(self):
@@ -735,181 +736,83 @@ class GeminiApp:
                     self._log_chat(None, content, "gemini", thought_content=thought)
                 
                 elif msg_type == 'ui_stream_start':
-                    # Réinitialiser les buffers pour le nouveau stream
+                    # Réinitialiser les buffers et les références de widgets pour le nouveau stream
                     self._stream_prefix_added = False
                     self.is_streaming = True
-                    self._stream_buffer = ""  # Buffer pour accumuler la réponse finale
-                    self._thinking_buffer = ""  # Buffer pour accumuler les thinking
-                    self._current_stream_textbox = None  # Pas de textbox pendant le stream
+                    self._stream_buffer = ""
+                    self._thinking_buffer = ""
+                    self._current_thinking_widget = None
+                    self._current_response_container = None
+                    self._current_response_textbox = None
                 
                 elif msg_type == 'ui_stream_thinking':
-                    # Accumuler les thinking séparément
-                    if not hasattr(self, '_thinking_buffer'):
-                        self._thinking_buffer = ""
                     text = res['text'].replace('\\n\\n', '\n\n').replace('\\n', '\n')
                     self._thinking_buffer += text
-                    log.info(f"🔵 THINKING accumulé: {len(text)} chars, total: {len(self._thinking_buffer)} chars")
+                    
+                    # Créer ou mettre à jour le widget de pensée en temps réel
+                    if not hasattr(self, '_current_thinking_widget') or self._current_thinking_widget is None:
+                        self._current_thinking_widget = ThinkingWidget(self.chat1_widgets_container)
+                        self._current_thinking_widget.pack(fill="x", padx=0, pady=1)
+                        self._current_thinking_widget.toggle() # Déplier pendant qu'il pense
+                    
+                    self._current_thinking_widget.append_to_last_block(text)
+                    self._scroll_to_bottom(self.chat1_scroll)
                 
                 elif msg_type == 'ui_stream_chunk':
-                    # Accumuler le contenu de la réponse finale dans le buffer (ne pas afficher pendant le stream)
-                    # Initialiser le buffer s'il n'existe pas (défense contre les messages hors ordre)
-                    if not hasattr(self, '_stream_buffer'):
-                        log.warning("⚠️ ui_stream_chunk reçu avant ui_stream_start, initialisation du buffer")
-                        self._stream_buffer = ""
+                    text = res.get('text', '')
+                    if not text: return
                     
-                    try:
-                        text = res.get('text', '')
-                        if not text:
-                            log.warning(f"⚠️ ui_stream_chunk reçu avec texte vide: {res}")
-                            return
-                        
-                        text = text.replace('\\n\\n', '\n\n').replace('\\n', '\n')
-                        self._stream_buffer += text
-                        log.info(f"🟢 CONTENU accumulé: {len(text)} chars, total: {len(self._stream_buffer)} chars")
-                    except Exception as e:
-                        log.error(f"❌ Erreur traitement ui_stream_chunk: {e}", exc_info=True)
+                    text = text.replace('\\n\\n', '\n\n').replace('\\n', '\n')
+                    self._stream_buffer += text
+                    
+                    # Créer ou mettre à jour le container de réponse en temps réel
+                    if not hasattr(self, '_current_response_container') or self._current_response_container is None:
+                        self._current_response_container = ResponseContainer(self.chat1_widgets_container)
+                        self._current_response_container.pack(fill="x", expand=False, padx=0, pady=1)
+                        self._current_response_textbox = self._current_response_container.add_textbox("", "gemini")
+                    
+                    # Mettre à jour la textbox de streaming (en mode texte brut pour la performance)
+                    self._current_response_textbox.configure(state="normal")
+                    self._current_response_textbox.insert("end", text)
+                    self._current_response_textbox.configure(state="disabled")
+                    self._adjust_textbox_height(self._current_response_textbox)
+                    self._scroll_to_bottom(self.chat1_scroll)
                 
                 elif msg_type == 'ui_stream_end':
-                    self._stop_animation() 
-                    # Réinitialiser le flag pour le prochain stream
-                    self._stream_prefix_added = False
+                    self._stop_animation()
                     self.is_streaming = False
                     
-                    # Afficher le thinking séparément si présent (détecté nativement via champ 'thought')
-                    # IMPORTANT: Ne créer le ThinkingWidget que si _thinking_buffer contient vraiment du contenu
-                    thinking_buffer_content = getattr(self, '_thinking_buffer', None)
-                    if thinking_buffer_content and thinking_buffer_content.strip():
-                        try:
-                            thinking_content = thinking_buffer_content.replace('\\n\\n', '\n\n').replace('\\n', '\n')
-                            log.info(f"🔵 Displaying thinking widget: {len(thinking_content)} chars")
-                            thinking_widget = ThinkingWidget(
-                                self.chat1_widgets_container,
-                                content=thinking_content
-                            )
-                            # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
-                            thinking_widget.pack(fill="x", padx=0, pady=1)
-                            if hasattr(self, '_thinking_buffer'):
-                                del self._thinking_buffer
-                        except Exception as e:
-                            log.error(f"Erreur affichage thinking: {e}", exc_info=True)
-                            if hasattr(self, '_thinking_buffer'):
-                                del self._thinking_buffer
-                    elif hasattr(self, '_thinking_buffer'):
-                        # Buffer vide ou None, nettoyer
-                        log.debug("Thinking buffer is empty, skipping thinking widget")
-                        del self._thinking_buffer
+                    # 1. Finaliser le thinking (le replier si configuré, ou laisser tel quel)
+                    if hasattr(self, '_current_thinking_widget') and self._current_thinking_widget:
+                        # Optionnel : self._current_thinking_widget.toggle() pour le fermer à la fin
+                        self._current_thinking_widget = None
+
+                    # 2. Convertir la réponse en Markdown si nécessaire
+                    # On fait confiance au buffer accumulé via ui_stream_chunk (séparation stricte côté worker)
+                    full_text = self._stream_buffer
                     
-                    # Traiter la réponse finale (sans thinking, déjà séparé)
-                    # IMPORTANT: Vérifier que _stream_buffer contient bien du contenu (pas vide)
-                    stream_buffer_content = getattr(self, '_stream_buffer', None)
-                    
-                    # DEBUG: Log le contenu du buffer avant traitement
-                    log.info(f"🔍 DEBUG ui_stream_end: stream_buffer_content type={type(stream_buffer_content)}, length={len(stream_buffer_content) if stream_buffer_content else 0}, preview={str(stream_buffer_content)[:200] if stream_buffer_content else 'None'}")
-                    
-                    if stream_buffer_content and stream_buffer_content.strip():
-                        try:
-                            # Nettoyer le buffer
-                            streamed_text = stream_buffer_content.replace('\\n\\n', '\n\n').replace('\\n', '\n')
-                            
-                            # CRITIQUE: Le thinking a déjà été séparé dans _thinking_buffer et affiché séparément
-                            # Le streamed_text ne devrait contenir QUE la réponse finale, pas de thinking
-                            # Mais on vérifie quand même pour filtrer les pensées qui pourraient s'y être glissées
-                            # IMPORTANT: Ne PAS utiliser _is_thinking_content() directement car elle peut être trop agressive
-                            # et supprimer toute la réponse si elle commence par un pattern de thinking
-                            
-                            # Utiliser _group_thinking_and_response pour séparer proprement thinking et réponse
-                            thinking_content_filtered, response_parts = _group_thinking_and_response(streamed_text)
-                            
-                            if thinking_content_filtered:
-                                # Reconstruire streamed_text sans les pensées (filtrer tous les types sauf thinking)
-                                filtered_parts = [p[1] for p in response_parts if p[0] != 'thinking']
-                                if filtered_parts:
-                                    streamed_text = "\n\n".join(filtered_parts)
-                                    log.info(f"🔵 Pensées filtrées du streamed_text ({len(thinking_content_filtered)} chars), réponse restante: {len(streamed_text)} chars")
-                                else:
-                                    # Si après filtrage il ne reste rien, c'est que tout était du thinking
-                                    streamed_text = ""
-                                    log.info(f"🔵 Streamed text contient uniquement du thinking, filtré de la réponse")
-                            elif response_parts:
-                                # S'il y a des response_parts mais pas de thinking_content_filtered,
-                                # reconstruire quand même pour être sûr (au cas où _parse_mixed_content a mal classé)
-                                filtered_parts = [p[1] for p in response_parts if p[0] != 'thinking']
-                                if filtered_parts:
-                                    streamed_text = "\n\n".join(filtered_parts)
-                            # Si pas de response_parts, garder streamed_text tel quel (c'est probablement de la réponse pure)
-                            
-                            if not streamed_text or not streamed_text.strip():
-                                log.info(f"ℹ️ Streamed text vide après filtrage des pensées - réponse finale vide")
-                                # Nettoyer le buffer et sortir
-                                if hasattr(self, '_stream_buffer'):
-                                    del self._stream_buffer
-                                return
-                            
-                            log.info(f"🟢 Displaying response container: {len(streamed_text)} chars, preview: {streamed_text[:200]}")
-                            
-                            # IMPORTANT: Le thinking a déjà été séparé et filtré, donc on ne doit PAS utiliser _parse_mixed_content
-                            # qui pourrait détecter incorrectement le texte comme du thinking.
-                            # On parse seulement pour détecter Markdown vs texte simple.
-                            
-                            # Vérifier si c'est du Markdown
-                            is_markdown = _is_markdown_content(streamed_text)
-                            log.info(f"📝 Markdown détecté: {is_markdown}")
-                            
-                            # Créer le ResponseContainer pour la réponse finale
-                            # Pas de hauteur limitée, affichage en grand, scrollbar masquée
-                            response_container = ResponseContainer(self.chat1_widgets_container)
-                            # Utiliser fill="x" et expand=False pour éviter l'expansion verticale inutile
-                            # pady=1 pour un léger espacement entre les box (scaled automatiquement par CustomTkinter)
-                            response_container.pack(fill="x", expand=False, padx=0, pady=1)
-                            
-                            if is_markdown:
-                                # Ajouter un widget Markdown
-                                response_container.add_markdown_widget(
-                                    content=streamed_text,
+                    if full_text.strip():
+                        if _is_markdown_content(full_text):
+                            # Si c'est du Markdown, on remplace la textbox de stream par le viewer HTML
+                            if hasattr(self, '_current_response_container') and self._current_response_container:
+                                # Supprimer la textbox temporaire
+                                if self._current_response_textbox:
+                                    self._current_response_textbox.destroy()
+                                    self._current_response_textbox = None
+                                
+                                # Ajouter le widget Markdown final
+                                self._current_response_container.add_markdown_widget(
+                                    content=full_text,
                                     is_markdown=True,
                                     on_open_in_tab=self._open_markdown_in_tab
                                 )
-                            else:
-                                # Ajouter une textbox pour le texte simple
-                                textbox = response_container.add_textbox(streamed_text, "gemini")
-                                self._configure_chat_tags(textbox)
-                            
-                            # Nettoyer le buffer
-                            if hasattr(self, '_stream_buffer'):
-                                del self._stream_buffer
-                        except Exception as e:
-                            log.error(f"Erreur traitement stream: {e}", exc_info=True)
-                            # En cas d'erreur, afficher le contenu brut
-                            if hasattr(self, '_stream_buffer') and self._stream_buffer:
-                                textbox = self._create_message_textbox(self.chat1_widgets_container, "gemini", self._stream_buffer)
-                                textbox.configure(state="normal")
-                                textbox.insert("1.0", f"🤖 {self._stream_buffer}", "gemini")
-                                textbox.configure(state="disabled")
-                                # Ajuster la hauteur après insertion du texte
-                                self.root.after(10, lambda: self._adjust_textbox_height(textbox))
-                                del self._stream_buffer
-                    elif hasattr(self, '_stream_buffer'):
-                        # Buffer vide ou None, mais log pour debug
-                        log.warning(f"⚠️ Stream buffer is empty at ui_stream_end. Content was: {repr(stream_buffer_content)}")
-                        # Vérifier s'il y a du thinking mais pas de réponse finale
-                        thinking_content = getattr(self, '_thinking_buffer', None)
-                        if thinking_content and thinking_content.strip():
-                            log.info(f"ℹ️ Thinking présent ({len(thinking_content)} chars) mais pas de réponse finale - c'est normal si l'IA n'a généré que des pensées")
-                        del self._stream_buffer
-                    else:
-                        # Buffer n'existe même pas - problème d'initialisation
-                        log.error("❌ _stream_buffer n'existe pas à ui_stream_end - ui_stream_start n'a peut-être pas été reçu")
                     
-                    # Scroll vers le bas
-                    def scroll_to_bottom():
-                        try:
-                            if hasattr(self.chat1_scroll, '_parent_canvas'):
-                                canvas = self.chat1_scroll._parent_canvas
-                                canvas.update_idletasks()
-                                canvas.yview_moveto(1.0)
-                        except:
-                            pass
-                    self.chat1_scroll.after(100, scroll_to_bottom)
+                    # Nettoyage
+                    self._current_response_container = None
+                    self._current_response_textbox = None
+                    self._stream_buffer = ""
+                    self._thinking_buffer = ""
+                    self._scroll_to_bottom(self.chat1_scroll)
                     
                 elif msg_type == 'ui_update':
                     if res.get('widget') == 'status': self.status_var.set(res['text'])
@@ -938,6 +841,16 @@ class GeminiApp:
         except queue.Empty: pass
         finally:
             self.root.after(100, self.check_result_queue)
+
+    def _scroll_to_bottom(self, scroll_container):
+        """Scroll vers le bas du container spécifié."""
+        try:
+            if hasattr(scroll_container, '_parent_canvas'):
+                canvas = scroll_container._parent_canvas
+                canvas.update_idletasks()
+                canvas.yview_moveto(1.0)
+        except Exception as e:
+            log.debug(f"Erreur scroll: {e}")
 
     def _handle_asr_done(self, res):
         self.input_txt.insert("end", res['text'] + " ")

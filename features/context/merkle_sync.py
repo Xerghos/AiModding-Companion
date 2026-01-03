@@ -398,11 +398,9 @@ class MerkleTreeSync:
 
 # Variables globales pour le cache partagé
 _merkle_tree_cache = None
-_merkle_tree_root_node = None  # Cache du root_node construit
 _merkle_tree_lock = threading.Lock()
 _merkle_tree_timestamp = 0
-_merkle_tree_hash = None  # Hash du projet pour validation
-_MERKLE_TREE_CACHE_TTL = 10  # 10 secondes de cache
+_MERKLE_TREE_CACHE_TTL = 60  # 60 secondes de cache (augmenté pour réduire scan disque)
 
 @trace_action(source="merkle_sync")
 def get_ready_merkle_tree(root_path: str, project_hash: str = None, force_rebuild: bool = False) -> Tuple[MerkleTreeSync, MerkleNode]:

@@ -147,6 +147,7 @@ def show_messagebox(title, message, icon="info", parent=None, **kwargs):
     ctk_icon = icon_map.get(icon, "info")
     
     # Pour les questions (askyesno), utiliser option_1 et option_2
+    # NOTE: CTkMessagebox n'accepte pas le paramètre 'parent', on l'ignore
     if icon == "question":
         result = CTkMessagebox(
             title=title,
@@ -154,7 +155,6 @@ def show_messagebox(title, message, icon="info", parent=None, **kwargs):
             icon=ctk_icon,
             option_1="Oui",
             option_2="Non",
-            parent=parent,
             **kwargs
         )
         # CTkMessagebox retourne "Oui" ou "Non", convertir en booléen
@@ -165,7 +165,6 @@ def show_messagebox(title, message, icon="info", parent=None, **kwargs):
             title=title,
             message=message,
             icon=ctk_icon,
-            parent=parent,
             **kwargs
         )
         return None
@@ -1028,6 +1027,26 @@ class ThinkingWidget(ctk.CTkFrame):
             # Recalculer la hauteur après insertion
             self.after(10, lambda: self._adjust_thinking_textbox_height())
     
+    def append_to_last_block(self, text):
+        """Ajoute du texte au dernier bloc de thinking (pour le streaming)."""
+        if not text:
+            return
+            
+        if not self.thinking_blocks:
+            self.thinking_blocks.append("")
+        
+        self.thinking_blocks[-1] += text
+        self.content = "\n\n---\n\n".join(self.thinking_blocks)
+        
+        self.thinking_textbox.configure(state="normal")
+        self.thinking_textbox.insert("end", text)
+        self.thinking_textbox.configure(state="disabled")
+        self.thinking_textbox.see("end")
+        
+        # Ajuster la hauteur périodiquement (pas à chaque caractère pour perfs)
+        if len(text) > 10 or text.endswith('\n'):
+            self._adjust_thinking_textbox_height()
+
     def _adjust_thinking_textbox_height(self):
         """Ajuste la hauteur de la textbox thinking pour qu'elle corresponde exactement au contenu."""
         try:

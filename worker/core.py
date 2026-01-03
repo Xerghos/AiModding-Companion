@@ -1016,7 +1016,7 @@ class Worker(threading.Thread):
                                 self.response_queue.put({'type': 'ui_stream_thinking', 'text': txt})
                             else:
                                 log.info(f"🟢 Routing content chunk: {len(txt)} chars, is_thinking={is_thinking}")
-                            self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
+                                self.response_queue.put({'type': 'ui_stream_chunk', 'text': txt})
                 except StopIteration:
                     # Itérateur terminé normalement
                     pass

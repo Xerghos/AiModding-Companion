@@ -294,31 +294,44 @@ def init_db(db_path_base=None):
             if chunks_count > 0 or knowledge_count > 0:
                 log.info(f"🔄 Reconstruction index FAISS depuis DB ({chunks_count} chunks, {knowledge_count} knowledge)...")
                 
-                # Reconstruire depuis chunks
+                # Collecter tous les vecteurs et IDs avant d'ajouter en batch (optimisation)
+                all_vectors = []
+                all_ids = []
+                
+                # Reconstruire depuis chunks (collecter pour batch)
                 if chunks_count > 0:
                     cursor.execute("SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL")
                     for chunk_id, embedding_blob in cursor.fetchall():
                         if embedding_blob:
                             vector = np.frombuffer(embedding_blob, dtype='float32')
                             if len(vector) == EMBEDDING_DIM:
-                                faiss_index.add_with_ids(
-                                    np.array([vector], dtype='float32'),
-                                    np.array([chunk_id], dtype='int64')
-                                )
+                                all_vectors.append(vector)
+                                all_ids.append(chunk_id)
                                 id_mapping[chunk_id] = chunk_id
                 
-                # Reconstruire depuis knowledge (legacy)
+                # Reconstruire depuis knowledge (legacy, collecter pour batch)
                 if knowledge_count > 0:
                     cursor.execute("SELECT id, embedding FROM knowledge WHERE embedding IS NOT NULL")
                     for know_id, embedding_blob in cursor.fetchall():
                         if embedding_blob:
                             vector = np.frombuffer(embedding_blob, dtype='float32')
                             if len(vector) == EMBEDDING_DIM:
-                                faiss_index.add_with_ids(
-                                    np.array([vector], dtype='float32'),
-                                    np.array([know_id], dtype='int64')
-                                )
+                                all_vectors.append(vector)
+                                all_ids.append(know_id)
                                 id_mapping[know_id] = know_id
+                
+                # Ajouter tous les vecteurs en batch (beaucoup plus rapide qu'un par un)
+                if all_vectors:
+                    vectors_matrix = np.vstack(all_vectors).astype('float32')
+                    ids_array = np.array(all_ids, dtype='int64')
+                    if isinstance(faiss_index, faiss.IndexIDMap):
+                        faiss_index.add_with_ids(vectors_matrix, ids_array)
+                    else:
+                        # Fallback si pas IndexIDMap (ne devrait pas arriver)
+                        for vector, vec_id in zip(all_vectors, all_ids):
+                            faiss_index.add(np.array([vector], dtype='float32'))
+                            faiss_id = faiss_index.ntotal - 1
+                            id_mapping[faiss_id] = vec_id
                 
                 # Sauvegarder l'index reconstruit
                 if faiss_index.ntotal > 0:
@@ -743,8 +756,44 @@ def _get_or_create_file_id(file_path: str, checksum: str, db_path_base=None) -> 
 
 
 @trace_action(source="database")
-def _add_chunk_to_db(file_id: int, chunk_index: int, chunk_data: Dict, db_path_base=None) -> Optional[int]:
-    """Ajoute un chunk à la base de données et retourne son ID."""
+def _save_faiss_index(db_path_base=None):
+    """Sauvegarde l'index FAISS sur disque.
+    
+    Args:
+        db_path_base: Chemin de base de la DB (optionnel)
+    
+    Returns:
+        True si sauvegarde réussie, False sinon
+    """
+    global faiss_index, id_mapping
+    
+    if faiss_index is None or faiss_index.ntotal == 0:
+        return False
+    
+    try:
+        sqlite_path, index_path, map_path = _get_paths(db_path_base)
+        faiss.write_index(faiss_index, index_path)
+        if not isinstance(faiss_index, faiss.IndexIDMap):
+            with open(map_path, 'wb') as f:
+                pickle.dump(id_mapping, f)
+        log.debug(f"Index FAISS sauvegardé : {faiss_index.ntotal} vecteurs")
+        return True
+    except Exception as e:
+        log.error(f"Erreur sauvegarde index FAISS: {e}")
+        return False
+
+
+@trace_action(source="database")
+def _add_chunk_to_db(file_id: int, chunk_index: int, chunk_data: Dict, db_path_base=None, save_immediately=False) -> Optional[int]:
+    """Ajoute un chunk à la base de données et retourne son ID.
+    
+    Args:
+        file_id: ID du fichier
+        chunk_index: Index du chunk dans le fichier
+        chunk_data: Données du chunk
+        db_path_base: Chemin de base de la DB
+        save_immediately: Si True, sauvegarde l'index immédiatement (par défaut False pour optimiser)
+    """
     global faiss_index, id_mapping
     
     _ensure_libs()
@@ -800,11 +849,9 @@ def _add_chunk_to_db(file_id: int, chunk_index: int, chunk_data: Dict, db_path_b
                 faiss_id = faiss_index.ntotal - 1
                 id_mapping[faiss_id] = chunk_id
             
-            # Sauvegarder index
-            faiss.write_index(faiss_index, index_path)
-            if not isinstance(faiss_index, faiss.IndexIDMap):
-                with open(map_path, 'wb') as f:
-                    pickle.dump(id_mapping, f)
+            # Sauvegarder index uniquement si demandé (pour optimiser les batch)
+            if save_immediately:
+                _save_faiss_index(db_path_base)
             
             return chunk_id
             
@@ -817,8 +864,131 @@ def _add_chunk_to_db(file_id: int, chunk_index: int, chunk_data: Dict, db_path_b
 
 
 @trace_action(source="database")
-def _delete_file_chunks(file_id: int, db_path_base=None):
-    """Supprime tous les chunks d'un fichier."""
+def _add_chunks_batch(file_id: int, chunks_data: List[Dict], db_path_base=None, save_immediately=False) -> int:
+    """Ajoute plusieurs chunks à la base de données en batch (optimisé).
+    
+    Cette fonction optimise l'indexation en traitant tous les chunks d'un fichier
+    en une seule opération : batch encoding, batch SQL insertion, batch FAISS addition.
+    
+    Args:
+        file_id: ID du fichier
+        chunks_data: Liste de dictionnaires contenant les données de chaque chunk
+        db_path_base: Chemin de base de la DB
+        save_immediately: Si True, sauvegarde l'index immédiatement (par défaut False)
+    
+    Returns:
+        Nombre de chunks ajoutés avec succès
+    """
+    global faiss_index, id_mapping
+    
+    if not chunks_data:
+        return 0
+    
+    _ensure_libs()
+    sqlite_path, index_path, map_path = _get_paths(db_path_base)
+    
+    # Filtrer les chunks vides
+    valid_chunks = []
+    for idx, chunk_data in enumerate(chunks_data):
+        content = chunk_data.get('content', '')
+        if content and content.strip():
+            valid_chunks.append((idx, chunk_data))
+    
+    if not valid_chunks:
+        return 0
+    
+    try:
+        # 1. Batch encoding : Encoder tous les chunks en une seule fois (10-100x plus rapide)
+        contents = [chunk_data.get('content', '') for _, chunk_data in valid_chunks]
+        vectors = model.encode(contents, show_progress_bar=False, convert_to_numpy=True)
+        
+        # Préparer les données pour l'insertion SQL
+        sql_data = []
+        for (chunk_idx, chunk_data), vector in zip(valid_chunks, vectors):
+            blob_embedding = vector.tobytes()
+            content_hash = hashlib.sha256(chunk_data.get('content', '').encode('utf-8')).hexdigest()
+            sql_data.append((
+                file_id,
+                chunk_idx,
+                chunk_data.get('start_line'),
+                chunk_data.get('end_line'),
+                chunk_data.get('content', ''),
+                chunk_data.get('ast_type'),
+                chunk_data.get('parent_context'),
+                content_hash,
+                blob_embedding
+            ))
+        
+        conn = sqlite3.connect(sqlite_path)
+        cursor = conn.cursor()
+        
+        try:
+            # 2. Batch SQL insertion : Insérer tous les chunks dans une transaction
+            cursor.executemany('''
+                INSERT INTO chunks (file_id, chunk_index, start_line, end_line, 
+                                 content, ast_type, parent_context, content_hash, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', sql_data)
+            
+            # Récupérer les IDs générés (nécessaire pour FAISS)
+            # SQLite ne retourne pas automatiquement les IDs avec executemany,
+            # donc on récupère les IDs basés sur file_id et chunk_index dans l'ordre
+            cursor.execute("SELECT id FROM chunks WHERE file_id=? ORDER BY chunk_index ASC", (file_id,))
+            chunk_ids = [row[0] for row in cursor.fetchall()]
+            
+            # Filtrer pour ne garder que les IDs des chunks qu'on vient d'insérer
+            # (on prend les N derniers IDs correspondant au nombre de chunks insérés)
+            if len(chunk_ids) >= len(valid_chunks):
+                chunk_ids = chunk_ids[-len(valid_chunks):]
+            
+            conn.commit()
+            
+            # 3. Ajouter au index FAISS en batch
+            if faiss_index is None:
+                init_db(db_path_base)
+            
+            # Utiliser add_with_ids pour IndexIDMap (tous les vecteurs en une fois)
+            if isinstance(faiss_index, faiss.IndexIDMap) and len(chunk_ids) == len(vectors):
+                faiss_index.add_with_ids(
+                    vectors.astype('float32'),
+                    np.array(chunk_ids, dtype='int64')
+                )
+            else:
+                # Fallback si pas IndexIDMap ou si nombre d'IDs ne correspond pas
+                for vector, chunk_id in zip(vectors, chunk_ids):
+                    if isinstance(faiss_index, faiss.IndexIDMap):
+                        faiss_index.add_with_ids(
+                            np.array([vector], dtype='float32'),
+                            np.array([chunk_id], dtype='int64')
+                        )
+                    else:
+                        faiss_index.add(np.array([vector], dtype='float32'))
+                        faiss_id = faiss_index.ntotal - 1
+                        id_mapping[faiss_id] = chunk_id
+            
+            # Sauvegarder index uniquement si demandé
+            if save_immediately:
+                _save_faiss_index(db_path_base)
+            
+            return len(valid_chunks)
+            
+        finally:
+            conn.close()
+            
+    except Exception as e:
+        log.error(f"Erreur ajout batch chunks: {e}", exc_info=True)
+        return 0
+
+
+@trace_action(source="database")
+def _delete_file_chunks(file_id: int, db_path_base=None, save_immediately=False):
+    """Supprime tous les chunks d'un fichier.
+    
+    Args:
+        file_id: ID du fichier
+        db_path_base: Chemin de base de la DB
+        save_immediately: Si True, sauvegarde l'index immédiatement (par défaut False pour optimiser)
+    """
     global faiss_index, id_mapping
     
     sqlite_path, index_path, map_path = _get_paths(db_path_base)
@@ -834,7 +1004,9 @@ def _delete_file_chunks(file_id: int, db_path_base=None):
         # Supprimer de FAISS si IndexIDMap
         if chunk_ids and isinstance(faiss_index, faiss.IndexIDMap):
             faiss_index.remove_ids(np.array(chunk_ids, dtype='int64'))
-            faiss.write_index(faiss_index, index_path)
+            # Sauvegarder index uniquement si demandé (pour optimiser les batch)
+            if save_immediately:
+                _save_faiss_index(db_path_base)
         
         # Supprimer de SQLite (CASCADE supprimera automatiquement)
         cursor.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
@@ -858,6 +1030,9 @@ def index_project_files(root_path, progress_callback=None, use_semantic_chunking
         use_semantic_chunking: Si True, utilise le chunking sémantique Tree-sitter
     """
     from .code_chunker import get_chunker
+    
+    # Initialiser la DB au début pour éviter les initialisations multiples
+    init_db()
     
     count = 0
     errors = 0
@@ -919,8 +1094,8 @@ def index_project_files(root_path, progress_callback=None, use_semantic_chunking
             # Récupérer ou créer l'ID du fichier
             file_id = _get_or_create_file_id(rel_path, checksum)
             
-            # Supprimer les anciens chunks de ce fichier
-            _delete_file_chunks(file_id)
+            # Supprimer les anciens chunks de ce fichier (sans sauvegarde immédiate)
+            _delete_file_chunks(file_id, save_immediately=False)
             
             # Chunking sémantique pour Python, fallback pour autres
             is_python = file_path.lower().endswith('.py')
@@ -973,11 +1148,10 @@ def index_project_files(root_path, progress_callback=None, use_semantic_chunking
                     log.warning(f"Erreur chunking basique {file_path}: {e}")
                     continue
             
-            # Ajouter les chunks à la base
-            for chunk_idx, chunk_data in enumerate(chunks):
-                chunk_id = _add_chunk_to_db(file_id, chunk_idx, chunk_data)
-                if chunk_id:
-                    total_chunks += 1
+            # Ajouter les chunks à la base en batch (optimisé)
+            if chunks:
+                added_count = _add_chunks_batch(file_id, chunks, save_immediately=False)
+                total_chunks += added_count
             
             count += 1
                 
@@ -987,7 +1161,11 @@ def index_project_files(root_path, progress_callback=None, use_semantic_chunking
         except Exception as e:
             errors += 1
             log.warning(f"⚠️ Échec indexation {os.path.basename(file_path)}: {e}")
-            
+    
+    # Sauvegarder l'index FAISS une seule fois à la fin de l'indexation complète
+    # Ceci évite des milliers d'écritures d'index pendant l'indexation
+    _save_faiss_index()
+    
     return f"Indexation terminée. {count} fichiers indexés, {total_chunks} chunks créés, {errors} erreurs."
 
 @trace_action(source="database")
@@ -1060,6 +1238,9 @@ def sync_incremental(root_path: str, progress_callback=None, state_file: str = N
     """
     from .merkle_sync import MerkleTreeSync
     
+    # Initialiser la DB au début
+    init_db()
+    
     if state_file is None:
         state_file = get_path("db/merkle_state.json")
     
@@ -1104,8 +1285,8 @@ def sync_incremental(root_path: str, progress_callback=None, state_file: str = N
             # Récupérer ou créer l'ID du fichier
             file_id = _get_or_create_file_id(rel_path, checksum)
             
-            # Supprimer les anciens chunks
-            _delete_file_chunks(file_id)
+            # Supprimer les anciens chunks (sans sauvegarde immédiate)
+            _delete_file_chunks(file_id, save_immediately=False)
             
             # Chunking et indexation (utiliser la même logique que index_project_files)
             from .code_chunker import get_chunker
@@ -1130,9 +1311,9 @@ def sync_incremental(root_path: str, progress_callback=None, state_file: str = N
                     'raw_content': content
                 }]
             
-            # Ajouter les chunks
-            for chunk_idx, chunk_data in enumerate(chunks):
-                _add_chunk_to_db(file_id, chunk_idx, chunk_data)
+            # Ajouter les chunks en batch (optimisé)
+            if chunks:
+                _add_chunks_batch(file_id, chunks, save_immediately=False)
             
             count += 1
             
@@ -1142,6 +1323,9 @@ def sync_incremental(root_path: str, progress_callback=None, state_file: str = N
         except Exception as e:
             errors += 1
             log.warning(f"⚠️ Échec sync {os.path.basename(file_path)}: {e}")
+    
+    # Sauvegarder l'index FAISS une seule fois à la fin
+    _save_faiss_index()
     
     # Sauvegarder le nouvel état
     current_tree.save_state(state_file)
