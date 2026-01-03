@@ -88,7 +88,7 @@ class KeyCaptureDialog(BaseWindow):
         if event.state & 131072: parts.append("Alt")
         if event.state & 1: parts.append("Shift")
         parts.append(event.keysym)
-        final = f"<{'-'.join(parts)}>")
+        final = f"<{'-'.join(parts)}>"
         self.lbl_current.configure(text=final)
         self.after(300, lambda: self._confirm(final))
 
@@ -204,7 +204,7 @@ class PathListEditor(ctk.CTkFrame):
         for p in paths:
             try:
                 # Tenter de rendre relatif
-                rel = os.path.relpath(p, cwd).replace("\", "/")
+                rel = os.path.relpath(p, cwd).replace("\\", "/")
                 if not rel.startswith(".."):
                     val = rel
                 else:

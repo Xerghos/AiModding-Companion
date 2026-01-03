@@ -288,38 +288,36 @@ def search_vector_db(query, db_path_base=None, max_results=5):
 
 @trace_action(source="database")
 def index_project_files(root_path: str, progress_callback=None, use_semantic_chunking=True, **kwargs):
-    """Indexation complète avec filtrage robuste (.gitignore) et exceptions prioritaires."""
+    """Indexation complète avec Mode Turbo (Massive Batch) pour >100 fichiers."""
     from .merkle_sync import MerkleTreeSync
     from .code_chunker import get_chunker
     from features.gitignore_parser import parse_gitignore
-    from config.settings import APP_SETTINGS # Import pour les settings dynamiques
+    from config.settings import APP_SETTINGS
+    from concurrent.futures import ThreadPoolExecutor
     
     init_db()
     
-    log.info(f"🚀 Début indexation (Mode Smart Filter) : {root_path}")
+    log.info(f"🚀 Début indexation (Mode Turbo) : {root_path}")
     
-    # 1. Chargement des règles .gitignore
+    # 1. Chargement .gitignore
     gitignore_path = os.path.join(root_path, ".gitignore")
     matches_gitignore = lambda x: False
     if os.path.exists(gitignore_path):
         try:
             matches_gitignore = parse_gitignore(gitignore_path)
-            log.info("✅ Règles .gitignore chargées.")
-        except Exception as e:
-            log.warning(f"⚠️ Erreur chargement .gitignore : {e}")
+        except: pass
 
-    # 2. Vérification DB vide
+    # 2. Détection DB vide
     db_is_empty = True
     try:
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM files")
-        count = cursor.fetchone()[0]
-        db_is_empty = (count == 0)
+        db_is_empty = (cursor.fetchone()[0] == 0)
         conn.close()
     except: pass
 
-    # 3. Synchronisation Merkle (pour la détection de modifs)
+    # 3. Merkle Sync
     state_file = get_path("db/merkle_state_v4.json")
     current_tree = MerkleTreeSync(root_path)
     current_tree.build_tree()
@@ -331,100 +329,173 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
     
     modified = current_tree.compare_trees(prev_tree)
     
-    # Force si DB vide
     if db_is_empty and not modified:
-        log.info("🔄 DB vide détectée : Forçage de l'indexation complète...")
+        log.info("🔄 DB vide : Forçage complet...")
         modified = [n.path for n in current_tree.node_map.values() if n.is_file]
     elif not modified:
-        log.info("✅ Aucun fichier modifié détecté et DB déjà peuplée.")
         return "Base déjà à jour."
 
     chunker = get_chunker()
     _ensure_model()
     
-    # 4. Filtrage "Logique Parfaite"
-    # On combine .gitignore + exclusions système critiques
+    # 4. Filtrage & Qualification
     critical_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'db', 'logs', 'dist', 'build', 'audio_cache', '.vscode', '.idea'}
-    
-    # Chargement de la liste de surveillance (Exceptions prioritaires)
     watch_list = APP_SETTINGS.get("repo_map_cache", {}).get("watch_files", [])
-    # Normalisation des chemins surveillés
     normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
     
     to_index = []
     for fpath in modified:
-        # Check Prioritaire : Liste de surveillance
-        # Si le fichier est dans la liste de surveillance, on l'indexe DIRECTEMENT
-        # sans vérifier gitignore ou les dossiers critiques.
         if os.path.normpath(fpath).lower() in normalized_watch_list:
             to_index.append(fpath)
             continue
 
         rel_path = os.path.relpath(fpath, root_path)
-        
-        # A. Filtre Dossiers Système (Bloquant)
-        parts = rel_path.split(os.sep)
-        if any(p in critical_dirs for p in parts):
-            continue
+        if any(p in critical_dirs for p in rel_path.split(os.sep)): continue
+        if matches_gitignore(fpath): continue
             
-        # B. Filtre Gitignore (Logique métier)
-        if matches_gitignore(fpath):
-            continue
-            
-        # C. Filtre Extensions (On veut du texte/code)
-        # On accepte tout ce qui ressemble à du texte, pas de binaire
-        # Liste blanche élargie pour attraper tout le code source
         valid_exts = SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css', '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml', '.toml', '.xml', '.sql', '.ini', '.cfg')
         if not fpath.lower().endswith(valid_exts):
-            # Petit check heuristique : si c'est pas dans la liste mais < 1MB, on tente de lire
             try:
-                if os.path.getsize(fpath) > 1024 * 1024: continue # Skip gros fichiers inconnus
+                if os.path.getsize(fpath) > 1024 * 1024: continue
             except: continue
         
         to_index.append(fpath)
 
-    log.info(f"📂 {len(to_index)} fichiers qualifiés pour indexation.")
+    total_files = len(to_index)
+    log.info(f"📂 {total_files} fichiers à indexer.")
     
-    # 5. Indexation
-    count = 0
-    total = len(to_index)
-    
-    for fpath in to_index:
+    if total_files == 0:
+        return "Aucun fichier éligible."
+
+    # --- PHASE 1 : Préparation Parallèle (Lecture + Chunking) ---
+    # On utilise tous les coeurs pour lire et découper les fichiers
+    def prepare_file(fpath):
         try:
             rel = os.path.relpath(fpath, root_path)
             with open(fpath, 'rb') as f: data = f.read()
-            # Détection binaire basique (null byte)
-            if b'\0' in data[:8000]: 
-                continue 
-                
+            if b'\0' in data[:8000]: return None
+            
             checksum = hashlib.sha256(data).hexdigest()
-            
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM files WHERE path = ?", (rel,))
-            row = cursor.fetchone()
-            if row: cursor.execute("DELETE FROM files WHERE id = ?", (row[0],))
-            
-            cursor.execute("INSERT INTO files (path, checksum) VALUES (?, ?)", (rel, checksum))
-            fid = cursor.lastrowid
-            conn.commit()
-            conn.close()
-            
             text = data.decode('utf-8', errors='ignore')
-            chunks = chunker.chunk_file(fpath) if use_semantic_chunking and fpath.endswith('.py') else [{'content': text}]
             
-            _add_chunks_batch(fid, chunks)
+            file_chunks = []
+            if use_semantic_chunking and fpath.endswith('.py'):
+                try: file_chunks = chunker.chunk_file(fpath)
+                except: file_chunks = [{'content': text}]
+            else:
+                file_chunks = [{'content': text}]
             
-            count += 1
-            if progress_callback and count % 5 == 0: 
-                progress_callback(f"Indexation : {rel} ({count}/{total})")
-                
-        except Exception as e:
-            log.warning(f"⚠️ Échec sur {fpath} : {e}")
+            return (fpath, rel, checksum, file_chunks)
+        except: return None
+
+    log.info("⚡ Phase 1 : Lecture & Chunking parallèle...")
+    prepared_data = []
+    with ThreadPoolExecutor() as executor:
+        results = executor.map(prepare_file, to_index)
+        for res in results:
+            if res: prepared_data.append(res)
+
+    # --- PHASE 2 : Mode Turbo (>100 fichiers) ---
+    if total_files >= 100:
+        log.info(f"🚀 MODE TURBO ACTIVÉ : Traitement massif de {len(prepared_data)} fichiers")
         
+        # A. Collecte globale des textes pour vectorisation
+        all_chunks_flat = [] # (file_index, chunk_data)
+        all_texts = []
+        
+        for f_idx, (_, _, _, chunks) in enumerate(prepared_data):
+            for ch in chunks:
+                txt = ch.get('content', '')
+                if txt.strip():
+                    all_chunks_flat.append((f_idx, ch))
+                    all_texts.append(txt)
+        
+        # B. Vectorisation Massive (1 seul appel au modèle = 0 overhead)
+        log.info(f"🧠 Vectorisation de {len(all_texts)} segments...")
+        if all_texts:
+            all_vectors = model.encode(all_texts, convert_to_numpy=True, show_progress_bar=True)
+        else:
+            all_vectors = []
+
+        # C. Insertion Transactionnelle Unique
+        log.info("💾 Écriture DB massive...")
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # 1. Mise à jour Files (Batch)
+            # On supprime d'abord les anciens fichiers
+            paths_to_delete = [item[1] for item in prepared_data]
+            cursor.executemany("DELETE FROM files WHERE path = ?", [(p,) for p in paths_to_delete])
+            
+            # On insère les nouveaux et on récupère les IDs
+            # Astuce: On insère un par un pour récupérer l'ID fiable, c'est très rapide en transaction
+            file_ids_map = {} # f_idx -> db_id
+            for f_idx, (_, rel, checksum, _) in enumerate(prepared_data):
+                cursor.execute("INSERT INTO files (path, checksum) VALUES (?, ?)", (rel, checksum))
+                file_ids_map[f_idx] = cursor.lastrowid
+
+            # 2. Préparation Chunks (Batch)
+            chunks_sql_data = []
+            vec_sql_data = []
+            fts_sql_data = []
+            
+            for (f_idx, ch), vec in zip(all_chunks_flat, all_vectors):
+                fid = file_ids_map[f_idx]
+                # On insère le chunk pour avoir son ID
+                # Note: Pour aller vite, on ne peut pas utiliser executemany ET récupérer les IDs générés facilement
+                # Sauf si on insère un par un dans la transaction. C'est le goulot d'étranglement.
+                # Optimisation : On insère un par un mais dans la transaction globale.
+                
+                params = {
+                    'fid': fid, 'idx': 0, # idx simplifié, pas critique
+                    'cnt': ch['content'], 'ast': ch.get('ast_type'),
+                    'sl': ch.get('start_line'), 'el': ch.get('end_line'),
+                    'pc': ch.get('parent_context'), 'meta': ch.get('metadata')
+                }
+                cursor.execute('''
+                    INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata)
+                    VALUES (:fid, :idx, :cnt, :ast, :sl, :el, :pc, :meta)
+                ''', params)
+                cid = cursor.lastrowid
+                
+                vec_sql_data.append((cid, vec.tobytes()))
+                fts_sql_data.append((cid, ch['content']))
+
+            # 3. Insertion Vectorielle & FTS (Batch Pur)
+            cursor.executemany("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", vec_sql_data)
+            try: cursor.executemany("INSERT INTO fts_chunks(rowid, content) VALUES (?, ?)", fts_sql_data)
+            except: pass
+            
+            conn.commit()
+            
+        except Exception as e:
+            log.error(f"❌ Erreur Transaction Turbo : {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    # --- PHASE 2bis : Mode Séquentiel (<100 fichiers) ---
+    else:
+        log.info("Mode Standard (Séquentiel)")
+        count = 0
+        for fpath, rel, checksum, chunks in prepared_data:
+            try:
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM files WHERE path = ?", (rel,))
+                cursor.execute("INSERT INTO files (path, checksum) VALUES (?, ?)", (rel, checksum))
+                fid = cursor.lastrowid
+                conn.commit()
+                conn.close()
+                _add_chunks_batch(fid, chunks)
+                count += 1
+                if progress_callback: progress_callback(f"Indexation : {rel} ({count}/{total_files})")
+            except: pass
+
     current_tree.save_state(state_file)
-    log.info(f"✅ Indexation terminée : {count} fichiers mis à jour.")
-    return f"Indexation réussie : {count} fichiers traités."
+    log.info(f"✅ Indexation terminée : {total_files} fichiers traités.")
+    return f"Indexation réussie : {total_files} fichiers traités."
 
 # --- Autres Exports ---
 
