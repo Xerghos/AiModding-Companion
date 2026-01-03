@@ -2,6 +2,7 @@ import logging
 import datetime
 import os
 import json
+import threading
 from pathlib import Path
 import google.generativeai as genai
 from google.generativeai import caching
@@ -23,6 +24,12 @@ class MultiModelCacheManager:
         self.ttl_minutes = 60
         # Liste des modèles pour lesquels le cache est impossible (Quota 0 ou erreur)
         self.blacklisted_models = set()
+        
+        # Cache arborescence avec hash Merkle
+        self._tree_cache = None
+        self._tree_hash = None
+        self._tree_lock = threading.Lock()  # Thread-safe pour tree cache
+        self._components_lock = threading.Lock()  # Thread-safe pour components
 
     @trace_action(source="CacheManager")
     def prepare_content(self):
@@ -34,93 +41,106 @@ class MultiModelCacheManager:
         
         # 1. ARBORESCENCE (COMPLÈTE - Toutes les infos essentielles pour DeepSeek)
         try:
-            # Arborescence complète : pas de limite de profondeur, tous les fichiers affichés
-            # Ignore seulement les dossiers vraiment inutiles (cache, dépendances, système, logs, backups)
-            tree = self._get_complete_tree(os.getcwd(), ignore_dirs={
-                '.git', '__pycache__', 'venv', 'env', 'node_modules', '.vs', '.vscode', '.idea', '.cursor',
-                'logs', 'backups', 'audio_cache'
-            })
-            self.components['tree'] = f"--- ARBORESCENCE PROJET ---\n{tree}"
-            log.info(f"✅ Arborescence générée: {len(tree)} caractères")
+            with self._tree_lock:
+                # Vérifier si le cache est valide
+                project_hash = self._get_project_hash()
+                if self._tree_cache and self._tree_hash == project_hash:
+                    with self._components_lock:
+                        self.components['tree'] = self._tree_cache
+                    log.debug("✅ Arborescence récupérée depuis le cache")
+                else:
+                    # Générer l'arborescence
+                    tree = self._get_complete_tree(os.getcwd(), ignore_dirs={
+                        '.git', '__pycache__', 'venv', 'env', 'node_modules', '.vs', '.vscode', '.idea', '.cursor',
+                        'logs', 'backups', 'audio_cache'
+                    })
+                    tree_str = f"--- ARBORESCENCE PROJET ---\n{tree}"
+                    self._tree_cache = tree_str
+                    self._tree_hash = project_hash
+                    with self._components_lock:
+                        self.components['tree'] = tree_str
+                    log.info(f"✅ Arborescence générée: {len(tree)} caractères")
         except Exception as e: 
             log.warning(f"Erreur Tree: {e}")
-            self.components['tree'] = ""
+            with self._components_lock:
+                self.components['tree'] = ""
 
-        # 2. ARCHITECTURE MAP (Lourd & Stable) - CONDENSÉE pour payload
-        try:
-            arch_path = get_path("config/architecture_map.json")
-            if os.path.exists(arch_path):
-                with open(arch_path, 'r', encoding='utf-8') as f:
-                    arch_data = json.load(f)
-                    # Condensation intelligente pour réduire la taille du payload
-                    condensed_arch = self._condense_architecture_map(arch_data)
-                    # Minification + Tri pour stabilité binaire parfaite
-                    arch_str = json.dumps(condensed_arch, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-                    self.components['arch'] = f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_str}"
-                    log.info(f"✅ Architecture Map chargée: {len(arch_str)} caractères")
-            else:
+        with self._components_lock:
+            # 2. ARCHITECTURE MAP (Lourd & Stable) - CONDENSÉE pour payload
+            try:
+                arch_path = get_path("config/architecture_map.json")
+                if os.path.exists(arch_path):
+                    with open(arch_path, 'r', encoding='utf-8') as f:
+                        arch_data = json.load(f)
+                        # Condensation intelligente pour réduire la taille du payload
+                        condensed_arch = self._condense_architecture_map(arch_data)
+                        # Minification + Tri pour stabilité binaire parfaite
+                        arch_str = json.dumps(condensed_arch, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+                        self.components['arch'] = f"--- CARTOGRAPHIE TECHNIQUE ---\n{arch_str}"
+                        log.info(f"✅ Architecture Map chargée: {len(arch_str)} caractères")
+                else:
+                    self.components['arch'] = ""
+                    log.info("ℹ️ Architecture Map non trouvée (config/architecture_map.json)")
+            except Exception as e:
+                log.warning(f"Erreur Architecture: {e}")
                 self.components['arch'] = ""
-                log.info("ℹ️ Architecture Map non trouvée (config/architecture_map.json)")
-        except Exception as e:
-            log.warning(f"Erreur Architecture: {e}")
-            self.components['arch'] = ""
 
-        # 3. REPO MAP (Structure du Projet) - Utilise le cache persistant
-        try:
-            from features.context.repo_map import get_cached_repo_map
-            from config import APP_SETTINGS
-            
-            # Récupérer le chemin de la base de données RAG
-            db_path = APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid")
-            if not os.path.isabs(db_path):
-                db_path = get_path(db_path)
-            
-            # get_cached_repo_map() utilise le cache persistant et lance la régénération en arrière-plan si nécessaire
-            repo_map = get_cached_repo_map(db_path_base=db_path, max_chars=None)
-            if repo_map:
-                self.components['repo_map'] = f"--- 🗺️ REPO MAP (Structure du Projet) ---\n{repo_map}"
-                log.info(f"✅ Repo Map générée: {len(repo_map)} caractères")
-            else:
+            # 3. REPO MAP (Structure du Projet) - Utilise le cache persistant
+            try:
+                from features.context.repo_map import get_cached_repo_map
+                from config import APP_SETTINGS
+                
+                # Récupérer le chemin de la base de données RAG
+                db_path = APP_SETTINGS.get("system_settings", {}).get("rag_database_path", "db/knowledge_base_hybrid")
+                if not os.path.isabs(db_path):
+                    db_path = get_path(db_path)
+                
+                # get_cached_repo_map() utilise le cache persistant et lance la régénération en arrière-plan si nécessaire
+                repo_map = get_cached_repo_map(db_path_base=db_path, max_chars=None)
+                if repo_map:
+                    self.components['repo_map'] = f"--- 🗺️ REPO MAP (Structure du Projet) ---\n{repo_map}"
+                    log.info(f"✅ Repo Map générée: {len(repo_map)} caractères")
+                else:
+                    self.components['repo_map'] = ""
+                    log.info("ℹ️ Repo Map vide")
+            except Exception as e:
+                log.warning(f"Erreur Repo Map: {e}")
                 self.components['repo_map'] = ""
-                log.info("ℹ️ Repo Map vide")
-        except Exception as e:
-            log.warning(f"Erreur Repo Map: {e}")
-            self.components['repo_map'] = ""
-        
-        # Log de comparaison repo_map vs arch
-        repo_map_size = len(self.components.get('repo_map', ''))
-        arch_size = len(self.components.get('arch', ''))
-        if repo_map_size > 0:
-            log.info(f"📊 Utilisation Repo Map ({repo_map_size} chars) au lieu de Architecture Map ({arch_size} chars)")
-        elif arch_size > 0:
-            log.info(f"📊 Utilisation Architecture Map ({arch_size} chars) - Repo Map non disponible")
-        else:
-            log.info("⚠️ Ni Repo Map ni Architecture Map disponibles")
-
-        # 4. HISTORIQUE LTM (Variable)
-        try:
-            from features.SemanticMemory import GlobalMemoryManager
-            if GlobalMemoryManager:
-                # On récupère le bloc compressé (si dispo)
-                self.components['ltm'] = GlobalMemoryManager.get_compressed_history_block()
-                log.info(f"✅ LTM chargé: {len(self.components['ltm'])} caractères")
+            
+            # Log de comparaison repo_map vs arch
+            repo_map_size = len(self.components.get('repo_map', ''))
+            arch_size = len(self.components.get('arch', ''))
+            if repo_map_size > 0:
+                log.info(f"📊 Utilisation Repo Map ({repo_map_size} chars) au lieu de Architecture Map ({arch_size} chars)")
+            elif arch_size > 0:
+                log.info(f"📊 Utilisation Architecture Map ({arch_size} chars) - Repo Map non disponible")
             else:
+                log.info("⚠️ Ni Repo Map ni Architecture Map disponibles")
+
+            # 4. HISTORIQUE LTM (Variable)
+            try:
+                from features.SemanticMemory import GlobalMemoryManager
+                if GlobalMemoryManager:
+                    # On récupère le bloc compressé (si dispo)
+                    self.components['ltm'] = GlobalMemoryManager.get_compressed_history_block()
+                    log.info(f"✅ LTM chargé: {len(self.components['ltm'])} caractères")
+                else:
+                    self.components['ltm'] = ""
+                    log.info("ℹ️ LTM non disponible (GlobalMemoryManager non initialisé)")
+            except Exception as e:
+                log.warning(f"Erreur LTM: {e}")
                 self.components['ltm'] = ""
-                log.info("ℹ️ LTM non disponible (GlobalMemoryManager non initialisé)")
-        except Exception as e:
-            log.warning(f"Erreur LTM: {e}")
-            self.components['ltm'] = ""
 
-        # 5. DÉDUPLICATION INTER-SECTIONS (Conservative)
-        # Détecter et supprimer les signatures dupliquées entre Repo Map et LTM
-        try:
-            self._deduplicate_components()
-        except Exception as e:
-            log.warning(f"Erreur déduplication: {e}")
+            # 5. DÉDUPLICATION INTER-SECTIONS (Conservative)
+            # Détecter et supprimer les signatures dupliquées entre Repo Map et LTM
+            try:
+                self._deduplicate_components()
+            except Exception as e:
+                log.warning(f"Erreur déduplication: {e}")
 
-        # Assemblage pour retro-compatibilité (Gemini Cache unique)
-        parts = [self.components.get('tree'), self.components.get('arch'), self.components.get('ltm')]
-        self.content_payload = "\n\n".join([p for p in parts if p])
+            # Assemblage pour retro-compatibilité (Gemini Cache unique)
+            parts = [self.components.get('tree'), self.components.get('arch'), self.components.get('ltm')]
+            self.content_payload = "\n\n".join([p for p in parts if p])
 
     def _get_optimized_tree(self, root_path, max_depth=3, ignore_dirs=None):
         """Génère une vue arborescente compacte et nettoyée."""
@@ -278,6 +298,76 @@ class MultiModelCacheManager:
         )
                     
         return "\n".join(lines)
+
+    def _get_project_hash(self):
+        """Calcule le hash du projet pour invalidation du cache."""
+        from features.context.merkle_sync import MerkleTreeSync
+        from features.Documentation import calculate_file_hash
+        from config.settings import APP_SETTINGS
+        import hashlib
+        
+        hasher = hashlib.sha256()
+        
+        # Utiliser la même logique que Repo Map pour cohérence
+        cache_config = APP_SETTINGS.get("repo_map_cache", {})
+        watch_dirs = cache_config.get("watch_directories", ["features/", "ai_core/", "worker/"])
+        watch_files = cache_config.get("watch_files", ["config/architecture_map.json"])
+        
+        # Utiliser MerkleTreeSync pour chaque dossier surveillé
+        for dir_path in watch_dirs:
+            abs_dir = get_path(dir_path) if not os.path.isabs(dir_path) else dir_path
+            if os.path.exists(abs_dir):
+                try:
+                    merkle = MerkleTreeSync(abs_dir)
+                    root = merkle.build_tree()
+                    if root and root.hash:
+                        hasher.update(root.hash.encode())
+                except Exception as e:
+                    log.debug(f"Erreur hash projet {dir_path}: {e}")
+        
+        # Ajouter les fichiers surveillés individuellement
+        for file_path in watch_files:
+            abs_file = get_path(file_path) if not os.path.isabs(file_path) else file_path
+            if os.path.exists(abs_file):
+                file_hash = calculate_file_hash(abs_file)
+                if file_hash:
+                    hasher.update(file_hash.encode())
+        
+        return hasher.hexdigest()
+
+    def prepare_tree_only(self):
+        """Prépare uniquement l'arborescence avec cache Merkle."""
+        with self._tree_lock:
+            try:
+                # Calculer le hash du projet (comme Repo Map)
+                project_hash = self._get_project_hash()
+                
+                # Vérifier si le cache est valide
+                if self._tree_cache and self._tree_hash == project_hash:
+                    log.debug("✅ Arborescence récupérée depuis le cache")
+                    with self._components_lock:
+                        self.components['tree'] = self._tree_cache
+                    return
+                
+                # Générer l'arborescence
+                tree = self._get_complete_tree(os.getcwd(), ignore_dirs={
+                    '.git', '__pycache__', 'venv', 'env', 'node_modules', 
+                    '.vs', '.vscode', '.idea', '.cursor',
+                    'logs', 'backups', 'audio_cache'
+                })
+                tree_str = f"--- ARBORESCENCE PROJET ---\n{tree}"
+                
+                # Mettre en cache
+                self._tree_cache = tree_str
+                self._tree_hash = project_hash
+                with self._components_lock:
+                    self.components['tree'] = tree_str
+                
+                log.info(f"✅ Arborescence préchauffée: {len(tree)} caractères")
+            except Exception as e:
+                log.warning(f"Erreur préchauffage tree: {e}")
+                with self._components_lock:
+                    self.components['tree'] = ""
 
     def _condense_architecture_map(self, arch_data):
         """

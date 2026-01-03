@@ -17,6 +17,9 @@ from features.Decorators import trace_action
 
 log = get_logger("features.context.database")
 
+# Lock pour protéger l'initialisation thread-safe de SentenceTransformer
+_ensure_libs_lock = threading.Lock()
+
 # --- Constantes ---
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
@@ -47,14 +50,29 @@ def _get_paths(db_path_base=None):
 @trace_action(source="database")
 def _ensure_libs():
     global faiss, SentenceTransformer, model
-    if faiss is None:
-        import faiss as f
-        faiss = f
-    if SentenceTransformer is None:
-        from sentence_transformers import SentenceTransformer as ST
-        SentenceTransformer = ST
-        log.info(f"Chargement modèle Embedding: {EMBEDDING_MODEL_NAME}...")
-        model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    # Vérifier d'abord si déjà initialisé (évite le lock si possible)
+    if faiss is not None and SentenceTransformer is not None and model is not None:
+        return
+    
+    # Protection thread-safe pour éviter les chargements simultanés
+    with _ensure_libs_lock:
+        # Double-check après avoir acquis le lock
+        if faiss is None:
+            import faiss as f
+            faiss = f
+        if SentenceTransformer is None:
+            from sentence_transformers import SentenceTransformer as ST
+            SentenceTransformer = ST
+        if model is None:
+            log.info(f"Chargement modèle Embedding: {EMBEDDING_MODEL_NAME}...")
+            try:
+                model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+                log.info(f"✅ Modèle Embedding chargé: {EMBEDDING_MODEL_NAME}")
+            except Exception as e:
+                log.error(f"❌ Erreur chargement SentenceTransformer: {e}")
+                # Réinitialiser pour permettre une nouvelle tentative
+                model = None
+                raise
 
 @trace_action(source="database")
 def init_db(db_path_base=None):
