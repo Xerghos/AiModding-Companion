@@ -3,9 +3,13 @@ Module d'initialisation hardware pour AiModding-Companion.
 Optimise l'environnement pour le GPU AMD Radeon (DirectML).
 """
 import sys
+import os
 import warnings
 
-# 1. Filtre global d'avertissements pour les messages système non critiques
+# 1. Optimisations Hugging Face
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
+# 2. Filtre global d'avertissements
 warnings.filterwarnings("ignore", message=".*Triton.*")
 warnings.filterwarnings("ignore", message=".*DirectML.*")
 

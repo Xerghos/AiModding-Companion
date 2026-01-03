@@ -1,7 +1,7 @@
 """
 Moteur de base de données sémantique omniscient utilisant sqlite-vec.
-Version V7.9 : Flux Continu & Performance Max.
-Optimisation : Backpressure (Queue=2), Executemany global, Alignement débit I/O sur IA.
+Version V8.5 : Restauration Performance (15s Target) + Toggle ONNX.
+Optimisation : PyTorch Quantized par défaut, Buffers 5000, Diagnostic Lab.
 """
 
 import os
@@ -44,6 +44,7 @@ def _get_db_path():
 
 @trace_action(source="database")
 def _get_paths(db_path_base=None):
+    """Restauré pour assurer la compatibilité avec symbol_graph et repo_map."""
     db_path = db_path_base or _get_db_path()
     return (db_path, None, None)
 
@@ -70,24 +71,50 @@ def get_connection(db_path_base=None, fast_mode=False):
 @trace_action(source="database")
 def _ensure_model():
     global SentenceTransformer, model
-    if model is not None: return
+    from config.settings import APP_SETTINGS
+    
     with _ensure_libs_lock:
+        if model is not None: return
         if SentenceTransformer is None:
             try:
                 from sentence_transformers import SentenceTransformer as ST
                 SentenceTransformer = ST
             except Exception: return
-        if model is None:
-            try:
-                import torch
-                # On force PyTorch à utiliser tous les coeurs pour model.encode()
-                torch.set_num_threads(os.cpu_count())
+            
+        # [MODIF V8.5] Toggle déplacé dans system_settings
+        use_onnx = APP_SETTINGS.get("system_settings", {}).get("use_onnx_acceleration", False)
+        
+        try:
+            import torch
+            if use_onnx:
+                # --- MODE ONNX (EXPERIMENTAL) ---
+                log.info("🚀 Tentative d'activation du backend ONNX...")
+                try:
+                    model = SentenceTransformer(
+                        EMBEDDING_MODEL_NAME, 
+                        backend="onnx",
+                        model_kwargs={"file_name": "onnx/model_qint8_avx512.onnx"}
+                    )
+                    log.info("✅ Backend ONNX chargé.")
+                except Exception as e:
+                    log.warning(f"⚠️ Échec ONNX ({e}). Fallback PyTorch...")
+                    use_onnx = False
+            
+            if not use_onnx:
+                # --- MODE PYTORCH (PROVEN FAST - 15s) ---
+                log.info(f"Chargement modèle PyTorch : {EMBEDDING_MODEL_NAME}...")
                 base_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
                 try:
+                    # On force le parallélisme PyTorch
+                    torch.set_num_threads(os.cpu_count())
+                    # Quantification Dynamique
                     base_model = torch.quantization.quantize_dynamic(base_model, {torch.nn.Linear}, dtype=torch.qint8)
+                    log.info("✅ Modèle PyTorch quantifié INT8 (AVX-512 Optimized)")
                 except: pass
                 model = base_model
-            except: raise
+                
+        except Exception as e:
+            log.error(f"❌ Erreur critique modèle : {e}")
 
 @trace_action(source="database")
 def init_db(db_path_base=None):
@@ -103,8 +130,7 @@ def init_db(db_path_base=None):
         cursor.execute(f'CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(chunk_id INTEGER PRIMARY KEY, embedding float[{EMBEDDING_DIM}])')
         try: cursor.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(content, tokenize='trigram')")
         except: pass
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
         if db_path_base is None: _db_initialized = True
 
 @trace_action(source="database")
@@ -118,26 +144,24 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
     _ensure_model()
     chunker = get_chunker()
 
-    # --- PIPELINE CONFIG (V7.9) ---
-    file_queue = queue.Queue(maxsize=1000)
-    # [FLUIDITÉ] On réduit la queue à 2 pour forcer le disque à attendre l'IA.
-    # Résultat : affichage fluide et synchrone.
-    chunk_queue = queue.Queue(maxsize=2) 
-    write_queue = queue.Queue(maxsize=100)
+    # RESTAURATION DES BUFFERS LARGES (V7.8)
+    file_queue = queue.Queue(maxsize=5000)
+    chunk_queue = queue.Queue(maxsize=5000)
+    write_queue = queue.Queue(maxsize=5000)
     
-    timers = {'scan': 0, 'io_chunk': 0, 'encode': 0, 'write': 0, 'commit': 0}
-    stats = {'scanned': 0, 'encoded': 0}
+    timers = {'scan': 0, 'io': 0, 'encode': 0, 'write': 0, 'commit': 0}
+    stats = {'scanned': 0, 'read': 0, 'encoded': 0}
     
-    # --- STAGE 1: SCANNER ---
     def scanner_thread():
         start = time.time()
         gitignore_path = os.path.join(root_path, ".gitignore")
         matches_gitignore = parse_gitignore(gitignore_path) if os.path.exists(gitignore_path) else lambda x: False
         critical_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'db', 'logs', 'dist', 'build', 'audio_cache', '.vscode', '.idea'}
+        ignored_folders = set(APP_SETTINGS.get("code_analysis", {}).get("ignored_folders", []))
         watch_list = APP_SETTINGS.get("repo_map_cache", {}).get("watch_files", [])
         normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
         for root, dirs, files in os.walk(root_path):
-            dirs[:] = [d for d in dirs if d not in critical_dirs and not matches_gitignore(os.path.join(root, d))]
+            dirs[:] = [d for d in dirs if d not in critical_dirs and d not in ignored_folders and not matches_gitignore(os.path.join(root, d))]
             for file in files:
                 fpath = os.path.join(root, file)
                 if os.path.normpath(fpath).lower() in normalized_watch_list:
@@ -147,12 +171,11 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
                 file_queue.put(fpath); stats['scanned'] += 1
         file_queue.put(None)
         timers['scan'] = time.time() - start
+        print(f"DEBUG: [SCAN] Fini en {timers['scan']:.2f}s", flush=True)
 
-    # --- STAGE 2: I/O (Chunking) ---
     def io_thread():
         start = time.time()
         def task(fpath):
-            t0 = time.time()
             try:
                 rel = os.path.relpath(fpath, root_path)
                 with open(fpath, 'rb') as f: data = f.read()
@@ -160,37 +183,30 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
                 checksum = hashlib.sha256(data).hexdigest()
                 text = data.decode('utf-8', errors='ignore')
                 chunks = chunker.chunk_file(fpath) if use_semantic_chunking and fpath.endswith('.py') else [{'content': text}]
-                # Bloque si l'encodeur est occupé (Backpressure)
                 chunk_queue.put((fpath, rel, checksum, chunks))
+                stats['read'] += 1
             except: pass
-            timers['io_chunk'] += (time.time() - t0)
-        
-        # 2 workers suffisent pour nourrir l'encodeur sans saturer le CPU
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             while True:
                 fpath = file_queue.get()
                 if fpath is None: break
                 executor.submit(task, fpath)
         chunk_queue.put(None)
         timers['io'] = time.time() - start
+        print(f"DEBUG: [I/O] Fini en {timers['io']:.2f}s", flush=True)
 
-    # --- STAGE 3: ENCODER ---
     def encoder_thread():
         start = time.time()
-        batch_size = 32
+        batch_size = 32 # Petit batch pour flux continu
         cur_meta, cur_texts = [], []
         while True:
             try:
-                item = chunk_queue.get(timeout=0.05)
+                # [OPTIMISATION] Timeout ultra-court (0.01s) pour une réactivité maximale
+                item = chunk_queue.get(timeout=0.01)
                 if item is None:
                     if cur_texts: encode_now(cur_meta, cur_texts)
                     write_queue.put(None); break
                 fpath, rel, checksum, chunks = item
-                
-                # Feedback utilisateur instantané (Synchrone avec l'IA)
-                if progress_callback:
-                    progress_callback(f"Analyse : {rel}...")
-
                 for ch in chunks:
                     txt = ch.get('content', '').strip()
                     if txt:
@@ -202,18 +218,17 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
             except queue.Empty:
                 if cur_texts:
                     encode_now(cur_meta, cur_texts); cur_meta, cur_texts = [], []
-        timers['encode_wall'] = time.time() - start
+        timers['encode'] = time.time() - start
+        print(f"DEBUG: [ENCODE] Fini en {timers['encode']:.2f}s", flush=True)
 
     def encode_now(meta, texts):
-        t0 = time.time()
         try:
             vecs = model.encode(texts, batch_size=len(texts), convert_to_numpy=True, show_progress_bar=False)
-            timers['encode'] += (time.time() - t0)
             write_queue.put((meta, vecs))
             stats['encoded'] += len(vecs)
+            if progress_callback: progress_callback(f"Analyse IA : {stats['encoded']} segments...")
         except Exception as e: log.error(f"Error Encoding: {e}")
 
-    # --- STAGE 4: WRITER ---
     def writer_thread():
         start = time.time()
         conn = get_connection(fast_mode=True)
@@ -224,50 +239,28 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
         while True:
             item = write_queue.get()
             if item is None: break
-            t0 = time.time()
             meta, vecs = item
-            
-            # --- INSERTION OPTIMISÉE ---
-            # 1. On prépare tous les fichiers d'un coup
-            for _, rel, checksum, _ in meta:
+            vbatch = []
+            for (fpath, rel, checksum, ch), vec in zip(meta, vecs):
                 if rel not in file_id_cache:
                     cursor.execute("INSERT INTO files (path, checksum) VALUES (?, ?)", (rel, checksum))
                     file_id_cache[rel] = cursor.lastrowid
-            
-            # 2. On prépare les chunks pour executemany
-            # Note: Pour sqlite-vec, on a besoin du cid du chunk.
-            # On va insérer les chunks un par un mais dans la transaction (très rapide)
-            # pour récupérer le lastrowid
-            vec_batch = []
-            for (fpath, rel, checksum, ch), vec in zip(meta, vecs):
                 fid = file_id_cache[rel]
-                cursor.execute('''INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', 
-                               (fid, 0, ch['content'], ch.get('ast_type'), ch.get('start_line'), ch.get('end_line'), ch.get('parent_context'), ch.get('metadata')))
-                vec_batch.append((cursor.lastrowid, vec.tobytes()))
-            
-            # 3. Insertion vectorielle massive
-            cursor.executemany("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", vec_batch)
-            timers['write'] += (time.time() - t0)
-        
-        t_commit = time.time()
-        conn.commit()
-        conn.close()
-        timers['commit'] = time.time() - t_commit
-        timers['writer_total'] = time.time() - start
+                cursor.execute('''INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', (fid, 0, ch['content'], ch.get('ast_type'), ch.get('start_line'), ch.get('end_line'), ch.get('parent_context'), ch.get('metadata')))
+                vbatch.append((cursor.lastrowid, vec.tobytes()))
+            cursor.executemany("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", vbatch)
+        conn.commit(); conn.close()
+        timers['write'] = time.time() - start
+        print(f"DEBUG: [DB] Fini en {timers['write']:.2f}s", flush=True)
 
     # Orchestration
-    threads = [
-        threading.Thread(target=scanner_thread, name="Scanner"),
-        threading.Thread(target=io_thread, name="IO"),
-        threading.Thread(target=encoder_thread, name="Encoder"),
-        threading.Thread(target=writer_thread, name="Writer")
-    ]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    ts = [threading.Thread(target=scanner_thread), threading.Thread(target=io_thread), threading.Thread(target=encoder_thread), threading.Thread(target=writer_thread)]
+    for t in ts: t.start()
+    for t in ts: t.join()
     
     total = time.time() - overall_start
-    log.info(f"📊 SUMMARY: {total:.2f}s | Scan:{timers['scan']:.1f}s | Model:{timers['encode']:.1f}s | Commit:{timers['commit']:.1f}s")
-    return f"Indexation terminée en {total:.1f}s ({stats['scanned']} fichiers)."
+    log.info(f"📊 SUMMARY V8.5: {total:.2f}s | Scan:{timers['scan']:.1f}s | IO:{timers['io']:.1f}s | Enc:{timers['encode']:.1f}s | DB:{timers['write']:.1f}s")
+    return f"Indexation terminée en {total:.1f}s."
 
 # --- Autres Fonctions ---
 

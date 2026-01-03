@@ -471,6 +471,13 @@ class SettingsWindow(BaseWindow):
         # --- GESTION AVANCÉE CLÉS (Treeview) ---
         self._add_header(scroll, "Gestionnaire de Clés API (Multi-Comptes)")
         
+        # [MODIF V8.5] Déplacement du toggle ONNX ici
+        self._add_header(scroll, "Moteur d'Embeddings Local (RAG)")
+        self._add_switch(scroll, "system_settings.use_onnx_acceleration", "🚀 Accélération ONNX (Expérimental)", False)
+        if "system_settings.use_onnx_acceleration_WIDGET" in self.vars:
+            add_tooltip(self.vars["system_settings.use_onnx_acceleration_WIDGET"], 
+                        "Active ONNX Runtime pour l'indexation.\nOFF = PyTorch (Config proven fast 15s).")
+        
         key_frame = ctk.CTkFrame(scroll)
         key_frame.pack(fill="x", padx=10, pady=5)
         

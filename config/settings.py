@@ -88,6 +88,7 @@ DEFAULT_SETTINGS = {
         "backup_interval": 30,
         "max_backups": 10,
         "rag_enabled": True,
+        "use_onnx_acceleration": False,
         "rag_database_path": "db/knowledge_base_hybrid",
         "max_history_retention": 50
     },
