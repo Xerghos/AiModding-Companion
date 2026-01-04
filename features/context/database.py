@@ -68,6 +68,25 @@ def get_connection(db_path_base=None, fast_mode=False):
         cursor.execute("PRAGMA cache_size=100000;") 
     return conn
 
+def normalize_path(path):
+    """Normalisation absolue et minuscule pour comparaison robuste sur Windows."""
+    return os.path.abspath(os.path.normpath(path)).lower()
+
+def is_path_exception(path: str, normalized_watch_list: List[str]) -> Tuple[bool, bool]:
+    """
+    Vérifie si un chemin est une exception ou mène à une exception.
+    Retourne (est_inclus, doit_parcourir).
+    """
+    p = normalize_path(path)
+    for w in normalized_watch_list:
+        # Match exact ou enfant (Inclusion directe)
+        if p == w or p.startswith(w + os.sep):
+            return True, True
+        # Parent d'une exception (Doit entrer pour trouver l'enfant)
+        if w.startswith(p + os.sep):
+            return False, True
+    return False, False
+
 @trace_action(source="database")
 def _ensure_model():
     global SentenceTransformer, model
@@ -163,54 +182,27 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
         ignored_folders = set(APP_SETTINGS.get("code_analysis", {}).get("ignored_folders", []))
         
         watch_list = APP_SETTINGS.get("repo_map_cache", {}).get("watch_files", [])
-        normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
-
-        def is_path_exception(path):
-            """
-            DÉTECTION D'EXCEPTION PRIORITAIRE.
-            Retourne True si le chemin doit être parcouru/inclus malgré les exclusions.
-            """
-            p = os.path.normpath(path).lower()
-            for w in normalized_watch_list:
-                # 1. Le chemin est l'exception ou un enfant de l'exception (Inclusion)
-                if p == w or p.startswith(w + os.sep):
-                    return True
-                # 2. Le chemin est un PARENT d'une exception (Traversal forcé)
-                if w.startswith(p + os.sep):
-                    return True
-            return False
+        normalized_watch_list = [normalize_path(os.path.join(root_path, w)) for w in watch_list]
 
         for root, dirs, files in os.walk(root_path):
-            # LOGIQUE DE PRUNING (Dossiers)
-            # On ne retire un dossier que s'il n'est PAS une exception ET (critique OU ignoré OU gitignored)
+            root_abs = os.path.abspath(root)
             new_dirs = []
             for d in dirs:
-                dpath = os.path.join(root, d)
-                if is_path_exception(dpath):
-                    new_dirs.append(d) # Priorité Exception : On entre !
-                elif d in critical_dirs or d in ignored_folders or matches_gitignore(dpath):
-                    continue # Exclu et pas d'exception : On ignore.
-                else:
-                    new_dirs.append(d) # Chemin standard.
+                dpath = os.path.join(root_abs, d)
+                is_exc, should_walk = is_path_exception(dpath, normalized_watch_list)
+                if should_walk or (d not in critical_dirs and d not in ignored_folders and not matches_gitignore(dpath)):
+                    new_dirs.append(d)
             dirs[:] = new_dirs
             
             for file in files:
-                fpath = os.path.join(root, file)
-                
-                # 1. Check Exception (Priorité absolue)
-                # Note: On utilise startswith(w) sans os.sep car c'est un fichier
-                p_lower = fpath.lower()
-                is_exc = False
-                for w in normalized_watch_list:
-                    if p_lower == w or p_lower.startswith(w + os.sep):
-                        is_exc = True; break
+                fpath = os.path.join(root_abs, file)
+                is_exc, _ = is_path_exception(fpath, normalized_watch_list)
                 
                 if is_exc:
                     file_queue.put(fpath)
                     stats['scanned'] += 1
                     continue
                 
-                # 2. Filtres standards (Uniquement si pas une exception)
                 if matches_gitignore(fpath): continue
                 
                 valid_exts = SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css', '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml', '.toml', '.xml', '.sql', '.ini', '.cfg')
@@ -379,106 +371,148 @@ def delete_local_db():
 
 
 def calculate_indexing_stats(root_path: str, settings: dict) -> dict:
+
+
     """
+
+
     Calcule les statistiques d'indexation sans traiter les fichiers.
+
+
     Simule un scan os.walk complet en appliquant exactement la même logique que scanner_thread.
-    
-    Args:
-        root_path: Chemin racine du projet
-        settings: Dictionnaire de configuration (comme APP_SETTINGS)
-        
-    Returns:
-        Dictionnaire avec les clés:
-        - "included": Nombre de fichiers à indexer
-        - "excluded": Nombre de fichiers ignorés (gitignore + dossiers exclus)
-        - "bypassed": Nombre de fichiers dans la watchlist (exceptions prioritaires)
+
+
     """
+
+
     from features.gitignore_parser import parse_gitignore
+
+
     from config import SUPPORTED_FILE_EXTENSIONS
+
+
     
-    # Initialisation des compteurs
+
+
     stats = {"included": 0, "excluded": 0, "bypassed": 0}
+
+
+    if not os.path.exists(root_path): return stats
+
+
     
-    # Vérification que le chemin existe
-    if not os.path.exists(root_path):
-        return stats
-    
-    # Configuration des règles de filtrage (identique à scanner_thread)
+
+
     gitignore_path = os.path.join(root_path, ".gitignore")
+
+
     matches_gitignore = parse_gitignore(gitignore_path) if os.path.exists(gitignore_path) else lambda x: False
-    
-    # Dossiers critiques système
+
+
     critical_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'db', 'logs', 'dist', 'build', 'audio_cache', '.vscode', '.idea'}
-    
-    # Dossiers exclus depuis les paramètres
+
+
     ignored_folders = set(settings.get("code_analysis", {}).get("ignored_folders", []))
-    
-    # Watchlist (exceptions prioritaires)
+
+
     watch_list = settings.get("repo_map_cache", {}).get("watch_files", [])
-    normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
+
+
+    normalized_watch_list = [normalize_path(os.path.join(root_path, w)) for w in watch_list]
+
+
     
-    # Fonction is_path_exception IDENTIQUE à celle de scanner_thread
-    def is_path_exception(path):
-        """
-        DÉTECTION D'EXCEPTION PRIORITAIRE.
-        Retourne True si le chemin doit être parcouru/inclus malgré les exclusions.
-        """
-        p = os.path.normpath(path).lower()
-        for w in normalized_watch_list:
-            # 1. Le chemin est l'exception ou un enfant de l'exception (Inclusion)
-            if p == w or p.startswith(w + os.sep):
-                return True
-            # 2. Le chemin est un PARENT d'une exception (Traversal forcé)
-            if w.startswith(p + os.sep):
-                return True
-        return False
-    
-    # Extensions supportées
+
+
     supported_extensions = SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css',
+
+
                                                        '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp',
+
+
                                                        '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml',
+
+
                                                        '.toml', '.xml', '.sql', '.ini', '.cfg')
+
+
     
-    # Parcours récursif du dossier (LOGIQUE IDENTIQUE à scanner_thread)
+
+
     for root, dirs, files in os.walk(root_path):
-        # LOGIQUE DE PRUNING IDENTIQUE à scanner_thread
+
+
+        root_abs = os.path.abspath(root)
+
+
         new_dirs = []
+
+
         for d in dirs:
-            dpath = os.path.join(root, d)
-            if is_path_exception(dpath):
-                new_dirs.append(d)  # Priorité Exception : On entre !
-            elif d in critical_dirs or d in ignored_folders or matches_gitignore(dpath):
-                continue  # Exclu et pas d'exception : On ignore.
-            else:
-                new_dirs.append(d)  # Chemin standard.
+
+
+            dpath = os.path.join(root_abs, d)
+
+
+            is_exc, should_walk = is_path_exception(dpath, normalized_watch_list)
+
+
+            if should_walk or (d not in critical_dirs and d not in ignored_folders and not matches_gitignore(dpath)):
+
+
+                new_dirs.append(d)
+
+
         dirs[:] = new_dirs
+
+
         
+
+
         for file in files:
-            fpath = os.path.join(root, file)
-            fpath_normalized = os.path.normpath(fpath).lower()
+
+
+            fpath = os.path.join(root_abs, file)
+
+
+            is_exc, _ = is_path_exception(fpath, normalized_watch_list)
+
+
             
-            # 1. Check Exception (Priorité absolue) - LOGIQUE IDENTIQUE à scanner_thread
-            is_exc = False
-            for w in normalized_watch_list:
-                if fpath_normalized == w or fpath_normalized.startswith(w + os.sep):
-                    is_exc = True
-                    break
-            
+
+
             if is_exc:
+
+
                 stats["bypassed"] += 1
+
+
+                stats["included"] += 1 # Cumulatif : l'exception EST incluse
+
+
                 continue
+
+
             
-            # 2. Filtres standards (Uniquement si pas une exception)
-            if matches_gitignore(fpath):
+
+
+            if matches_gitignore(fpath) or not fpath.lower().endswith(supported_extensions):
+
+
                 stats["excluded"] += 1
+
+
                 continue
+
+
             
-            # 3. Vérification extension
-            if not fpath.lower().endswith(supported_extensions):
-                stats["excluded"] += 1
-                continue
-            
-            # Fichier à indexer
+
+
             stats["included"] += 1
+
+
     
+
+
     return stats
+
