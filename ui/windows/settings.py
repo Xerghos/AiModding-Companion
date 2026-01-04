@@ -219,6 +219,153 @@ class PathListEditor(ctk.CTkFrame):
     def get_data(self):
         return self.items
 
+
+class IndexingStatusWidget(ctk.CTkFrame):
+    """
+    Widget affichant les statistiques d'indexation en temps réel.
+    Affiche l'impact des règles d'exclusion et d'exception sur les fichiers du projet.
+    """
+    def __init__(self, master, root_path, settings):
+        super().__init__(master, fg_color="transparent")
+        self.root_path = root_path
+        self.settings = settings
+        
+        # Titre du widget
+        title_frame = ctk.CTkFrame(self, fg_color="transparent")
+        title_frame.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(
+            title_frame, 
+            text="📊 Statut d'Indexation Dynamique", 
+            font=("Arial", 12, "bold"),
+            text_color=COLORS["ACCENT"]
+        ).pack(side="left")
+        
+        # Bouton d'actualisation
+        self.refresh_btn = ctk.CTkButton(
+            title_frame,
+            text="🔄 Actualiser",
+            width=100,
+            command=self._refresh_stats,
+            fg_color=COLORS["BG_SECONDARY"]
+        )
+        self.refresh_btn.pack(side="right")
+        
+        # Frame pour les statistiques
+        self.stats_frame = ctk.CTkFrame(self, fg_color=COLORS["BG_WIDGET"])
+        self.stats_frame.pack(fill="x", pady=(0, 5))
+        
+        # Initialisation des labels (seront mis à jour après calcul)
+        self.included_label = ctk.CTkLabel(
+            self.stats_frame, 
+            text="📄 Chargement...", 
+            font=("Arial", 11),
+            text_color=COLORS["FG_SECONDARY"]
+        )
+        self.included_label.pack(side="left", padx=20, pady=10, expand=True)
+        
+        self.excluded_label = ctk.CTkLabel(
+            self.stats_frame, 
+            text="🚫 Chargement...", 
+            font=("Arial", 11),
+            text_color=COLORS["FG_SECONDARY"]
+        )
+        self.excluded_label.pack(side="left", padx=20, pady=10, expand=True)
+        
+        self.bypassed_label = ctk.CTkLabel(
+            self.stats_frame, 
+            text="🔓 Chargement...", 
+            font=("Arial", 11),
+            text_color=COLORS["FG_SECONDARY"]
+        )
+        self.bypassed_label.pack(side="left", padx=20, pady=10, expand=True)
+        
+        # Label d'état
+        self.status_label = ctk.CTkLabel(
+            self, 
+            text="Prêt", 
+            font=("Arial", 9),
+            text_color=COLORS["FG_SECONDARY"]
+        )
+        self.status_label.pack(anchor="e", pady=(0, 5))
+        
+        # Lancement du calcul initial
+        self.after(500, self._refresh_stats)
+    
+    def _refresh_stats(self):
+        """Lance le calcul des statistiques dans un thread séparé."""
+        import threading
+        from features.context.database import calculate_indexing_stats
+        
+        # Désactiver le bouton pendant le calcul
+        self.refresh_btn.configure(state="disabled", text="⏳ Calcul...")
+        self.status_label.configure(text="Scan en cours...", text_color=COLORS["INFO"])
+        
+        def calculate_thread():
+            try:
+                # Calcul des statistiques
+                stats = calculate_indexing_stats(self.root_path, self.settings)
+                
+                # Mise à jour de l'UI dans le thread principal
+                self.after(0, lambda: self._update_ui(stats))
+                
+            except Exception as e:
+                error_msg = f"Erreur: {str(e)[:50]}..."
+                self.after(0, lambda: self._show_error(error_msg))
+        
+        # Lancer le thread
+        thread = threading.Thread(target=calculate_thread, daemon=True)
+        thread.start()
+    
+    def _update_ui(self, stats):
+        """Met à jour l'interface avec les nouvelles statistiques."""
+        # Mettre à jour les labels avec les couleurs appropriées
+        self.included_label.configure(
+            text=f"📄 {stats['included']} fichiers à indexer",
+            text_color=COLORS["SUCCESS"]
+        )
+        
+        self.excluded_label.configure(
+            text=f"🚫 {stats['excluded']} fichiers ignorés",
+            text_color=COLORS["ERROR"]
+        )
+        
+        self.bypassed_label.configure(
+            text=f"🔓 {stats['bypassed']} exceptions (watchlist)",
+            text_color=COLORS["INFO"]
+        )
+        
+        # Réactiver le bouton
+        self.refresh_btn.configure(state="normal", text="🔄 Actualiser")
+        
+        # Mettre à jour le statut
+        total = stats['included'] + stats['excluded'] + stats['bypassed']
+        self.status_label.configure(
+            text=f"Scan terminé • {total} fichiers analysés",
+            text_color=COLORS["SUCCESS"]
+        )
+    
+    def _show_error(self, error_msg):
+        """Affiche une erreur dans l'interface."""
+        self.included_label.configure(
+            text="📄 Erreur",
+            text_color=COLORS["ERROR"]
+        )
+        self.excluded_label.configure(
+            text="🚫 Erreur",
+            text_color=COLORS["ERROR"]
+        )
+        self.bypassed_label.configure(
+            text="🔓 Erreur",
+            text_color=COLORS["ERROR"]
+        )
+        
+        self.refresh_btn.configure(state="normal", text="🔄 Actualiser")
+        self.status_label.configure(
+            text=error_msg,
+            text_color=COLORS["ERROR"]
+        )
+
 # --- FENÊTRE PRINCIPALE SETTINGS ---
 
 class SettingsWindow(BaseWindow):
@@ -1021,6 +1168,14 @@ class SettingsWindow(BaseWindow):
         self._add_header(scroll, "Analyse de Code & Sécurité")
         self._add_switch(scroll, "code_analysis.backup_before_refactor", "Backup Auto avant Refactoring", True)
         self._add_combo(scroll, "code_analysis.security_scan_level", "Niveau Scan Sécurité", ["standard", "high", "paranoid"], "standard")
+        
+        # --- Widget Statut d'Indexation Dynamique ---
+        self.indexing_widget = IndexingStatusWidget(
+            scroll,
+            root_path=os.getcwd(),
+            settings=self.settings
+        )
+        self.indexing_widget.pack(fill="x", padx=10, pady=(0, 15))
         
         # --- Exclusions (Fichiers & Dossiers) ---
         self._add_header(scroll, "Exclusions (Fichiers & Dossiers ignorés)")

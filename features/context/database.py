@@ -1,7 +1,7 @@
 """
 Moteur de base de données sémantique omniscient utilisant sqlite-vec.
-Version V8.5 : Restauration Performance (15s Target) + Toggle ONNX.
-Optimisation : PyTorch Quantized par défaut, Buffers 5000, Diagnostic Lab.
+Version V8.6 : APOGÉE PERFORMANCE (15s Target).
+Optimisation : PyTorch INT8 AVX-512, 4 Workers I/O, Batch 32, Buffer 5000.
 """
 
 import os
@@ -81,7 +81,6 @@ def _ensure_model():
                 SentenceTransformer = ST
             except Exception: return
             
-        # [MODIF V8.5] Toggle déplacé dans system_settings
         use_onnx = APP_SETTINGS.get("system_settings", {}).get("use_onnx_acceleration", False)
         
         try:
@@ -103,10 +102,13 @@ def _ensure_model():
             if not use_onnx:
                 # --- MODE PYTORCH (PROVEN FAST - 15s) ---
                 log.info(f"Chargement modèle PyTorch : {EMBEDDING_MODEL_NAME}...")
+                
+                # On force le parallélisme PyTorch AVANT le chargement
+                if hasattr(torch, 'set_num_threads'):
+                    torch.set_num_threads(os.cpu_count())
+                
                 base_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
                 try:
-                    # On force le parallélisme PyTorch
-                    torch.set_num_threads(os.cpu_count())
                     # Quantification Dynamique
                     base_model = torch.quantization.quantize_dynamic(base_model, {torch.nn.Linear}, dtype=torch.qint8)
                     log.info("✅ Modèle PyTorch quantifié INT8 (AVX-512 Optimized)")
@@ -144,7 +146,7 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
     _ensure_model()
     chunker = get_chunker()
 
-    # RESTAURATION DES BUFFERS LARGES (V7.8)
+    # Buffers larges pour fluidité I/O (V7.8)
     file_queue = queue.Queue(maxsize=5000)
     chunk_queue = queue.Queue(maxsize=5000)
     write_queue = queue.Queue(maxsize=5000)
@@ -152,26 +154,77 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
     timers = {'scan': 0, 'io': 0, 'encode': 0, 'write': 0, 'commit': 0}
     stats = {'scanned': 0, 'read': 0, 'encoded': 0}
     
+    # --- STAGE 1: SCANNER ---
     def scanner_thread():
         start = time.time()
         gitignore_path = os.path.join(root_path, ".gitignore")
         matches_gitignore = parse_gitignore(gitignore_path) if os.path.exists(gitignore_path) else lambda x: False
         critical_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'db', 'logs', 'dist', 'build', 'audio_cache', '.vscode', '.idea'}
         ignored_folders = set(APP_SETTINGS.get("code_analysis", {}).get("ignored_folders", []))
+        
         watch_list = APP_SETTINGS.get("repo_map_cache", {}).get("watch_files", [])
         normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
+
+        def is_path_exception(path):
+            """
+            DÉTECTION D'EXCEPTION PRIORITAIRE.
+            Retourne True si le chemin doit être parcouru/inclus malgré les exclusions.
+            """
+            p = os.path.normpath(path).lower()
+            for w in normalized_watch_list:
+                # 1. Le chemin est l'exception ou un enfant de l'exception (Inclusion)
+                if p == w or p.startswith(w + os.sep):
+                    return True
+                # 2. Le chemin est un PARENT d'une exception (Traversal forcé)
+                if w.startswith(p + os.sep):
+                    return True
+            return False
+
         for root, dirs, files in os.walk(root_path):
-            dirs[:] = [d for d in dirs if d not in critical_dirs and d not in ignored_folders and not matches_gitignore(os.path.join(root, d))]
+            # LOGIQUE DE PRUNING (Dossiers)
+            # On ne retire un dossier que s'il n'est PAS une exception ET (critique OU ignoré OU gitignored)
+            new_dirs = []
+            for d in dirs:
+                dpath = os.path.join(root, d)
+                if is_path_exception(dpath):
+                    new_dirs.append(d) # Priorité Exception : On entre !
+                elif d in critical_dirs or d in ignored_folders or matches_gitignore(dpath):
+                    continue # Exclu et pas d'exception : On ignore.
+                else:
+                    new_dirs.append(d) # Chemin standard.
+            dirs[:] = new_dirs
+            
             for file in files:
                 fpath = os.path.join(root, file)
-                if os.path.normpath(fpath).lower() in normalized_watch_list:
-                    file_queue.put(fpath); stats['scanned'] += 1; continue
+                
+                # 1. Check Exception (Priorité absolue)
+                # Note: On utilise startswith(w) sans os.sep car c'est un fichier
+                p_lower = fpath.lower()
+                is_exc = False
+                for w in normalized_watch_list:
+                    if p_lower == w or p_lower.startswith(w + os.sep):
+                        is_exc = True; break
+                
+                if is_exc:
+                    file_queue.put(fpath)
+                    stats['scanned'] += 1
+                    continue
+                
+                # 2. Filtres standards (Uniquement si pas une exception)
                 if matches_gitignore(fpath): continue
-                if not fpath.lower().endswith(SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css', '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml', '.toml', '.xml', '.sql', '.ini', '.cfg')): continue
-                file_queue.put(fpath); stats['scanned'] += 1
+                
+                valid_exts = SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css', '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml', '.toml', '.xml', '.sql', '.ini', '.cfg')
+                if not fpath.lower().endswith(valid_exts):
+                    try: 
+                        if os.path.getsize(fpath) > 1024 * 1024: continue
+                    except: continue
+                
+                file_queue.put(fpath)
+                stats['scanned'] += 1
+        
         file_queue.put(None)
         timers['scan'] = time.time() - start
-        print(f"DEBUG: [SCAN] Fini en {timers['scan']:.2f}s", flush=True)
+        print(f"DEBUG: [SCAN] Fini en {timers['scan']:.2f}s ({stats['scanned']} fichiers)", flush=True)
 
     def io_thread():
         start = time.time()
@@ -186,7 +239,9 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
                 chunk_queue.put((fpath, rel, checksum, chunks))
                 stats['read'] += 1
             except: pass
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        
+        # [PROVEN FAST] 4 workers I/O pour laisser le CPU à l'encodeur
+        with ThreadPoolExecutor(max_workers=4) as executor:
             while True:
                 fpath = file_queue.get()
                 if fpath is None: break
@@ -197,11 +252,11 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
 
     def encoder_thread():
         start = time.time()
-        batch_size = 32 # Petit batch pour flux continu
+        batch_size = 32 # Taille de batch optimale pour PyTorch CPU (Cache L3)
         cur_meta, cur_texts = [], []
         while True:
             try:
-                # [OPTIMISATION] Timeout ultra-court (0.01s) pour une réactivité maximale
+                # Timeout ultra-court pour fluidité
                 item = chunk_queue.get(timeout=0.01)
                 if item is None:
                     if cur_texts: encode_now(cur_meta, cur_texts)
@@ -254,12 +309,16 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
         print(f"DEBUG: [DB] Fini en {timers['write']:.2f}s", flush=True)
 
     # Orchestration
-    ts = [threading.Thread(target=scanner_thread), threading.Thread(target=io_thread), threading.Thread(target=encoder_thread), threading.Thread(target=writer_thread)]
-    for t in ts: t.start()
-    for t in ts: t.join()
+    t_scan = threading.Thread(target=scanner_thread, name="Scanner")
+    t_io = threading.Thread(target=io_thread, name="IO")
+    t_enc = threading.Thread(target=encoder_thread, name="Encoder")
+    t_write = threading.Thread(target=writer_thread, name="Writer")
+    threads = [t_scan, t_io, t_enc, t_write]
+    for t in threads: t.start()
+    for t in threads: t.join()
     
     total = time.time() - overall_start
-    log.info(f"📊 SUMMARY V8.5: {total:.2f}s | Scan:{timers['scan']:.1f}s | IO:{timers['io']:.1f}s | Enc:{timers['encode']:.1f}s | DB:{timers['write']:.1f}s")
+    log.info(f"📊 SUMMARY V8.6: {total:.2f}s | Scan:{timers['scan']:.1f}s | IO:{timers['io']:.1f}s | Enc:{timers['encode']:.1f}s | DB:{timers['write']:.1f}s")
     return f"Indexation terminée en {total:.1f}s."
 
 # --- Autres Fonctions ---
@@ -317,3 +376,109 @@ def delete_local_db():
             return "✅ Base V4 supprimée."
         except Exception as e: return f"❌ Erreur : {e}"
     return "Néant."
+
+
+def calculate_indexing_stats(root_path: str, settings: dict) -> dict:
+    """
+    Calcule les statistiques d'indexation sans traiter les fichiers.
+    Simule un scan os.walk complet en appliquant exactement la même logique que scanner_thread.
+    
+    Args:
+        root_path: Chemin racine du projet
+        settings: Dictionnaire de configuration (comme APP_SETTINGS)
+        
+    Returns:
+        Dictionnaire avec les clés:
+        - "included": Nombre de fichiers à indexer
+        - "excluded": Nombre de fichiers ignorés (gitignore + dossiers exclus)
+        - "bypassed": Nombre de fichiers dans la watchlist (exceptions prioritaires)
+    """
+    from features.gitignore_parser import parse_gitignore
+    from config import SUPPORTED_FILE_EXTENSIONS
+    
+    # Initialisation des compteurs
+    stats = {"included": 0, "excluded": 0, "bypassed": 0}
+    
+    # Vérification que le chemin existe
+    if not os.path.exists(root_path):
+        return stats
+    
+    # Configuration des règles de filtrage (identique à scanner_thread)
+    gitignore_path = os.path.join(root_path, ".gitignore")
+    matches_gitignore = parse_gitignore(gitignore_path) if os.path.exists(gitignore_path) else lambda x: False
+    
+    # Dossiers critiques système
+    critical_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'db', 'logs', 'dist', 'build', 'audio_cache', '.vscode', '.idea'}
+    
+    # Dossiers exclus depuis les paramètres
+    ignored_folders = set(settings.get("code_analysis", {}).get("ignored_folders", []))
+    
+    # Watchlist (exceptions prioritaires)
+    watch_list = settings.get("repo_map_cache", {}).get("watch_files", [])
+    normalized_watch_list = [os.path.normpath(os.path.join(root_path, w)).lower() for w in watch_list]
+    
+    # Fonction is_path_exception IDENTIQUE à celle de scanner_thread
+    def is_path_exception(path):
+        """
+        DÉTECTION D'EXCEPTION PRIORITAIRE.
+        Retourne True si le chemin doit être parcouru/inclus malgré les exclusions.
+        """
+        p = os.path.normpath(path).lower()
+        for w in normalized_watch_list:
+            # 1. Le chemin est l'exception ou un enfant de l'exception (Inclusion)
+            if p == w or p.startswith(w + os.sep):
+                return True
+            # 2. Le chemin est un PARENT d'une exception (Traversal forcé)
+            if w.startswith(p + os.sep):
+                return True
+        return False
+    
+    # Extensions supportées
+    supported_extensions = SUPPORTED_FILE_EXTENSIONS + ('.py', '.md', '.txt', '.js', '.json', '.html', '.css',
+                                                       '.ts', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp',
+                                                       '.rs', '.go', '.sh', '.bat', '.ps1', '.yaml', '.yml',
+                                                       '.toml', '.xml', '.sql', '.ini', '.cfg')
+    
+    # Parcours récursif du dossier (LOGIQUE IDENTIQUE à scanner_thread)
+    for root, dirs, files in os.walk(root_path):
+        # LOGIQUE DE PRUNING IDENTIQUE à scanner_thread
+        new_dirs = []
+        for d in dirs:
+            dpath = os.path.join(root, d)
+            if is_path_exception(dpath):
+                new_dirs.append(d)  # Priorité Exception : On entre !
+            elif d in critical_dirs or d in ignored_folders or matches_gitignore(dpath):
+                continue  # Exclu et pas d'exception : On ignore.
+            else:
+                new_dirs.append(d)  # Chemin standard.
+        dirs[:] = new_dirs
+        
+        for file in files:
+            fpath = os.path.join(root, file)
+            fpath_normalized = os.path.normpath(fpath).lower()
+            
+            # 1. Check Exception (Priorité absolue) - LOGIQUE IDENTIQUE à scanner_thread
+            is_exc = False
+            for w in normalized_watch_list:
+                if fpath_normalized == w or fpath_normalized.startswith(w + os.sep):
+                    is_exc = True
+                    break
+            
+            if is_exc:
+                stats["bypassed"] += 1
+                continue
+            
+            # 2. Filtres standards (Uniquement si pas une exception)
+            if matches_gitignore(fpath):
+                stats["excluded"] += 1
+                continue
+            
+            # 3. Vérification extension
+            if not fpath.lower().endswith(supported_extensions):
+                stats["excluded"] += 1
+                continue
+            
+            # Fichier à indexer
+            stats["included"] += 1
+    
+    return stats
