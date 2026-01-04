@@ -72,6 +72,44 @@ def normalize_path(path):
     """Normalisation absolue et minuscule pour comparaison robuste sur Windows."""
     return os.path.abspath(os.path.normpath(path)).lower()
 
+def _get_hardware_snap():
+    """Capture ultra-légère de l'état CPU/RAM."""
+    try:
+        import psutil
+        proc = psutil.Process()
+        ram_mb = proc.memory_info().rss / (1024 * 1024)
+        cpu_pct = psutil.cpu_percent(interval=None)
+        return ram_mb, cpu_pct
+    except: return 0, 0
+
+def _generate_autopsy(total_time, timers, stats):
+    """Analyse les chronomètres pour identifier le goulot d'étranglement."""
+    report = [f"\n🏆 [AUTOPSIE] Indexation finie en {total_time:.1f}s"]
+    
+    # Calcul des parts relatives
+    parts = {
+        "Scan": timers.get('scan', 0),
+        "I/O & Chunking": timers.get('io', 0),
+        "IA (Encodage)": timers.get('encode', 0),
+        "DB (Écriture)": timers.get('write', 0)
+    }
+    
+    main_bottleneck = max(parts, key=parts.get)
+    bottleneck_pct = (parts[main_bottleneck] / total_time) * 100 if total_time > 0 else 0
+    
+    report.append(f"📍 Goulot principal : {main_bottleneck} ({bottleneck_pct:.1f}%)")
+    
+    # Recommandations intelligentes
+    if main_bottleneck == "IA (Encodage)":
+        report.append("💡 Conseil : Augmentez 'inference_batch_size' ou tentez l'accélération ONNX.")
+    elif main_bottleneck == "I/O & Chunking":
+        report.append("💡 Conseil : Votre CPU semble peiner sur le parsing Tree-sitter ou le disque est lent.")
+    elif main_bottleneck == "DB (Écriture)":
+        report.append("💡 Conseil : Conflit d'accès SQLite détecté. Fermez les autres outils de DB.")
+        
+    report.append(f"📊 Débit moyen : {stats['encoded']/total_time:.1f} seg/s ({stats['scanned']} fichiers)")
+    return "\n".join(report)
+
 def is_path_exception(path: str, normalized_watch_list: List[str]) -> Tuple[bool, bool]:
     """
     Vérifie si un chemin est une exception ou mène à une exception.
@@ -159,21 +197,37 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
     from .code_chunker import get_chunker
     from features.gitignore_parser import parse_gitignore
     from config.settings import APP_SETTINGS
+    import gc
     
     overall_start = time.time()
     init_db()
     _ensure_model()
     chunker = get_chunker()
 
-    # Buffers larges pour fluidité I/O (V7.8)
+    db_config = APP_SETTINGS.get("database_settings", {})
+    queue_size = int(db_config.get("indexing_queue_size", 1000))
+    batch_size = int(db_config.get("inference_batch_size", 64))
+
     file_queue = queue.Queue(maxsize=5000)
-    chunk_queue = queue.Queue(maxsize=5000)
+    chunk_queue = queue.Queue(maxsize=queue_size)
     write_queue = queue.Queue(maxsize=5000)
     
-    timers = {'scan': 0, 'io': 0, 'encode': 0, 'write': 0, 'commit': 0}
+    timers = {'scan': 0, 'io': 0, 'encode': 0, 'write': 0}
     stats = {'scanned': 0, 'read': 0, 'encoded': 0}
     
-    # --- STAGE 1: SCANNER ---
+    # [LOGS V9.1] Thread Heartbeat
+    stop_event = threading.Event()
+    def heartbeat_thread():
+        while not stop_event.is_set():
+            time.sleep(3) # Pulse toutes les 3s pour être discret
+            ram, cpu = _get_hardware_snap()
+            q_io = chunk_queue.qsize()
+            q_db = write_queue.qsize()
+            print(f"💓 [HB] RAM: {ram:.0f}MB | CPU: {cpu:.0f}% | Queue_IO: {q_io} | Queue_DB: {q_db}", flush=True)
+
+    hb = threading.Thread(target=heartbeat_thread, daemon=True)
+    hb.start()
+
     def scanner_thread():
         start = time.time()
         gitignore_path = os.path.join(root_path, ".gitignore")
@@ -228,7 +282,15 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
                 checksum = hashlib.sha256(data).hexdigest()
                 text = data.decode('utf-8', errors='ignore')
                 chunks = chunker.chunk_file(fpath) if use_semantic_chunking and fpath.endswith('.py') else [{'content': text}]
+                
+                t_put_start = time.time()
                 chunk_queue.put((fpath, rel, checksum, chunks))
+                put_duration = time.time() - t_put_start
+                
+                # [LOGS V9.2] Détection Backpressure
+                if put_duration > 0.5:
+                    print(f"⚠️ [FLOW] Backpressure : Disque bloqué par l'IA pendant {put_duration:.1f}s (IA trop lente)", flush=True)
+                
                 stats['read'] += 1
             except: pass
         
@@ -244,12 +306,19 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
 
     def encoder_thread():
         start = time.time()
-        batch_size = 32 # Taille de batch optimale pour PyTorch CPU (Cache L3)
         cur_meta, cur_texts = [], []
+        segments_since_gc = 0
+        
         while True:
             try:
-                # Timeout ultra-court pour fluidité
+                t_wait_start = time.time()
                 item = chunk_queue.get(timeout=0.01)
+                wait_duration = time.time() - t_wait_start
+                
+                # [LOGS V9.2] Détection Starvation
+                if wait_duration > 0.5:
+                    print(f"⚠️ [FLOW] Starvation : IA en attente de données pendant {wait_duration:.1f}s (Disque trop lent)", flush=True)
+
                 if item is None:
                     if cur_texts: encode_now(cur_meta, cur_texts)
                     write_queue.put(None); break
@@ -257,13 +326,20 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
                 for ch in chunks:
                     txt = ch.get('content', '').strip()
                     if txt:
-                        cur_texts.append(txt)
-                        cur_meta.append((fpath, rel, checksum, ch))
+                        cur_texts.append(txt); cur_meta.append((fpath, rel, checksum, ch))
+                
                 if len(cur_texts) >= batch_size:
                     encode_now(cur_meta, cur_texts)
+                    segments_since_gc += len(cur_texts)
                     cur_meta, cur_texts = [], []
+                    
+                    # [MODIF V9.0] Nettoyage RAM périodique
+                    if segments_since_gc >= 1000:
+                        gc.collect()
+                        segments_since_gc = 0
+                        
             except queue.Empty:
-                if cur_texts:
+                if cur_texts: 
                     encode_now(cur_meta, cur_texts); cur_meta, cur_texts = [], []
         timers['encode'] = time.time() - start
         print(f"DEBUG: [ENCODE] Fini en {timers['encode']:.2f}s", flush=True)
@@ -300,17 +376,20 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
         timers['write'] = time.time() - start
         print(f"DEBUG: [DB] Fini en {timers['write']:.2f}s", flush=True)
 
-    # Orchestration
-    t_scan = threading.Thread(target=scanner_thread, name="Scanner")
-    t_io = threading.Thread(target=io_thread, name="IO")
-    t_enc = threading.Thread(target=encoder_thread, name="Encoder")
-    t_write = threading.Thread(target=writer_thread, name="Writer")
-    threads = [t_scan, t_io, t_enc, t_write]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    ts = [threading.Thread(target=scanner_thread, name="Scanner"), 
+          threading.Thread(target=io_thread, name="IO"), 
+          threading.Thread(target=encoder_thread, name="Encoder"), 
+          threading.Thread(target=writer_thread, name="Writer")]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    
+    # Arrêt du monitoring
+    stop_event.set()
     
     total = time.time() - overall_start
-    log.info(f"📊 SUMMARY V8.6: {total:.2f}s | Scan:{timers['scan']:.1f}s | IO:{timers['io']:.1f}s | Enc:{timers['encode']:.1f}s | DB:{timers['write']:.1f}s")
+    autopsy = _generate_autopsy(total, timers, stats)
+    print(autopsy, flush=True)
+    log.info(f"📊 SUMMARY V9.1: {total:.2f}s | Scan:{timers['scan']:.1f}s | IO:{timers['io']:.1f}s | Enc:{timers['encode']:.1f}s")
     return f"Indexation terminée en {total:.1f}s."
 
 # --- Autres Fonctions ---

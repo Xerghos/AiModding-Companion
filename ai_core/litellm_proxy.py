@@ -243,12 +243,25 @@ class LiteLLMProxy:
         provider = self._detect_provider(model)
         normalized_model = self._normalize_model_name(model, provider)
         
+        # Ajuster la température pour les modèles Gemini-3
+        # LiteLLM émet un warning si température < 1.0 pour Gemini-3
+        adjusted_temperature = temperature
+        if provider == ModelProvider.GEMINI and "gemini-3" in model.lower():
+            # Forcer température = 1.0 pour Gemini-3 comme recommandé par LiteLLM
+            if temperature < 1.0:
+                UnifiedLogger.write(
+                    "AI_CORE",
+                    "WARNING",
+                    f"⚠️ Ajustement température Gemini-3: {temperature} -> 1.0 (recommandé par LiteLLM pour éviter boucles infinies)"
+                )
+                adjusted_temperature = 1.0
+        
         # Configuration spécifique par provider
         model_config = {
             "model": normalized_model,
             "messages": messages,  # Ordre préservé
             "stream": stream,
-            "temperature": temperature,
+            "temperature": adjusted_temperature,
         }
         
         # Gestion de l'authentification : OAuth (Login with Google) pour Gemini si disponible, sinon API key
@@ -300,7 +313,7 @@ class LiteLLMProxy:
                         model=normalized_model,
                         messages=messages,
                         stream=stream,
-                        temperature=temperature,
+                        temperature=adjusted_temperature,
                         max_tokens=max_tokens,
                         tools=tools,
                         project_id=None,  # None = utilise quota personnel Google AI Pro

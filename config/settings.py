@@ -92,6 +92,10 @@ DEFAULT_SETTINGS = {
         "rag_database_path": "db/knowledge_base_hybrid",
         "max_history_retention": 50
     },
+    "database_settings": {
+        "indexing_queue_size": 1000,
+        "inference_batch_size": 64
+    },
     "general_settings": {
         "chat_pool_size": 4, 
         "secondary_chat_pool_size": 1, 

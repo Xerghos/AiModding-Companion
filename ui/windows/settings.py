@@ -303,6 +303,7 @@ class SettingsWindow(BaseWindow):
         self.tab_swarm = self.tab_view.add("🧠 Swarm & Rôles")
         self.tab_cli = self.tab_view.add("🌉 Hybride / CLI")
         self.tab_sys = self.tab_view.add("🛠️ Système & Code")
+        self.tab_db = self.tab_view.add("📦 Database")
         self.tab_ui = self.tab_view.add("🎨 UI & Clés")
 
         self._build_general_tab()
@@ -310,6 +311,7 @@ class SettingsWindow(BaseWindow):
         self._build_swarm_tab()
         self._build_cli_tab()
         self._build_system_code_tab()
+        self._build_database_tab()
         self._build_ui_keys_tab()
 
         # Barre d'actions
@@ -1121,6 +1123,35 @@ class SettingsWindow(BaseWindow):
         self._add_slider(scroll, "memory_optimization.active_window", "Fenêtre Active (Messages)", 0, 20, 10)
         self._add_slider(scroll, "memory_optimization.compression_threshold", "Seuil Compression (Chars)", 0, 2000, 800)
         self._add_slider(scroll, "memory_optimization.max_active_tokens", "Plafond RAM (Caractères)", 1000, 200000, 50000, False)
+
+    def _build_database_tab(self):
+        scroll = self._add_scroll_frame(self.tab_db)
+        
+        self._add_header(scroll, "🚀 Performance de l'Indexation (RAG)")
+        
+        # Slider Queue : 0 à 50 000
+        self._add_slider(scroll, "database_settings.indexing_queue_size", 
+                         "Taille Queue d'Indexation (Buffer RAM)", 0, 50000, 1000)
+        if "database_settings.indexing_queue_size_WIDGET" in self.vars:
+            add_tooltip(self.vars["database_settings.indexing_queue_size_WIDGET"], 
+                        "Nombre maximum de segments stockés en RAM en attendant l'IA.\n"
+                        "Plus élevé = I/O plus rapide mais consommation RAM accrue.\n"
+                        "Conseillé : 1000 à 5000.")
+
+        # Slider Batch : 6 à 2048
+        self._add_slider(scroll, "database_settings.inference_batch_size", 
+                         "Taille du Batch IA (Inférence)", 6, 2048, 64)
+        if "database_settings.inference_batch_size_WIDGET" in self.vars:
+            add_tooltip(self.vars["database_settings.inference_batch_size_WIDGET"], 
+                        "Nombre de segments envoyés d'un coup au CPU/GPU.\n"
+                        "Plus élevé = Meilleur débit sur gros CPU (AVX-512).\n"
+                        "Trop élevé = Latence d'interface.")
+
+        self._add_header(scroll, "🧹 Maintenance")
+        self._add_switch(scroll, "system_settings.rag_enabled", "Activer le moteur sémantique", True)
+        
+        self._add_header(scroll, "Chemins & Stockage")
+        self._add_entry(scroll, "system_settings.rag_database_path", "Chemin DB Vectorielle", "db/knowledge_base_omniscient_V4")
 
     def _build_ui_keys_tab(self):
         scroll = self._add_scroll_frame(self.tab_ui)
