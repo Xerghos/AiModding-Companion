@@ -358,7 +358,9 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
         cursor = conn.cursor()
         file_id_cache = {}
         cursor.execute("BEGIN TRANSACTION")
-        cursor.execute("DELETE FROM files") 
+        
+        # [MODIF V9.3] On garde la transaction unique pour la performance
+        # mais on ajoute un log clair pour le commit final.
         while True:
             item = write_queue.get()
             if item is None: break
@@ -372,9 +374,12 @@ def index_project_files(root_path: str, progress_callback=None, use_semantic_chu
                 cursor.execute('''INSERT INTO chunks (file_id, chunk_index, content, ast_type, start_line, end_line, parent_context, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', (fid, 0, ch['content'], ch.get('ast_type'), ch.get('start_line'), ch.get('end_line'), ch.get('parent_context'), ch.get('metadata')))
                 vbatch.append((cursor.lastrowid, vec.tobytes()))
             cursor.executemany("INSERT INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)", vbatch)
-        conn.commit(); conn.close()
+        
+        print("💾 [DB] Synchronisation finale sur le disque (Commit)...", flush=True)
+        conn.commit()
+        conn.close()
         timers['write'] = time.time() - start
-        print(f"DEBUG: [DB] Fini en {timers['write']:.2f}s", flush=True)
+        print(f"DEBUG: [DB] Écriture disque terminée en {timers['write']:.2f}s", flush=True)
 
     ts = [threading.Thread(target=scanner_thread, name="Scanner"), 
           threading.Thread(target=io_thread, name="IO"), 

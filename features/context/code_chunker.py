@@ -39,6 +39,20 @@ class SemanticChunker:
         self.is_available = False  # Flag pour indiquer si le chunking sémantique est disponible
         self._init_tree_sitter()
     
+    @property
+    def parser(self):
+        """Expose le parser thread-local."""
+        if not hasattr(self._local, "parser") or not self._local.parser:
+            self._init_tree_sitter()
+        return getattr(self._local, "parser", None)
+
+    @property
+    def language(self):
+        """Expose le langage thread-local."""
+        if not hasattr(self._local, "language") or not self._local.language:
+            self._init_tree_sitter()
+        return getattr(self._local, "language", None)
+
     def _init_tree_sitter(self):
         """
         Initialise Tree-sitter pour Python via le language-pack.
